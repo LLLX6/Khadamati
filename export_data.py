@@ -1,9 +1,10 @@
 from pathlib import Path
 import json
+import os
 import sqlite3
 
 BASE_DIR = Path(__file__).resolve().parent
-DB_PATH = BASE_DIR / "foran.sqlite3"
+DB_PATH = Path(os.environ.get("FORAN_DB_PATH") or (BASE_DIR / "foran.sqlite3"))
 OUT_PATH = BASE_DIR / "foran-export.json"
 
 
@@ -24,6 +25,12 @@ def main():
         "leads": rows(con, "leads"),
         "finance": rows(con, "finance"),
         "whatsapp_logs": rows(con, "whatsapp_logs"),
+        "reviews": rows(con, "reviews"),
+        "complaints": rows(con, "complaints"),
+        "packages": rows(con, "packages"),
+        "subscriptions": rows(con, "subscriptions"),
+        "payments": rows(con, "payments"),
+        "audit_logs": rows(con, "audit_logs"),
     }
     OUT_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
     print(OUT_PATH)

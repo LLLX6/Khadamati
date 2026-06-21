@@ -15,6 +15,12 @@
    - `leads`
    - `finance`
    - `whatsapp_logs`
+   - `reviews`
+   - `complaints`
+   - `packages`
+   - `subscriptions`
+   - `payments`
+   - `audit_logs`
 5. انقل مجلد الصور `public/uploads`.
 6. حدّث طبقة الاتصال في `server.py` لاستخدام PostgreSQL driver مثل `psycopg`.
 
