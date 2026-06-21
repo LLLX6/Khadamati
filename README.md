@@ -65,16 +65,34 @@ python server.py
 
 ## النشر
 
-هذه النسخة مناسبة للنشر على خادم يدعم Python مثل VPS أو Render أو Railway.
+هذه النسخة مجهزة للنشر على Render عبر ملف `render.yaml` الموجود في جذر المشروع.
 
-خطوات الإنتاج المقترحة:
+الإعدادات الجاهزة:
 
-1. رفع مجلد `foran-platform`.
-2. ضبط متغير `FORAN_ADMIN_CODE`.
-3. تشغيل `server.py` عبر خدمة دائمة مثل systemd أو خدمة المنصة المستضيفة.
-4. وضع الخادم خلف HTTPS واسم نطاق.
-5. جدولة نسخ احتياطي لملف `foran.sqlite3`.
-6. جدولة نسخ احتياطي لمجلد `public/uploads`.
+- `buildCommand`: `pip install -r requirements.txt`
+- `startCommand`: `python server.py`
+- `HOST=0.0.0.0` حتى يقبل الخادم زيارات الإنترنت.
+- `FORAN_DB_PATH=/var/data/foran.sqlite3` لحفظ قاعدة البيانات على قرص دائم.
+- قرص دائم باسم `faoran-data` على المسار `/var/data`.
+
+خطوات Render:
+
+1. افتح Render Dashboard.
+2. اختر `New` ثم `Blueprint`.
+3. اربط مستودع GitHub: `LLLX6/faoran`.
+4. عند طلب `FORAN_ADMIN_CODE` ضع رمز إدارة قوي.
+5. اضغط `Apply` وانتظر حتى يكتمل البناء.
+6. سيعطيك Render رابطًا من نوع `https://faoran.onrender.com`.
+
+مهم: القرص الدائم ضروري حتى لا تضيع قاعدة البيانات والصور بعد إعادة التشغيل. إذا أردت تجربة مجانية بدون قرص دائم يمكن تشغيل الخدمة بدون `disk`، لكنها لا تصلح كتشغيل إنتاجي يحفظ بيانات العملاء.
+
+لتفعيل واتساب الرسمي بعد النشر، أضف هذه المتغيرات من صفحة الخدمة في Render:
+
+```text
+WHATSAPP_ACCESS_TOKEN
+WHATSAPP_PHONE_NUMBER_ID
+WHATSAPP_API_VERSION=v20.0
+```
 
 ## PostgreSQL عند التوسع
 

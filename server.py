@@ -14,7 +14,7 @@ import urllib.request
 BASE_DIR = Path(__file__).resolve().parent
 PUBLIC_DIR = BASE_DIR / "public"
 UPLOAD_DIR = PUBLIC_DIR / "uploads"
-DB_PATH = BASE_DIR / "foran.sqlite3"
+DB_PATH = Path(os.environ.get("FORAN_DB_PATH") or (BASE_DIR / "foran.sqlite3"))
 ADMIN_CODE = os.environ.get("FORAN_ADMIN_CODE", "1995")
 ADMIN_HASH = hashlib.sha256(ADMIN_CODE.encode("utf-8")).hexdigest()
 TOKENS = {}
@@ -35,6 +35,7 @@ ROLE_PERMISSIONS = {
 
 
 def db():
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     con = sqlite3.connect(DB_PATH)
     con.row_factory = sqlite3.Row
     return con
@@ -712,6 +713,8 @@ class Handler(SimpleHTTPRequestHandler):
 
 if __name__ == "__main__":
     init_db()
+    host = os.environ.get("HOST", "127.0.0.1")
     port = int(os.environ.get("PORT", "8080"))
-    print(f"Fawran platform running: http://127.0.0.1:{port}")
-    ThreadingHTTPServer(("127.0.0.1", port), Handler).serve_forever()
+    display_host = "127.0.0.1" if host in ("0.0.0.0", "::") else host
+    print(f"Fawran platform running: http://{display_host}:{port}", flush=True)
+    ThreadingHTTPServer((host, port), Handler).serve_forever()
