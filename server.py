@@ -1189,7 +1189,7 @@ class Handler(SimpleHTTPRequestHandler):
 
 if __name__ == "__main__":
     init_db()
-    host = os.environ.get("HOST", "127.0.0.1")
+    host = os.environ.get("HOST", "0.0.0.0")
     port = int(os.environ.get("PORT", "8080"))
     display_host = "127.0.0.1" if host in ("0.0.0.0", "::") else host
     print(f"Fawran platform running: http://{display_host}:{port}", flush=True)
