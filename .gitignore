@@ -1,0 +1,8 @@
+foran.sqlite3
+foran-export.json
+__pycache__/
+*.pyc
+server.log
+server.err
+public/uploads/*
+!public/uploads/.gitkeep

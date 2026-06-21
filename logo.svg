@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="Fawran">
+  <defs>
+    <linearGradient id="g" x1="80" y1="64" x2="430" y2="448" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#102a43"/>
+      <stop offset=".62" stop-color="#1f5f8b"/>
+      <stop offset="1" stop-color="#15a085"/>
+    </linearGradient>
+    <linearGradient id="gold" x1="160" y1="120" x2="370" y2="390" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#ffe7a3"/>
+      <stop offset="1" stop-color="#d8b46a"/>
+    </linearGradient>
+  </defs>
+  <rect width="512" height="512" rx="132" fill="url(#g)"/>
+  <path d="M143 331c24 27 62 43 107 43 78 0 132-47 132-116 0-63-46-107-113-107-40 0-73 14-96 39l45 44c12-13 28-20 48-20 27 0 45 18 45 45 0 29-22 48-58 48-29 0-54-10-76-31l-34 55Z" fill="#fff"/>
+  <path d="M342 87 217 259h72l-33 164 124-190h-70l32-146Z" fill="url(#gold)"/>
+  <circle cx="386" cy="372" r="42" fill="#20c997"/>
+</svg>
