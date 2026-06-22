@@ -212,6 +212,7 @@ def init_db():
             );
             CREATE TABLE IF NOT EXISTS leads(
               id TEXT PRIMARY KEY, provider_id TEXT, kind TEXT, customer_name TEXT, phone TEXT, note TEXT,
+              service_value TEXT DEFAULT '', service_name TEXT DEFAULT '', gov TEXT DEFAULT '', status TEXT DEFAULT 'open',
               created_at TEXT DEFAULT CURRENT_TIMESTAMP
             );
             CREATE TABLE IF NOT EXISTS finance(
@@ -257,6 +258,10 @@ def init_db():
         ensure_column(con, "providers", "quality_score", "INTEGER DEFAULT 60")
         ensure_column(con, "providers", "response_score", "INTEGER DEFAULT 70")
         ensure_column(con, "providers", "subscription_until", "TEXT DEFAULT ''")
+        ensure_column(con, "leads", "service_value", "TEXT DEFAULT ''")
+        ensure_column(con, "leads", "service_name", "TEXT DEFAULT ''")
+        ensure_column(con, "leads", "gov", "TEXT DEFAULT ''")
+        ensure_column(con, "leads", "status", "TEXT DEFAULT 'open'")
         if con.execute("SELECT COUNT(*) n FROM categories").fetchone()["n"] == 0:
             for c in SEED_CATEGORIES:
                 con.execute("INSERT INTO categories VALUES(?,?,?,?,?)", (c["id"], c["icon"], c["ar"], c["en"], c["active"]))
@@ -392,6 +397,31 @@ def row_lead(r):
     return dict(r)
 
 
+def lead_matches_provider(lead, provider):
+    if lead.get("kind") != "request" or lead.get("status") in ("cancelled", "deleted", "closed"):
+        return False
+    service_value = (lead.get("service_value") or "").strip()
+    service_tokens = set()
+    if "|" in service_value:
+        cat_id, service_id = service_value.split("|", 1)
+        service_tokens.update([cat_id, service_id])
+    service_tokens.update(x for x in [lead.get("service_name"), lead.get("note")] if x)
+    provider_services = provider.get("services") or []
+    service_ok = not service_value
+    for svc in provider_services:
+        if svc.get("catId") in service_tokens or svc.get("serviceId") in service_tokens:
+            service_ok = True
+            break
+        if service_value and service_value == f"{svc.get('catId')}|{svc.get('serviceId')}":
+            service_ok = True
+            break
+    gov = (lead.get("gov") or "").strip()
+    areas = set(provider.get("areas") or [])
+    areas.update([provider.get("gov"), provider.get("wilayah")])
+    area_ok = not gov or gov in areas
+    return bool(service_ok and area_ok)
+
+
 def log_audit(con, session, action, target="", detail=""):
     actor_kind = (session or {}).get("kind", "system")
     actor_id = (session or {}).get("id") or (session or {}).get("providerId") or "system"
@@ -459,6 +489,13 @@ def get_bootstrap(session=None):
         if has_permission(session, "review_requests"):
             for r in con.execute("SELECT * FROM provider_requests ORDER BY created_at DESC"):
                 payload = jload(r["payload"], {}) | {"createdAt": r["created_at"]}
+                payload["pending"] = True
+                payload["active"] = False
+                payload["status"] = payload.get("status", "unavailable")
+                payload["services"] = payload.get("services", [])
+                if not payload["services"] and "|" in payload.get("service", ""):
+                    cat_id, service_id = payload["service"].split("|", 1)
+                    payload["services"] = [{"id": f"pending-{payload.get('id','')}", "catId": cat_id, "serviceId": service_id, "priceFrom": payload.get("priceFrom", 0), "active": True, "areas": [payload.get("wilayah", "")]}]
                 payload.pop("pinHash", None)
                 requests.append(payload)
         settings = jload(con.execute("SELECT value FROM settings WHERE key='platform'").fetchone()["value"], {})
@@ -477,6 +514,11 @@ def get_bootstrap(session=None):
             subscriptions = [row_subscription(r) for r in con.execute("SELECT * FROM subscriptions WHERE provider_id=? ORDER BY created_at DESC", (pid,))]
             payments = [row_payment(r) for r in con.execute("SELECT * FROM payments WHERE provider_id=? ORDER BY created_at DESC", (pid,))]
             leads = [row_lead(r) for r in con.execute("SELECT * FROM leads WHERE provider_id=? ORDER BY created_at DESC LIMIT 80", (pid,))]
+            current_provider = next((p for p in providers if p["id"] == pid), None)
+            if current_provider:
+                open_requests = [row_lead(r) for r in con.execute("SELECT * FROM leads WHERE kind='request' AND COALESCE(provider_id,'')='' AND status NOT IN ('cancelled','deleted','closed') ORDER BY created_at DESC LIMIT 120")]
+                matched = [lead for lead in open_requests if lead_matches_provider(lead, current_provider)]
+                leads = leads + matched[:40]
             audits = []
         else:
             reviews = [row_review(r) for r in con.execute("SELECT * FROM reviews WHERE approved=1 ORDER BY created_at DESC")]
@@ -822,6 +864,7 @@ class Handler(SimpleHTTPRequestHandler):
                 "service": data.get("service", ""),
                 "priceFrom": data.get("priceFrom", 0),
                 "note": data.get("note", ""),
+                "hours": data.get("hours", ""),
                 "imagePath": "",
                 "workImages": [],
                 "documents": [],
@@ -910,16 +953,40 @@ class Handler(SimpleHTTPRequestHandler):
         kind = data.get("kind", "whatsapp")
         if kind not in ("request", "views", "whatsapp", "calls", "booking", "quote"):
             kind = "request"
+        lead_id = (data.get("id") or slug("lead")).strip()[:80]
         item = {
-            "id": slug("lead"),
+            "id": lead_id,
             "provider_id": (data.get("providerId") or "")[:80],
             "kind": kind,
             "customer_name": (data.get("customerName", "") or "").strip()[:80],
             "phone": (data.get("phone", "") or "").strip()[:30],
             "note": (data.get("note", "") or "").strip()[:1200],
+            "service_value": (data.get("serviceValue", "") or "").strip()[:120],
+            "service_name": (data.get("serviceName", "") or "").strip()[:120],
+            "gov": (data.get("gov", "") or "").strip()[:80],
+            "status": (data.get("status", "open") or "open").strip()[:40],
         }
         with db() as con:
-            con.execute("INSERT INTO leads VALUES(?,?,?,?,?,?,CURRENT_TIMESTAMP)", tuple(item.values()))
+            exists = con.execute("SELECT id FROM leads WHERE id=?", (item["id"],)).fetchone()
+            if exists:
+                con.execute(
+                    """UPDATE leads
+                    SET provider_id=?, kind=?, customer_name=?, phone=?, note=?, service_value=?, service_name=?, gov=?, status=?
+                    WHERE id=?""",
+                    (
+                        item["provider_id"], item["kind"], item["customer_name"], item["phone"], item["note"],
+                        item["service_value"], item["service_name"], item["gov"], item["status"], item["id"],
+                    ),
+                )
+            else:
+                con.execute(
+                    """INSERT INTO leads(id,provider_id,kind,customer_name,phone,note,service_value,service_name,gov,status,created_at)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP)""",
+                    (
+                        item["id"], item["provider_id"], item["kind"], item["customer_name"], item["phone"], item["note"],
+                        item["service_value"], item["service_name"], item["gov"], item["status"],
+                    ),
+                )
             provider = None
             if item["kind"] in ("views", "whatsapp", "calls") and item["provider_id"]:
                 r = con.execute("SELECT * FROM providers WHERE id=?", (item["provider_id"],)).fetchone()
@@ -930,7 +997,7 @@ class Handler(SimpleHTTPRequestHandler):
                     con.execute("UPDATE providers SET stats=? WHERE id=?", (jdump(stats), item["provider_id"]))
         if data.get("notifyProvider") and provider:
             send_whatsapp(provider["phone"], f"تنبيه من فوراً: لديك تواصل جديد. {item['note']}".strip())
-        return self.send_json({"ok": True}, 201)
+        return self.send_json({"ok": True, "lead": item}, 200 if data.get("id") else 201)
 
     def provider_post(self, path, data):
         session = self.require_provider()
@@ -1045,7 +1112,7 @@ class Handler(SimpleHTTPRequestHandler):
                         "wilayah": payload.get("wilayah", ""),
                         "areas": [payload.get("wilayah", "")],
                         "bio": payload.get("note", ""),
-                        "hours": "",
+                        "hours": payload.get("hours", ""),
                         "status": "available",
                         "active": True,
                         "verified": False,
