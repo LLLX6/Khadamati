@@ -164,3 +164,140 @@ CREATE TABLE IF NOT EXISTS audit_logs (
   detail TEXT DEFAULT '',
   created_at TIMESTAMPTZ DEFAULT now()
 );
+
+CREATE TABLE IF NOT EXISTS app_users (
+  id TEXT PRIMARY KEY,
+  phone TEXT NOT NULL UNIQUE,
+  name TEXT DEFAULT '',
+  pin_hash TEXT DEFAULT '',
+  gov TEXT DEFAULT '',
+  wilayah TEXT DEFAULT '',
+  avatar TEXT DEFAULT '',
+  latitude DOUBLE PRECISION,
+  longitude DOUBLE PRECISION,
+  status TEXT NOT NULL DEFAULT 'active',
+  failed_attempts INTEGER NOT NULL DEFAULT 0,
+  locked_until TIMESTAMPTZ,
+  first_login TIMESTAMPTZ DEFAULT now(),
+  last_login TIMESTAMPTZ DEFAULT now(),
+  login_count INTEGER NOT NULL DEFAULT 1
+);
+
+CREATE TABLE IF NOT EXISTS auth_sessions (
+  id TEXT PRIMARY KEY,
+  token_hash TEXT NOT NULL UNIQUE,
+  session_json JSONB NOT NULL,
+  expires_at TIMESTAMPTZ NOT NULL,
+  revoked BOOLEAN NOT NULL DEFAULT FALSE,
+  created_at TIMESTAMPTZ DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS customer_requests (
+  id TEXT PRIMARY KEY,
+  user_id TEXT REFERENCES app_users(id) ON DELETE SET NULL,
+  customer_name TEXT DEFAULT '',
+  phone TEXT DEFAULT '',
+  service_value TEXT NOT NULL,
+  service_name TEXT DEFAULT '',
+  gov TEXT DEFAULT '',
+  wilayah TEXT DEFAULT '',
+  latitude DOUBLE PRECISION,
+  longitude DOUBLE PRECISION,
+  urgency TEXT DEFAULT 'normal',
+  schedule_type TEXT DEFAULT 'flexible',
+  requested_at TIMESTAMPTZ,
+  budget_min NUMERIC DEFAULT 0,
+  budget_max NUMERIC DEFAULT 0,
+  location_text TEXT DEFAULT '',
+  note TEXT DEFAULT '',
+  images JSONB DEFAULT '[]',
+  status TEXT NOT NULL DEFAULT 'matching',
+  accepted_provider_id TEXT REFERENCES providers(id) ON DELETE SET NULL,
+  matching_provider_ids JSONB DEFAULT '[]',
+  declined_provider_ids JSONB DEFAULT '[]',
+  offers_open BOOLEAN NOT NULL DEFAULT TRUE,
+  created_at TIMESTAMPTZ DEFAULT now(),
+  updated_at TIMESTAMPTZ DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS app_notifications (
+  id TEXT PRIMARY KEY,
+  target_kind TEXT NOT NULL,
+  target_id TEXT DEFAULT '',
+  type TEXT DEFAULT 'general',
+  title TEXT NOT NULL,
+  message TEXT DEFAULT '',
+  related_id TEXT DEFAULT '',
+  priority TEXT DEFAULT 'normal',
+  action_text TEXT DEFAULT '',
+  action_route TEXT DEFAULT '',
+  is_read BOOLEAN NOT NULL DEFAULT FALSE,
+  created_at TIMESTAMPTZ DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS advertisements (
+  id TEXT PRIMARY KEY,
+  image_path TEXT NOT NULL,
+  advertiser TEXT DEFAULT '',
+  phone TEXT DEFAULT '',
+  amount NUMERIC DEFAULT 0,
+  title TEXT DEFAULT '',
+  body TEXT DEFAULT '',
+  starts_at TIMESTAMPTZ,
+  ends_at TIMESTAMPTZ,
+  active BOOLEAN NOT NULL DEFAULT TRUE,
+  deleted_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ DEFAULT now(),
+  updated_at TIMESTAMPTZ DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS password_recoveries (
+  id TEXT PRIMARY KEY,
+  account_kind TEXT NOT NULL,
+  account_id TEXT DEFAULT '',
+  phone TEXT NOT NULL,
+  code_hash TEXT NOT NULL,
+  attempts INTEGER NOT NULL DEFAULT 0,
+  expires_at TIMESTAMPTZ NOT NULL,
+  used_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS push_subscriptions (
+  id TEXT PRIMARY KEY,
+  target_kind TEXT NOT NULL,
+  target_id TEXT DEFAULT '',
+  endpoint TEXT NOT NULL UNIQUE,
+  subscription_json JSONB NOT NULL,
+  active BOOLEAN NOT NULL DEFAULT TRUE,
+  last_success_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS policy_acceptances (
+  id TEXT PRIMARY KEY,
+  user_id TEXT DEFAULT '',
+  phone TEXT DEFAULT '',
+  policy_version TEXT NOT NULL,
+  accepted_at TIMESTAMPTZ DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_requests_status ON customer_requests(status, created_at);
+CREATE INDEX IF NOT EXISTS idx_notifications_target ON app_notifications(target_kind, target_id, is_read);
+CREATE INDEX IF NOT EXISTS idx_sessions_hash ON auth_sessions(token_hash, expires_at);
+
+ALTER TABLE providers ADD COLUMN IF NOT EXISTS subscription_start TEXT DEFAULT '';
+ALTER TABLE providers ADD COLUMN IF NOT EXISTS provider_type TEXT DEFAULT 'individual';
+ALTER TABLE providers ADD COLUMN IF NOT EXISTS company_name TEXT DEFAULT '';
+ALTER TABLE providers ADD COLUMN IF NOT EXISTS company_id TEXT DEFAULT '';
+ALTER TABLE providers ADD COLUMN IF NOT EXISTS commercial_no TEXT DEFAULT '';
+ALTER TABLE providers ADD COLUMN IF NOT EXISTS verification_expiry TEXT DEFAULT '';
+ALTER TABLE providers ADD COLUMN IF NOT EXISTS commercial_expiry TEXT DEFAULT '';
+ALTER TABLE providers ADD COLUMN IF NOT EXISTS license_expiry TEXT DEFAULT '';
+ALTER TABLE providers ADD COLUMN IF NOT EXISTS latitude DOUBLE PRECISION;
+ALTER TABLE providers ADD COLUMN IF NOT EXISTS longitude DOUBLE PRECISION;
+ALTER TABLE providers ADD COLUMN IF NOT EXISTS location_updated_at TIMESTAMPTZ;
+ALTER TABLE leads ADD COLUMN IF NOT EXISTS service_value TEXT DEFAULT '';
+ALTER TABLE leads ADD COLUMN IF NOT EXISTS service_name TEXT DEFAULT '';
+ALTER TABLE leads ADD COLUMN IF NOT EXISTS gov TEXT DEFAULT '';
+ALTER TABLE leads ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'open';

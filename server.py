@@ -3,15 +3,28 @@ from urllib.parse import urlparse
 from pathlib import Path
 from datetime import datetime, timedelta, UTC
 import base64
+import csv
 import hashlib
+import hmac
+import html
+import io
 import json
 import mimetypes
 import os
+import re
 import secrets
 import sqlite3
+import threading
 import time
 import urllib.error
 import urllib.request
+import zipfile
+
+try:
+    from pywebpush import WebPushException, webpush
+except ImportError:
+    WebPushException = Exception
+    webpush = None
 
 BASE_DIR = Path(__file__).resolve().parent
 PUBLIC_DIR = BASE_DIR / "public"
@@ -21,6 +34,17 @@ DB_PATH = Path(os.environ.get("KHADAMATI_DB_PATH") or os.environ.get("FORAN_DB_P
 ADMIN_CODE = os.environ.get("KHADAMATI_ADMIN_CODE") or os.environ.get("FORAN_ADMIN_CODE", "0000")
 ADMIN_HASH = hashlib.sha256(ADMIN_CODE.encode("utf-8")).hexdigest()
 TOKENS = {}
+DEFAULT_ALLOWED_ORIGINS = {
+    "https://lllx6.github.io",
+    "http://127.0.0.1:8080",
+    "http://localhost:8080",
+}
+ALLOWED_ORIGINS = {
+    item.strip().rstrip("/")
+    for item in os.environ.get("KHADAMATI_ALLOWED_ORIGINS", ",".join(sorted(DEFAULT_ALLOWED_ORIGINS))).split(",")
+    if item.strip()
+}
+SESSION_DAYS = int(os.environ.get("KHADAMATI_SESSION_DAYS", "30"))
 
 ALL_PERMISSIONS = [
     "view_reports",
@@ -59,6 +83,27 @@ def hash_secret(value):
     return hashlib.sha256(str(value).encode("utf-8")).hexdigest()
 
 
+def hash_pin(value):
+    salt = secrets.token_hex(16)
+    rounds = 160_000
+    digest = hashlib.pbkdf2_hmac("sha256", str(value).encode("utf-8"), salt.encode("ascii"), rounds).hex()
+    return f"pbkdf2_sha256${rounds}${salt}${digest}"
+
+
+def verify_secret(value, encoded):
+    encoded = str(encoded or "")
+    if encoded.startswith("pbkdf2_sha256$"):
+        try:
+            _, rounds, salt, digest = encoded.split("$", 3)
+            actual = hashlib.pbkdf2_hmac(
+                "sha256", str(value).encode("utf-8"), salt.encode("ascii"), int(rounds)
+            ).hex()
+            return hmac.compare_digest(actual, digest)
+        except (TypeError, ValueError):
+            return False
+    return hmac.compare_digest(hash_secret(value), encoded)
+
+
 def jdump(value):
     return json.dumps(value, ensure_ascii=False)
 
@@ -85,6 +130,10 @@ def default_provider_pin(phone):
 
 def iso_date(days=0):
     return (datetime.now(UTC) + timedelta(days=days)).strftime("%Y-%m-%d")
+
+
+def iso_datetime(minutes=0, days=0):
+    return (datetime.now(UTC) + timedelta(minutes=minutes, days=days)).isoformat()
 
 
 def seed_service(service_id, icon, ar, en):
@@ -370,6 +419,62 @@ def init_db():
               id TEXT PRIMARY KEY, actor_kind TEXT, actor_id TEXT, action TEXT NOT NULL, target TEXT,
               detail TEXT DEFAULT '', created_at TEXT DEFAULT CURRENT_TIMESTAMP
             );
+            CREATE TABLE IF NOT EXISTS app_users(
+              id TEXT PRIMARY KEY, phone TEXT NOT NULL UNIQUE, name TEXT DEFAULT '', pin_hash TEXT DEFAULT '',
+              gov TEXT DEFAULT '', wilayah TEXT DEFAULT '', avatar TEXT DEFAULT '', latitude REAL, longitude REAL,
+              status TEXT NOT NULL DEFAULT 'active', failed_attempts INTEGER NOT NULL DEFAULT 0,
+              locked_until TEXT DEFAULT '', first_login TEXT DEFAULT CURRENT_TIMESTAMP,
+              last_login TEXT DEFAULT CURRENT_TIMESTAMP, login_count INTEGER NOT NULL DEFAULT 1
+            );
+            CREATE TABLE IF NOT EXISTS auth_sessions(
+              id TEXT PRIMARY KEY, token_hash TEXT NOT NULL UNIQUE, session_json TEXT NOT NULL,
+              expires_at TEXT NOT NULL, revoked INTEGER NOT NULL DEFAULT 0, created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS customer_requests(
+              id TEXT PRIMARY KEY, user_id TEXT DEFAULT '', customer_name TEXT DEFAULT '', phone TEXT DEFAULT '',
+              service_value TEXT NOT NULL, service_name TEXT DEFAULT '', gov TEXT DEFAULT '', wilayah TEXT DEFAULT '',
+              latitude REAL, longitude REAL, urgency TEXT DEFAULT 'normal', schedule_type TEXT DEFAULT 'flexible',
+              requested_at TEXT DEFAULT '', budget_min REAL DEFAULT 0, budget_max REAL DEFAULT 0,
+              location_text TEXT DEFAULT '', note TEXT DEFAULT '', images TEXT DEFAULT '[]',
+              status TEXT NOT NULL DEFAULT 'matching', accepted_provider_id TEXT DEFAULT '',
+              matching_provider_ids TEXT DEFAULT '[]', declined_provider_ids TEXT DEFAULT '[]',
+              offers_open INTEGER NOT NULL DEFAULT 1, created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+              updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS app_notifications(
+              id TEXT PRIMARY KEY, target_kind TEXT NOT NULL, target_id TEXT DEFAULT '', type TEXT DEFAULT 'general',
+              title TEXT NOT NULL, message TEXT DEFAULT '', related_id TEXT DEFAULT '',
+              priority TEXT DEFAULT 'normal', action_text TEXT DEFAULT '', action_route TEXT DEFAULT '',
+              is_read INTEGER NOT NULL DEFAULT 0, created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS advertisements(
+              id TEXT PRIMARY KEY, image_path TEXT NOT NULL, advertiser TEXT DEFAULT '', phone TEXT DEFAULT '',
+              amount REAL DEFAULT 0, title TEXT DEFAULT '', body TEXT DEFAULT '', starts_at TEXT DEFAULT '',
+              ends_at TEXT DEFAULT '', active INTEGER NOT NULL DEFAULT 1, deleted_at TEXT DEFAULT '',
+              created_at TEXT DEFAULT CURRENT_TIMESTAMP, updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS password_recoveries(
+              id TEXT PRIMARY KEY, account_kind TEXT NOT NULL, account_id TEXT DEFAULT '', phone TEXT NOT NULL,
+              code_hash TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, expires_at TEXT NOT NULL,
+              used_at TEXT DEFAULT '', created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS push_subscriptions(
+              id TEXT PRIMARY KEY, target_kind TEXT NOT NULL, target_id TEXT DEFAULT '', endpoint TEXT NOT NULL UNIQUE,
+              subscription_json TEXT NOT NULL, active INTEGER NOT NULL DEFAULT 1,
+              last_success_at TEXT DEFAULT '', created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS policy_acceptances(
+              id TEXT PRIMARY KEY, user_id TEXT DEFAULT '', phone TEXT DEFAULT '', policy_version TEXT NOT NULL,
+              accepted_at TEXT DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS login_failures(
+              account_kind TEXT NOT NULL, account_id TEXT NOT NULL, phone TEXT DEFAULT '',
+              attempts INTEGER NOT NULL DEFAULT 0, last_attempt TEXT DEFAULT CURRENT_TIMESTAMP,
+              PRIMARY KEY(account_kind, account_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_requests_status ON customer_requests(status, created_at);
+            CREATE INDEX IF NOT EXISTS idx_notifications_target ON app_notifications(target_kind, target_id, is_read);
+            CREATE INDEX IF NOT EXISTS idx_sessions_hash ON auth_sessions(token_hash, expires_at);
             """
         )
         ensure_column(con, "providers", "image_path", "TEXT DEFAULT ''")
@@ -650,9 +755,224 @@ def admin_public(r):
     return d
 
 
+def issue_token(session):
+    token = secrets.token_urlsafe(32)
+    with db() as con:
+        con.execute(
+            "INSERT INTO auth_sessions(id,token_hash,session_json,expires_at) VALUES(?,?,?,?)",
+            (slug("ses"), hash_secret(token), jdump(session), iso_datetime(days=SESSION_DAYS)),
+        )
+    TOKENS[token] = session
+    return token
+
+
 def token_session(headers):
     token = headers.get("Authorization", "").replace("Bearer ", "")
-    return TOKENS.get(token)
+    if not token:
+        return None
+    if token in TOKENS:
+        return TOKENS[token]
+    with db() as con:
+        row = con.execute(
+            "SELECT session_json,expires_at FROM auth_sessions WHERE token_hash=? AND revoked=0",
+            (hash_secret(token),),
+        ).fetchone()
+    if not row:
+        return None
+    try:
+        expires_at = datetime.fromisoformat(str(row["expires_at"]).replace("Z", "+00:00"))
+        if expires_at.tzinfo is None:
+            expires_at = expires_at.replace(tzinfo=UTC)
+        if expires_at <= datetime.now(UTC):
+            return None
+    except ValueError:
+        return None
+    session = jload(row["session_json"], None)
+    if session:
+        TOKENS[token] = session
+    return session
+
+
+def row_app_user(r, private=False):
+    d = dict(r)
+    d["firstLogin"] = d.pop("first_login", "")
+    d["lastLogin"] = d.pop("last_login", "")
+    d["loginCount"] = int(d.pop("login_count", 0) or 0)
+    d["failedAttempts"] = int(d.pop("failed_attempts", 0) or 0)
+    d["lockedUntil"] = d.pop("locked_until", "")
+    d["pinConfigured"] = bool(d.pop("pin_hash", ""))
+    if not private:
+        d.pop("phone", None)
+    return d
+
+
+def row_customer_request(r):
+    d = dict(r)
+    d["userId"] = d.pop("user_id", "")
+    d["customerName"] = d.pop("customer_name", "")
+    d["serviceValue"] = d.pop("service_value", "")
+    d["serviceName"] = d.pop("service_name", "")
+    d["scheduleType"] = d.pop("schedule_type", "")
+    d["requestedAt"] = d.pop("requested_at", "")
+    d["budgetMin"] = d.pop("budget_min", 0)
+    d["budgetMax"] = d.pop("budget_max", 0)
+    d["locationText"] = d.pop("location_text", "")
+    d["images"] = jload(d["images"], [])
+    d["acceptedProviderId"] = d.pop("accepted_provider_id", "")
+    d["matchingProviderIds"] = jload(d.pop("matching_provider_ids", "[]"), [])
+    d["declinedProviderIds"] = jload(d.pop("declined_provider_ids", "[]"), [])
+    d["offersOpen"] = bool(d.pop("offers_open", 0))
+    d["createdAt"] = d.pop("created_at", "")
+    d["updatedAt"] = d.pop("updated_at", "")
+    return d
+
+
+def row_notification(r):
+    d = dict(r)
+    d["targetKind"] = d.pop("target_kind")
+    d["targetId"] = d.pop("target_id")
+    d["relatedId"] = d.pop("related_id")
+    d["actionText"] = d.pop("action_text")
+    d["actionRoute"] = d.pop("action_route")
+    d["read"] = bool(d.pop("is_read"))
+    d["createdAt"] = d.pop("created_at")
+    return d
+
+
+def row_advertisement(r):
+    d = dict(r)
+    d["imageUrl"] = image_url(d.pop("image_path", ""))
+    d["startsAt"] = d.pop("starts_at", "")
+    d["endsAt"] = d.pop("ends_at", "")
+    d["deletedAt"] = d.pop("deleted_at", "")
+    d["createdAt"] = d.pop("created_at", "")
+    d["updatedAt"] = d.pop("updated_at", "")
+    d["active"] = bool(d["active"])
+    return d
+
+
+def push_ready():
+    return bool(webpush and os.environ.get("VAPID_PRIVATE_KEY") and os.environ.get("VAPID_PUBLIC_KEY"))
+
+
+def deliver_push(target_kind, target_id, payload):
+    if not push_ready():
+        return
+    time.sleep(0.15)
+    with db() as con:
+        subscriptions = list(
+            con.execute(
+                """SELECT id,subscription_json FROM push_subscriptions
+                WHERE target_kind=? AND target_id=? AND active=1""",
+                (target_kind, target_id or ""),
+            )
+        )
+    for subscription in subscriptions:
+        try:
+            webpush(
+                subscription_info=jload(subscription["subscription_json"], {}),
+                data=jdump(payload),
+                vapid_private_key=os.environ["VAPID_PRIVATE_KEY"],
+                vapid_claims={"sub": os.environ.get("VAPID_SUBJECT", "mailto:foranoman@gmail.com")},
+                ttl=300,
+            )
+            with db() as con:
+                con.execute(
+                    "UPDATE push_subscriptions SET last_success_at=CURRENT_TIMESTAMP WHERE id=?",
+                    (subscription["id"],),
+                )
+        except WebPushException as err:
+            status = getattr(getattr(err, "response", None), "status_code", 0)
+            if status in (404, 410):
+                with db() as con:
+                    con.execute("UPDATE push_subscriptions SET active=0 WHERE id=?", (subscription["id"],))
+        except Exception as err:
+            print(f"Push delivery skipped: {err}", flush=True)
+
+
+def create_notification(con, target_kind, target_id, title, message="", *, type_="general",
+                        related_id="", priority="normal", action_text="", action_route=""):
+    notification_id = slug("ntf")
+    con.execute(
+        """INSERT INTO app_notifications(
+        id,target_kind,target_id,type,title,message,related_id,priority,action_text,action_route)
+        VALUES(?,?,?,?,?,?,?,?,?,?)""",
+        (
+            notification_id, target_kind, target_id or "", type_, title[:160], message[:1200],
+            related_id or "", priority, action_text[:80], action_route[:240],
+        ),
+    )
+    if push_ready():
+        threading.Thread(
+            target=deliver_push,
+            args=(
+                target_kind,
+                target_id or "",
+                {
+                    "id": notification_id,
+                    "title": title[:160],
+                    "body": message[:1200],
+                    "tag": f"khadamati-{notification_id}",
+                    "route": "https://lllx6.github.io/faoran/",
+                },
+            ),
+            daemon=True,
+        ).start()
+    return notification_id
+
+
+def request_matches_provider(request_item, provider):
+    service_value = str(request_item.get("serviceValue") or "")
+    requested_cat, requested_service = ("", "")
+    if "|" in service_value:
+        requested_cat, requested_service = service_value.split("|", 1)
+    service_ok = any(
+        svc.get("active", True)
+        and (
+            (requested_cat and svc.get("catId") == requested_cat)
+            or (requested_service and svc.get("serviceId") == requested_service)
+        )
+        for svc in provider.get("services") or []
+    )
+    if not service_ok:
+        return False
+    request_area = {str(request_item.get("gov") or ""), str(request_item.get("wilayah") or "")} - {""}
+    provider_area = {
+        str(provider.get("gov") or ""),
+        str(provider.get("wilayah") or ""),
+        *(str(a) for a in provider.get("areas") or []),
+    } - {""}
+    return not request_area or bool(request_area & provider_area)
+
+
+def record_login_failure(con, account_kind, account_id, phone=""):
+    con.execute(
+        """INSERT INTO login_failures(account_kind,account_id,phone,attempts,last_attempt)
+        VALUES(?,?,?,1,CURRENT_TIMESTAMP)
+        ON CONFLICT(account_kind,account_id) DO UPDATE SET
+        attempts=login_failures.attempts+1,last_attempt=CURRENT_TIMESTAMP""",
+        (account_kind, account_id or phone or "unknown", phone),
+    )
+    row = con.execute(
+        "SELECT attempts FROM login_failures WHERE account_kind=? AND account_id=?",
+        (account_kind, account_id or phone or "unknown"),
+    ).fetchone()
+    attempts = int(row["attempts"] or 0)
+    if attempts == 3 or (attempts > 3 and attempts % 5 == 0):
+        create_notification(
+            con, "admin", "", "محاولات دخول غير ناجحة",
+            f"{account_kind}: {phone or account_id} - عدد المحاولات {attempts}",
+            type_="security", related_id=account_id, priority="urgent",
+            action_text="مراجعة الحساب", action_route=f"admin:{account_kind}:{account_id}",
+        )
+    return attempts
+
+
+def clear_login_failures(con, account_kind, account_id):
+    con.execute(
+        "DELETE FROM login_failures WHERE account_kind=? AND account_id=?",
+        (account_kind, account_id),
+    )
 
 
 def permissions_for(role, selected=None):
@@ -667,8 +987,65 @@ def has_permission(session, permission):
     return session.get("role") == "owner" or permission in session.get("permissions", [])
 
 
+def scan_expirations(con):
+    settings_row = con.execute("SELECT value FROM settings WHERE key='platform'").fetchone()
+    settings = jload(settings_row["value"], {}) if settings_row else {}
+    thresholds = settings.get("expiryThresholds", [30, 15, 7, 3, 0])
+    thresholds = sorted({int(x) for x in thresholds if str(x).lstrip("-").isdigit()}, reverse=True) or [30, 15, 7, 3, 0]
+    checks = []
+    for row in con.execute(
+        """SELECT id,name,subscription_until,verification_expiry,commercial_expiry,license_expiry
+        FROM providers"""
+    ):
+        for field, label in (
+            ("subscription_until", "الاشتراك"),
+            ("verification_expiry", "التوثيق"),
+            ("commercial_expiry", "السجل التجاري"),
+            ("license_expiry", "الرخصة"),
+        ):
+            if row[field]:
+                checks.append(("provider", row["id"], row["name"], label, row[field]))
+    for row in con.execute("SELECT id,advertiser,ends_at FROM advertisements WHERE active=1"):
+        if row["ends_at"]:
+            checks.append(("advertisement", row["id"], row["advertiser"] or "إعلان", "الإعلان", row["ends_at"]))
+    today = datetime.now(UTC).date()
+    for kind, item_id, name, label, raw_date in checks:
+        try:
+            expiry = datetime.fromisoformat(str(raw_date).replace("Z", "+00:00")).date()
+        except ValueError:
+            try:
+                expiry = datetime.strptime(str(raw_date)[:10], "%Y-%m-%d").date()
+            except ValueError:
+                continue
+        days = (expiry - today).days
+        stage = "expired" if days < 0 else next((str(t) for t in thresholds if days <= t), None)
+        if stage is None:
+            continue
+        dedupe = f"expiry:{kind}:{item_id}:{label}:{stage}"
+        if con.execute(
+            "SELECT id FROM app_notifications WHERE type='expiry' AND related_id=?",
+            (dedupe,),
+        ).fetchone():
+            continue
+        title = f"انتهت صلاحية {label}" if days < 0 else f"{label} قريب الانتهاء"
+        message = f"{name} - {raw_date}" + (f" - متبقٍ {days} يوم" if days >= 0 else "")
+        create_notification(
+            con, "admin", "", title, message, type_="expiry", related_id=dedupe,
+            priority="urgent" if days <= 3 else "high",
+            action_text="فتح الملف", action_route=f"admin:{kind}:{item_id}",
+        )
+        if kind == "provider" and label == "الاشتراك":
+            create_notification(
+                con, "provider", item_id, title, message, type_="expiry", related_id=dedupe,
+                priority="urgent" if days <= 3 else "high",
+                action_text="تجديد الباقة", action_route="provider:subscription",
+            )
+
+
 def get_bootstrap(session=None):
     with db() as con:
+        if session and session.get("kind") == "admin":
+            scan_expirations(con)
         categories = []
         for c in con.execute("SELECT * FROM categories ORDER BY rowid"):
             cd = dict(c)
@@ -677,6 +1054,7 @@ def get_bootstrap(session=None):
             categories.append(cd)
         is_admin = bool(session and session.get("kind") == "admin")
         is_provider = bool(session and session.get("kind") == "provider")
+        is_user = bool(session and session.get("kind") == "user")
         providers = [row_provider(r, private=is_admin) for r in con.execute("SELECT * FROM providers ORDER BY featured DESC, quality_score DESC, rating DESC")]
         requests = []
         if has_permission(session, "review_requests"):
@@ -716,6 +1094,72 @@ def get_bootstrap(session=None):
         else:
             reviews = [row_review(r) for r in con.execute("SELECT * FROM reviews WHERE approved=1 ORDER BY created_at DESC")]
             complaints, subscriptions, payments, audits, leads = [], [], [], [], []
+        all_customer_requests = [
+            row_customer_request(r)
+            for r in con.execute("SELECT * FROM customer_requests ORDER BY created_at DESC LIMIT 300")
+        ]
+        if is_admin:
+            customer_requests = all_customer_requests
+            notifications = [
+                row_notification(r)
+                for r in con.execute("SELECT * FROM app_notifications ORDER BY created_at DESC LIMIT 300")
+            ]
+            users = [
+                row_app_user(r, private=True)
+                for r in con.execute("SELECT * FROM app_users ORDER BY last_login DESC LIMIT 300")
+            ]
+            advertisements = [
+                row_advertisement(r)
+                for r in con.execute("SELECT * FROM advertisements ORDER BY created_at DESC")
+            ]
+        elif is_provider:
+            pid = session["providerId"]
+            customer_requests = [
+                item for item in all_customer_requests
+                if pid in item["matchingProviderIds"] or item["acceptedProviderId"] == pid
+            ]
+            notifications = [
+                row_notification(r)
+                for r in con.execute(
+                    """SELECT * FROM app_notifications
+                    WHERE target_kind='provider' AND target_id=? ORDER BY created_at DESC LIMIT 160""",
+                    (pid,),
+                )
+            ]
+            users = []
+            advertisements = [
+                row_advertisement(r)
+                for r in con.execute(
+                    "SELECT * FROM advertisements WHERE active=1 AND COALESCE(deleted_at,'')='' ORDER BY created_at DESC"
+                )
+            ]
+        elif is_user:
+            uid = session["userId"]
+            customer_requests = [item for item in all_customer_requests if item["userId"] == uid]
+            notifications = [
+                row_notification(r)
+                for r in con.execute(
+                    """SELECT * FROM app_notifications
+                    WHERE target_kind='user' AND target_id=? ORDER BY created_at DESC LIMIT 160""",
+                    (uid,),
+                )
+            ]
+            user_row = con.execute("SELECT * FROM app_users WHERE id=?", (uid,)).fetchone()
+            users = [row_app_user(user_row, private=True)] if user_row else []
+            advertisements = [
+                row_advertisement(r)
+                for r in con.execute(
+                    "SELECT * FROM advertisements WHERE active=1 AND COALESCE(deleted_at,'')='' ORDER BY created_at DESC"
+                )
+            ]
+        else:
+            customer_requests, notifications, users = [], [], []
+            advertisements = [
+                row_advertisement(r)
+                for r in con.execute(
+                    "SELECT * FROM advertisements WHERE active=1 AND COALESCE(deleted_at,'')='' ORDER BY created_at DESC"
+                )
+            ]
         payment_revenue = con.execute("SELECT COALESCE(SUM(amount),0) n FROM payments WHERE kind='revenue' AND status='paid'").fetchone()["n"]
         finance_revenue = con.execute("SELECT COALESCE(SUM(amount),0) n FROM finance WHERE kind='revenue'").fetchone()["n"]
         stats = {
@@ -729,6 +1173,14 @@ def get_bootstrap(session=None):
             "activeSubscriptions": con.execute("SELECT COUNT(*) n FROM subscriptions WHERE status='active'").fetchone()["n"],
             "qualityAverage": round(con.execute("SELECT COALESCE(AVG(quality_score),0) n FROM providers").fetchone()["n"], 1),
             "whatsappLogs": con.execute("SELECT COUNT(*) n FROM whatsapp_logs").fetchone()["n"],
+            "users": con.execute("SELECT COUNT(*) n FROM app_users WHERE status='active'").fetchone()["n"],
+            "customerRequests": con.execute("SELECT COUNT(*) n FROM customer_requests").fetchone()["n"],
+            "unavailableRequests": con.execute(
+                "SELECT COUNT(*) n FROM customer_requests WHERE status='unavailable'"
+            ).fetchone()["n"],
+            "unreadNotifications": con.execute(
+                "SELECT COUNT(*) n FROM app_notifications WHERE is_read=0"
+            ).fetchone()["n"] if is_admin else len([n for n in notifications if not n["read"]]),
         }
         reports = {
             "topProviders": sorted(
@@ -756,6 +1208,10 @@ def get_bootstrap(session=None):
             "payments": payments,
             "leads": leads,
             "auditLogs": audits,
+            "customerRequests": customer_requests,
+            "notifications": notifications,
+            "users": users,
+            "advertisements": advertisements,
             "settings": settings,
             "stats": stats,
             "reports": reports,
@@ -766,6 +1222,8 @@ def get_bootstrap(session=None):
             data["adminUser"] = {k: session[k] for k in ("id", "name", "role", "permissions")}
             if has_permission(session, "manage_admins"):
                 data["adminUsers"] = [admin_public(r) for r in con.execute("SELECT * FROM admin_users ORDER BY created_at")]
+        elif is_user and users:
+            data["currentUser"] = users[0]
         return data
 
 
@@ -887,13 +1345,18 @@ def upsert_provider(con, data):
         image_path = existing_provider.get("imagePath", "")
     pin_hash = data.get("pinHash") or ""
     if data.get("pin"):
-        pin_hash = hash_secret(data["pin"])
+        pin_hash = hash_pin(data["pin"])
     if not pin_hash:
         existing_hash = existing["pin_hash"] if existing else ""
         pin_hash = existing_hash or hash_secret(default_provider_pin(p.get("phone")))
     work_images = data.get("workImages") or existing_provider.get("workImages", [])
     if data.get("workImagesData"):
-        work_images = save_many_images(p["id"], data.get("workImagesData"), "work", 15 if data.get("providerType") == "company" else 5)
+        limit = 15 if data.get("providerType", existing_provider.get("providerType")) == "company" else 5
+        new_images = save_many_images(
+            p["id"], data.get("workImagesData"),
+            f"work{int(time.time())}-", max(0, limit - len(work_images)),
+        )
+        work_images = list(dict.fromkeys([*work_images, *new_images]))[:limit]
     card_image = data.get("cardImage") or existing_provider.get("cardImage", "") or image_url(image_path)
     if isinstance(card_image, str) and card_image.startswith("data:"):
         if card_image == data.get("imageData"):
@@ -906,7 +1369,11 @@ def upsert_provider(con, data):
                 card_image = image_url(image_path)
     documents = data.get("documents") or existing_provider.get("documents", [])
     if data.get("documentsData"):
-        documents = save_many_documents(p["id"], data.get("documentsData"), "doc", 3)
+        new_documents = save_many_documents(
+            p["id"], data.get("documentsData"),
+            f"doc{int(time.time())}-", max(0, 6 - len(documents)),
+        )
+        documents = list(dict.fromkeys([*documents, *new_documents]))[:6]
     location = data.get("location") or existing_provider.get("location") or {}
     con.execute(
         """INSERT INTO providers(id,name,phone,gov,wilayah,areas,bio,hours,status,active,verified,featured,
@@ -964,13 +1431,32 @@ class Handler(SimpleHTTPRequestHandler):
 
     def end_headers(self):
         self.send_header("Cache-Control", "no-store")
+        origin = self.headers.get("Origin", "").rstrip("/")
+        if origin in ALLOWED_ORIGINS:
+            self.send_header("Access-Control-Allow-Origin", origin)
+            self.send_header("Access-Control-Allow-Headers", "Authorization, Content-Type")
+            self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+            self.send_header("Vary", "Origin")
         super().end_headers()
+
+    def do_OPTIONS(self):
+        self.send_response(204)
+        self.end_headers()
 
     def send_json(self, data, status=200):
         raw = jdump(data).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
+
+    def send_bytes(self, raw, content_type, filename=None, status=200):
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(raw)))
+        if filename:
+            self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
         self.end_headers()
         self.wfile.write(raw)
 
@@ -997,6 +1483,13 @@ class Handler(SimpleHTTPRequestHandler):
             return None
         return session
 
+    def require_user(self):
+        session = self.session()
+        if not session or session.get("kind") != "user":
+            self.send_json({"error": "user_auth_required"}, 401)
+            return None
+        return session
+
     def send_upload(self, path):
         filename = path.removeprefix("/uploads/")
         if not filename or "/" in filename or "\\" in filename:
@@ -1016,9 +1509,40 @@ class Handler(SimpleHTTPRequestHandler):
             self.copyfile(f, self.wfile)
 
     def do_GET(self):
-        path = urlparse(self.path).path
+        parsed = urlparse(self.path)
+        path = parsed.path
         if path.startswith("/uploads/"):
+            filename = path.removeprefix("/uploads/")
+            if "-doc" in filename:
+                session = self.session()
+                if not session or session.get("kind") != "admin" or not has_permission(session, "review_requests"):
+                    return self.send_json({"error": "document_access_denied"}, 403)
             return self.send_upload(path)
+        if path.startswith("/share/provider/"):
+            provider_id = path.rsplit("/", 1)[-1]
+            with db() as con:
+                row = con.execute("SELECT * FROM providers WHERE id=? AND active=1", (provider_id,)).fetchone()
+            if not row:
+                return self.send_error(404)
+            provider = row_provider(row)
+            host = self.headers.get("Host", "localhost")
+            scheme = self.headers.get("X-Forwarded-Proto", "http").split(",", 1)[0]
+            image_path = provider.get("cardImage") or provider.get("imageUrl") or "/app-icon-512.png"
+            image = image_path if str(image_path).startswith("http") else f"{scheme}://{host}{image_path}"
+            target = f"https://lllx6.github.io/faoran/#provider={provider_id}"
+            page = f"""<!doctype html><html lang="ar" dir="rtl"><head><meta charset="utf-8">
+            <meta name="viewport" content="width=device-width,initial-scale=1">
+            <title>{html.escape(provider['name'])} | خدماتي</title>
+            <meta property="og:type" content="profile"><meta property="og:site_name" content="خدماتي">
+            <meta property="og:title" content="{html.escape(provider['name'])}">
+            <meta property="og:description" content="{html.escape(provider.get('bio') or 'مزود خدمة على منصة خدماتي')}">
+            <meta property="og:image" content="{html.escape(image)}">
+            <meta property="og:url" content="{html.escape(f'{scheme}://{host}{path}')}">
+            <style>body{{font-family:Arial;background:#f4f6fb;color:#102a43;display:grid;place-items:center;min-height:100vh}}
+            a{{background:#168f7a;color:white;padding:14px 22px;border-radius:12px;text-decoration:none;font-weight:bold}}</style>
+            <meta http-equiv="refresh" content="1;url={html.escape(target)}"></head>
+            <body><a href="{html.escape(target)}">فتح بطاقة {html.escape(provider['name'])} في خدماتي</a></body></html>"""
+            return self.send_bytes(page.encode("utf-8"), "text/html; charset=utf-8")
         if path == "/api/classic-state":
             session = self.require_admin("manage_settings")
             if not session:
@@ -1027,6 +1551,8 @@ class Handler(SimpleHTTPRequestHandler):
             return self.send_json({"ok": True, "state": state})
         if path == "/api/bootstrap":
             return self.send_json(get_bootstrap(self.session()))
+        if path == "/api/push/public-key":
+            return self.send_json({"publicKey": os.environ.get("VAPID_PUBLIC_KEY", "")})
         if path == "/api/admin/session":
             session = self.require_admin()
             if not session:
@@ -1046,7 +1572,80 @@ class Handler(SimpleHTTPRequestHandler):
             if not session:
                 return
             return self.send_json(get_bootstrap(session))
+        if path.startswith("/api/reports/"):
+            session = self.require_admin("view_reports")
+            if not session:
+                return
+            return self.download_report(path)
         return super().do_GET()
+
+    def download_report(self, path):
+        with db() as con:
+            rows = [
+                ["المؤشر", "القيمة"],
+                ["المستخدمون", con.execute("SELECT COUNT(*) n FROM app_users WHERE status='active'").fetchone()["n"]],
+                ["المزودون", con.execute("SELECT COUNT(*) n FROM providers").fetchone()["n"]],
+                ["الشركات", con.execute("SELECT COUNT(*) n FROM providers WHERE provider_type='company'").fetchone()["n"]],
+                ["طلبات العملاء", con.execute("SELECT COUNT(*) n FROM customer_requests").fetchone()["n"]],
+                ["طلبات غير متاحة", con.execute("SELECT COUNT(*) n FROM customer_requests WHERE status='unavailable'").fetchone()["n"]],
+                ["اشتراكات نشطة", con.execute("SELECT COUNT(*) n FROM subscriptions WHERE status='active'").fetchone()["n"]],
+                ["إيرادات مسجلة", con.execute("SELECT COALESCE(SUM(amount),0) n FROM payments WHERE kind='revenue' AND status='paid'").fetchone()["n"]],
+            ]
+        stamp = datetime.now().strftime("%Y-%m-%d")
+        if path.endswith(".csv"):
+            output = io.StringIO()
+            writer = csv.writer(output)
+            writer.writerows(rows)
+            raw = ("\ufeff" + output.getvalue()).encode("utf-8")
+            return self.send_bytes(raw, "text/csv; charset=utf-8", f"khadamati-report-{stamp}.csv")
+        if path.endswith(".docx"):
+            paragraphs = "".join(
+                f'<w:p><w:pPr><w:bidi/></w:pPr><w:r><w:rPr><w:rtl/></w:rPr><w:t>{html.escape(str(label))}: {html.escape(str(value))}</w:t></w:r></w:p>'
+                for label, value in rows
+            )
+            document = (
+                '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+                '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+                f"<w:body>{paragraphs}<w:sectPr/></w:body></w:document>"
+            )
+            stream = io.BytesIO()
+            with zipfile.ZipFile(stream, "w", zipfile.ZIP_DEFLATED) as archive:
+                archive.writestr(
+                    "[Content_Types].xml",
+                    '<?xml version="1.0" encoding="UTF-8"?>'
+                    '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+                    '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+                    '<Default Extension="xml" ContentType="application/xml"/>'
+                    '<Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>'
+                    "</Types>",
+                )
+                archive.writestr(
+                    "_rels/.rels",
+                    '<?xml version="1.0" encoding="UTF-8"?>'
+                    '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+                    '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>'
+                    "</Relationships>",
+                )
+                archive.writestr("word/document.xml", document)
+            return self.send_bytes(
+                stream.getvalue(),
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                f"khadamati-report-{stamp}.docx",
+            )
+        table_rows = "".join(
+            f"<tr><th>{html.escape(str(label))}</th><td>{html.escape(str(value))}</td></tr>"
+            for label, value in rows
+        )
+        page = f"""<!doctype html><html lang="ar" dir="rtl"><meta charset="utf-8">
+        <title>تقرير خدماتي</title><style>
+        body{{font-family:Arial,sans-serif;max-width:760px;margin:40px auto;color:#102a43}}
+        h1{{color:#087f8c}}table{{width:100%;border-collapse:collapse}}
+        th,td{{padding:12px;border:1px solid #d9e2ec;text-align:right}}th{{background:#f0f7f8}}
+        button{{padding:10px 18px;border:0;border-radius:8px;background:#087f8c;color:white}}
+        @media print{{button{{display:none}}}}
+        </style><h1>تقرير منصة خدماتي</h1><p>{stamp}</p>
+        <table>{table_rows}</table><p><button onclick="print()">طباعة / حفظ PDF</button></p></html>"""
+        return self.send_bytes(page.encode("utf-8"), "text/html; charset=utf-8")
 
     def do_POST(self):
         path = urlparse(self.path).path
@@ -1061,26 +1660,87 @@ class Handler(SimpleHTTPRequestHandler):
             except ValueError as err:
                 return self.send_json({"error": str(err)}, 400)
         if path == "/api/admin/login":
-            code_hash = hash_secret(data.get("code", ""))
             with db() as con:
-                row = con.execute("SELECT * FROM admin_users WHERE code_hash=? AND active=1", (code_hash,)).fetchone()
+                row = next(
+                    (
+                        candidate for candidate in con.execute("SELECT * FROM admin_users WHERE active=1")
+                        if verify_secret(data.get("code", ""), candidate["code_hash"])
+                    ),
+                    None,
+                )
             if not row:
                 return self.send_json({"error": "invalid_code"}, 403)
             user = admin_public(row)
-            token = secrets.token_urlsafe(24)
-            TOKENS[token] = {"kind": "admin", **user}
+            token = issue_token({"kind": "admin", **user})
             return self.send_json({"token": token, "user": user})
         if path == "/api/provider/login":
             phone = normalize_phone(data.get("phone", ""))
-            pin_hash = hash_secret(data.get("pin", ""))
             with db() as con:
-                row = con.execute("SELECT * FROM providers WHERE (phone=? OR phone=?) AND pin_hash=?", (phone, phone.replace("968", "", 1), pin_hash)).fetchone()
+                row = con.execute(
+                    "SELECT * FROM providers WHERE phone=? OR phone=?",
+                    (phone, phone.replace("968", "", 1)),
+                ).fetchone()
+                if not row or not verify_secret(data.get("pin", ""), row["pin_hash"] if row else ""):
+                    attempts = record_login_failure(con, "provider", row["id"] if row else phone, phone)
+                    return self.send_json(
+                        {"error": "invalid_provider_login", "attempts": attempts},
+                        403,
+                    )
+                clear_login_failures(con, "provider", row["id"])
             if not row:
                 return self.send_json({"error": "invalid_provider_login"}, 403)
             provider = row_provider(row, private=True)
-            token = secrets.token_urlsafe(24)
-            TOKENS[token] = {"kind": "provider", "providerId": provider["id"], "name": provider["name"]}
+            token = issue_token({"kind": "provider", "providerId": provider["id"], "name": provider["name"]})
             return self.send_json({"token": token, "provider": provider})
+        if path == "/api/users/login":
+            phone = normalize_phone(data.get("phone", ""))
+            name = str(data.get("name", "") or "").strip()[:80]
+            pin = str(data.get("pin", "") or "")
+            if len(phone) < 11:
+                return self.send_json({"error": "valid_phone_required"}, 400)
+            with db() as con:
+                row = con.execute("SELECT * FROM app_users WHERE phone=?", (phone,)).fetchone()
+                if row and row["status"] != "active":
+                    return self.send_json({"error": "account_inactive"}, 403)
+                if row and row["pin_hash"] and not verify_secret(pin, row["pin_hash"]):
+                    attempts = record_login_failure(con, "user", row["id"], phone)
+                    con.execute("UPDATE app_users SET failed_attempts=? WHERE id=?", (attempts, row["id"]))
+                    return self.send_json({"error": "invalid_user_pin", "attempts": attempts}, 403)
+                location = data.get("location") or {}
+                if row:
+                    con.execute(
+                        """UPDATE app_users SET name=COALESCE(NULLIF(?,''),name),gov=COALESCE(NULLIF(?,''),gov),
+                        wilayah=COALESCE(NULLIF(?,''),wilayah),latitude=COALESCE(?,latitude),
+                        longitude=COALESCE(?,longitude),last_login=CURRENT_TIMESTAMP,
+                        login_count=login_count+1,failed_attempts=0 WHERE id=?""",
+                        (
+                            name, data.get("gov", ""), data.get("wilayah", ""),
+                            location.get("lat"), location.get("lng"), row["id"],
+                        ),
+                    )
+                    user_id = row["id"]
+                    clear_login_failures(con, "user", user_id)
+                else:
+                    user_id = slug("usr")
+                    con.execute(
+                        """INSERT INTO app_users(
+                        id,phone,name,pin_hash,gov,wilayah,latitude,longitude)
+                        VALUES(?,?,?,?,?,?,?,?)""",
+                        (
+                            user_id, phone, name, hash_pin(pin) if len(pin) >= 4 else "",
+                            data.get("gov", ""), data.get("wilayah", ""),
+                            location.get("lat"), location.get("lng"),
+                        ),
+                    )
+                    create_notification(
+                        con, "admin", "", "مستخدم جديد",
+                        f"تم تسجيل {name or phone}", type_="user", related_id=user_id,
+                        action_text="فتح المستخدم", action_route=f"admin:user:{user_id}",
+                    )
+                user_row = con.execute("SELECT * FROM app_users WHERE id=?", (user_id,)).fetchone()
+            user = row_app_user(user_row, private=True)
+            token = issue_token({"kind": "user", "userId": user_id, "name": user["name"], "phone": phone})
+            return self.send_json({"token": token, "user": user})
         if path == "/api/provider-requests":
             pin = str(data.get("pin", "")).strip()
             req_id = slug("req")
@@ -1103,7 +1763,7 @@ class Handler(SimpleHTTPRequestHandler):
                 "imagePath": "",
                 "workImages": [],
                 "documents": [],
-                "pinHash": hash_secret(pin) if len(pin) >= 4 else "",
+                "pinHash": hash_pin(pin) if len(pin) >= 4 else "",
             }
             if not item["name"] or not item["phone"] or not item["pinHash"]:
                 return self.send_json({"error": "name_phone_pin_required"}, 400)
@@ -1142,6 +1802,22 @@ class Handler(SimpleHTTPRequestHandler):
             return self.save_complaint(data)
         if path == "/api/leads":
             return self.save_lead(data)
+        if path.startswith("/api/user/"):
+            return self.user_post(path, data)
+        if path == "/api/requests/action":
+            return self.request_action(data)
+        if path == "/api/notifications/action":
+            return self.notification_action(data)
+        if path == "/api/recovery/request":
+            return self.recovery_request(data)
+        if path == "/api/recovery/complete":
+            return self.recovery_complete(data)
+        if path == "/api/account/delete":
+            return self.delete_account(data)
+        if path == "/api/push/subscribe":
+            return self.push_subscribe(data)
+        if path == "/api/policy/accept":
+            return self.policy_accept(data)
         if path.startswith("/api/provider/"):
             return self.provider_post(path, data)
         if path.startswith("/api/admin/"):
@@ -1243,9 +1919,367 @@ class Handler(SimpleHTTPRequestHandler):
                     stats = provider["stats"]
                     stats[item["kind"]] = int(stats.get(item["kind"], 0)) + 1
                     con.execute("UPDATE providers SET stats=? WHERE id=?", (jdump(stats), item["provider_id"]))
+            session = self.session()
+            if (
+                item["provider_id"]
+                and session
+                and session.get("kind") == "admin"
+                and item["kind"] in ("booking", "quote", "request")
+            ):
+                create_notification(
+                    con, "provider", item["provider_id"], "ملاحظة من الإدارة",
+                    item["note"], type_="admin", related_id=item["id"], priority="high",
+                    action_text="فتح الرسالة", action_route="provider:support",
+                )
         if data.get("notifyProvider") and provider:
             send_whatsapp(provider["phone"], f"تنبيه من خدماتي: لديك تواصل جديد. {item['note']}".strip())
         return self.send_json({"ok": True, "lead": item}, 200 if data.get("id") else 201)
+
+    def user_post(self, path, data):
+        session = self.require_user()
+        if not session:
+            return
+        user_id = session["userId"]
+        with db() as con:
+            user_row = con.execute("SELECT * FROM app_users WHERE id=? AND status='active'", (user_id,)).fetchone()
+            if not user_row:
+                return self.send_json({"error": "user_not_found"}, 404)
+            if path == "/api/user/profile":
+                avatar = user_row["avatar"] or ""
+                if data.get("avatarData"):
+                    avatar = save_upload_data(user_id, data["avatarData"], "avatar", IMAGE_MIMES, 2_500_000)
+                location = data.get("location") or {}
+                con.execute(
+                    """UPDATE app_users SET name=?,gov=?,wilayah=?,avatar=?,
+                    latitude=COALESCE(?,latitude),longitude=COALESCE(?,longitude)
+                    WHERE id=?""",
+                    (
+                        str(data.get("name", user_row["name"]) or "").strip()[:80],
+                        str(data.get("gov", user_row["gov"]) or "").strip()[:80],
+                        str(data.get("wilayah", user_row["wilayah"]) or "").strip()[:80],
+                        avatar, location.get("lat"), location.get("lng"), user_id,
+                    ),
+                )
+                updated = con.execute("SELECT * FROM app_users WHERE id=?", (user_id,)).fetchone()
+                return self.send_json({"ok": True, "user": row_app_user(updated, private=True)})
+            if path == "/api/user/pin":
+                pin = str(data.get("pin", ""))
+                if len(pin) < 4:
+                    return self.send_json({"error": "pin_too_short"}, 400)
+                if user_row["pin_hash"] and not verify_secret(data.get("currentPin", ""), user_row["pin_hash"]):
+                    return self.send_json({"error": "current_pin_incorrect"}, 403)
+                con.execute("UPDATE app_users SET pin_hash=? WHERE id=?", (hash_pin(pin), user_id))
+                return self.send_json({"ok": True})
+            if path == "/api/user/requests":
+                request_id = str(data.get("id", "") or "")
+                action = data.get("action", "save")
+                if request_id:
+                    current = con.execute(
+                        "SELECT * FROM customer_requests WHERE id=? AND user_id=?",
+                        (request_id, user_id),
+                    ).fetchone()
+                    if not current:
+                        return self.send_json({"error": "request_not_found"}, 404)
+                    if action in ("cancel", "delete", "pause"):
+                        next_status = {"cancel": "cancelled", "delete": "deleted", "pause": "paused"}[action]
+                        con.execute(
+                            """UPDATE customer_requests SET status=?,offers_open=0,
+                            updated_at=CURRENT_TIMESTAMP WHERE id=?""",
+                            (next_status, request_id),
+                        )
+                        create_notification(
+                            con, "admin", "", "تم تحديث طلب",
+                            f"الطلب {request_id}", type_="request", related_id=request_id,
+                            action_text="فتح الطلب", action_route=f"admin:request:{request_id}",
+                        )
+                        return self.send_json({"ok": True, "status": action})
+                    if current["accepted_provider_id"]:
+                        return self.send_json({"error": "accepted_request_cannot_be_edited"}, 409)
+                else:
+                    request_id = slug("ord")
+                service_value = str(data.get("serviceValue", "") or "").strip()[:120]
+                service_name = str(data.get("serviceName", "") or "").strip()[:120]
+                if not service_value:
+                    return self.send_json({"error": "service_required"}, 400)
+                images = jload(current["images"], []) if request_id and 'current' in locals() else []
+                if data.get("imagesData"):
+                    images = save_many_images(request_id, data["imagesData"], "problem", 5)
+                request_item = {
+                    "id": request_id,
+                    "userId": user_id,
+                    "customerName": str(data.get("customerName", user_row["name"]) or "")[:80],
+                    "phone": user_row["phone"],
+                    "serviceValue": service_value,
+                    "serviceName": service_name,
+                    "gov": str(data.get("gov", user_row["gov"]) or "")[:80],
+                    "wilayah": str(data.get("wilayah", user_row["wilayah"]) or "")[:80],
+                }
+                providers = [
+                    row_provider(r, private=True)
+                    for r in con.execute(
+                        "SELECT * FROM providers WHERE active=1 AND status!='unavailable'"
+                    )
+                ]
+                matches = [p["id"] for p in providers if request_matches_provider(request_item, p)]
+                preferred_provider = str(data.get("preferredProviderId", "") or "")
+                if preferred_provider and preferred_provider in matches:
+                    matches = [preferred_provider]
+                status = "matching" if matches else "unavailable"
+                location = data.get("location") or {}
+                con.execute(
+                    """INSERT INTO customer_requests(
+                    id,user_id,customer_name,phone,service_value,service_name,gov,wilayah,
+                    latitude,longitude,urgency,schedule_type,requested_at,budget_min,budget_max,
+                    location_text,note,images,status,accepted_provider_id,matching_provider_ids,
+                    declined_provider_ids,offers_open,updated_at)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP)
+                    ON CONFLICT(id) DO UPDATE SET
+                    customer_name=excluded.customer_name,service_value=excluded.service_value,
+                    service_name=excluded.service_name,gov=excluded.gov,wilayah=excluded.wilayah,
+                    latitude=excluded.latitude,longitude=excluded.longitude,urgency=excluded.urgency,
+                    schedule_type=excluded.schedule_type,requested_at=excluded.requested_at,
+                    budget_min=excluded.budget_min,budget_max=excluded.budget_max,
+                    location_text=excluded.location_text,note=excluded.note,images=excluded.images,
+                    status=excluded.status,matching_provider_ids=excluded.matching_provider_ids,
+                    offers_open=1,updated_at=CURRENT_TIMESTAMP""",
+                    (
+                        request_id, user_id, request_item["customerName"], user_row["phone"],
+                        service_value, service_name, request_item["gov"], request_item["wilayah"],
+                        location.get("lat"), location.get("lng"), data.get("urgency", "normal"),
+                        data.get("scheduleType", "flexible"), data.get("requestedAt", ""),
+                        float(data.get("budgetMin", 0) or 0), float(data.get("budgetMax", 0) or 0),
+                        str(data.get("locationText", "") or "")[:240],
+                        str(data.get("note", "") or "")[:1200], jdump(images), status, "",
+                        jdump(matches), "[]", 1,
+                    ),
+                )
+                for provider_id in matches:
+                    create_notification(
+                        con, "provider", provider_id, "طلب خدمة مناسب لك",
+                        f"{service_name or service_value} - {request_item['wilayah'] or request_item['gov']}",
+                        type_="request", related_id=request_id, priority="high",
+                        action_text="فتح الطلب", action_route=f"provider:request:{request_id}",
+                    )
+                create_notification(
+                    con, "admin", "", "طلب خدمة جديد" if matches else "خدمة غير متاحة",
+                    f"{service_name or service_value} - {request_item['wilayah'] or request_item['gov']}",
+                    type_="request", related_id=request_id,
+                    priority="normal" if matches else "high",
+                    action_text="فتح الطلب", action_route=f"admin:request:{request_id}",
+                )
+                saved = con.execute("SELECT * FROM customer_requests WHERE id=?", (request_id,)).fetchone()
+                return self.send_json(
+                    {"ok": True, "request": row_customer_request(saved), "matchedProviders": len(matches)},
+                    200 if data.get("id") else 201,
+                )
+        return self.send_json({"error": "not_found"}, 404)
+
+    def request_action(self, data):
+        session = self.require_provider()
+        if not session:
+            return
+        request_id = str(data.get("id", ""))
+        action = data.get("action")
+        if action not in ("accept", "decline"):
+            return self.send_json({"error": "invalid_request_action"}, 400)
+        provider_id = session["providerId"]
+        with db() as con:
+            row = con.execute("SELECT * FROM customer_requests WHERE id=?", (request_id,)).fetchone()
+            if not row:
+                return self.send_json({"error": "request_not_found"}, 404)
+            item = row_customer_request(row)
+            if provider_id not in item["matchingProviderIds"]:
+                return self.send_json({"error": "request_not_assigned_to_provider"}, 403)
+            if action == "accept":
+                result = con.execute(
+                    """UPDATE customer_requests SET accepted_provider_id=?,status='accepted',
+                    offers_open=0,updated_at=CURRENT_TIMESTAMP
+                    WHERE id=? AND offers_open=1 AND COALESCE(accepted_provider_id,'')=''""",
+                    (provider_id, request_id),
+                )
+                if result.rowcount != 1:
+                    return self.send_json({"error": "request_already_accepted"}, 409)
+                create_notification(
+                    con, "user", item["userId"], "تم قبول طلبك",
+                    f"وافق مزود على طلب {item['serviceName'] or item['serviceValue']}",
+                    type_="request", related_id=request_id, priority="high",
+                    action_text="عرض الطلب", action_route=f"user:request:{request_id}",
+                )
+                create_notification(
+                    con, "admin", "", "تم قبول طلب",
+                    f"{request_id} بواسطة {session.get('name', provider_id)}",
+                    type_="request", related_id=request_id,
+                    action_text="فتح الطلب", action_route=f"admin:request:{request_id}",
+                )
+            else:
+                declined = list(item["declinedProviderIds"])
+                if provider_id not in declined:
+                    declined.append(provider_id)
+                remaining = [pid for pid in item["matchingProviderIds"] if pid not in declined]
+                status = "matching" if remaining else "unavailable"
+                con.execute(
+                    """UPDATE customer_requests SET declined_provider_ids=?,status=?,
+                    offers_open=?,updated_at=CURRENT_TIMESTAMP WHERE id=?""",
+                    (jdump(declined), status, int(bool(remaining)), request_id),
+                )
+                if not remaining:
+                    create_notification(
+                        con, "user", item["userId"], "لم يتوفر مزود بعد",
+                        "سنحتفظ بطلبك لإيجاد مزود مناسب.", type_="request",
+                        related_id=request_id, action_text="عرض الطلب",
+                        action_route=f"user:request:{request_id}",
+                    )
+            return self.send_json({"ok": True, "status": action})
+
+    def notification_action(self, data):
+        session = self.session()
+        if not session:
+            return self.send_json({"error": "auth_required"}, 401)
+        notification_id = str(data.get("id", ""))
+        action = data.get("action", "read")
+        target_kind = session.get("kind")
+        target_id = session.get("providerId") or session.get("userId") or ""
+        with db() as con:
+            row = con.execute("SELECT * FROM app_notifications WHERE id=?", (notification_id,)).fetchone()
+            if not row:
+                return self.send_json({"error": "notification_not_found"}, 404)
+            if target_kind != "admin" and (
+                row["target_kind"] != target_kind or row["target_id"] != target_id
+            ):
+                return self.send_json({"error": "notification_access_denied"}, 403)
+            if action == "delete":
+                con.execute("DELETE FROM app_notifications WHERE id=?", (notification_id,))
+            else:
+                con.execute("UPDATE app_notifications SET is_read=1 WHERE id=?", (notification_id,))
+            return self.send_json({"ok": True})
+
+    def recovery_request(self, data):
+        phone = normalize_phone(data.get("phone", ""))
+        kind = data.get("kind", "user")
+        if kind not in ("user", "provider"):
+            return self.send_json({"error": "invalid_account_kind"}, 400)
+        with db() as con:
+            if kind == "user":
+                row = con.execute("SELECT id,name FROM app_users WHERE phone=? AND status='active'", (phone,)).fetchone()
+            else:
+                row = con.execute(
+                    "SELECT id,name FROM providers WHERE phone=? OR phone=?",
+                    (phone, phone.replace("968", "", 1)),
+                ).fetchone()
+            if not row:
+                return self.send_json({"error": "account_not_found"}, 404)
+            code = f"{secrets.randbelow(1_000_000):06d}"
+            recovery_id = slug("rcv")
+            con.execute(
+                """INSERT INTO password_recoveries(
+                id,account_kind,account_id,phone,code_hash,expires_at)
+                VALUES(?,?,?,?,?,?)""",
+                (recovery_id, kind, row["id"], phone, hash_pin(code), iso_datetime(minutes=10)),
+            )
+            create_notification(
+                con, "admin", "", "طلب استعادة رمز",
+                f"{row['name']} - {phone}", type_="security", related_id=row["id"],
+                priority="high", action_text="فتح الحساب",
+                action_route=f"admin:{kind}:{row['id']}",
+            )
+        delivery = send_whatsapp(phone, f"رمز استعادة حساب خدماتي هو: {code}. صالح لمدة 10 دقائق.")
+        response = {"ok": True, "recoveryId": recovery_id, "deliveryConfigured": delivery.get("configured", False)}
+        if os.environ.get("KHADAMATI_RECOVERY_DEBUG") == "1":
+            response["debugCode"] = code
+        return self.send_json(response)
+
+    def recovery_complete(self, data):
+        recovery_id = str(data.get("recoveryId", ""))
+        code = str(data.get("code", ""))
+        pin = str(data.get("pin", ""))
+        if len(pin) < 4:
+            return self.send_json({"error": "pin_too_short"}, 400)
+        with db() as con:
+            row = con.execute(
+                "SELECT * FROM password_recoveries WHERE id=? AND COALESCE(used_at,'')=''",
+                (recovery_id,),
+            ).fetchone()
+            if not row:
+                return self.send_json({"error": "recovery_not_found"}, 404)
+            try:
+                expires = datetime.fromisoformat(str(row["expires_at"]).replace("Z", "+00:00"))
+                if expires.tzinfo is None:
+                    expires = expires.replace(tzinfo=UTC)
+            except ValueError:
+                expires = datetime.now(UTC) - timedelta(seconds=1)
+            if expires <= datetime.now(UTC):
+                return self.send_json({"error": "recovery_expired"}, 410)
+            if int(row["attempts"] or 0) >= 5 or not verify_secret(code, row["code_hash"]):
+                con.execute("UPDATE password_recoveries SET attempts=attempts+1 WHERE id=?", (recovery_id,))
+                return self.send_json({"error": "invalid_recovery_code"}, 403)
+            table = "app_users" if row["account_kind"] == "user" else "providers"
+            con.execute(f"UPDATE {table} SET pin_hash=? WHERE id=?", (hash_pin(pin), row["account_id"]))
+            con.execute("UPDATE password_recoveries SET used_at=CURRENT_TIMESTAMP WHERE id=?", (recovery_id,))
+            clear_login_failures(con, row["account_kind"], row["account_id"])
+        return self.send_json({"ok": True})
+
+    def delete_account(self, data):
+        session = self.session()
+        if not session or session.get("kind") not in ("user", "provider"):
+            return self.send_json({"error": "auth_required"}, 401)
+        pin = str(data.get("pin", ""))
+        with db() as con:
+            if session["kind"] == "user":
+                account_id = session["userId"]
+                row = con.execute("SELECT pin_hash FROM app_users WHERE id=?", (account_id,)).fetchone()
+                if row and row["pin_hash"] and not verify_secret(pin, row["pin_hash"]):
+                    return self.send_json({"error": "invalid_user_pin"}, 403)
+                con.execute("UPDATE app_users SET status='deleted' WHERE id=?", (account_id,))
+            else:
+                account_id = session["providerId"]
+                row = con.execute("SELECT pin_hash FROM providers WHERE id=?", (account_id,)).fetchone()
+                if not row or not verify_secret(pin, row["pin_hash"]):
+                    return self.send_json({"error": "invalid_provider_login"}, 403)
+                con.execute("UPDATE providers SET active=0,status='deleted' WHERE id=?", (account_id,))
+            con.execute(
+                "UPDATE auth_sessions SET revoked=1 WHERE session_json LIKE ?",
+                (f'%"{account_id}"%',),
+            )
+            create_notification(
+                con, "admin", "", "تم حذف حساب",
+                f"{session['kind']} - {account_id}", type_="security",
+                related_id=account_id, priority="high",
+            )
+        return self.send_json({"ok": True})
+
+    def push_subscribe(self, data):
+        session = self.session()
+        if not session:
+            return self.send_json({"error": "auth_required"}, 401)
+        subscription = data.get("subscription") or {}
+        endpoint = str(subscription.get("endpoint", ""))
+        if not endpoint:
+            return self.send_json({"error": "push_endpoint_required"}, 400)
+        target_id = session.get("providerId") or session.get("userId") or session.get("id") or ""
+        with db() as con:
+            con.execute(
+                """INSERT INTO push_subscriptions(
+                id,target_kind,target_id,endpoint,subscription_json)
+                VALUES(?,?,?,?,?)
+                ON CONFLICT(endpoint) DO UPDATE SET target_kind=excluded.target_kind,
+                target_id=excluded.target_id,subscription_json=excluded.subscription_json,active=1""",
+                (slug("push"), session["kind"], target_id, endpoint, jdump(subscription)),
+            )
+        return self.send_json({"ok": True, "deliveryReady": bool(os.environ.get("VAPID_PRIVATE_KEY"))})
+
+    def policy_accept(self, data):
+        session = self.session()
+        if not session:
+            return self.send_json({"error": "auth_required"}, 401)
+        policy_version = str(data.get("version", "2026-07"))[:40]
+        user_id = session.get("userId") or session.get("providerId") or session.get("id") or ""
+        phone = session.get("phone", "")
+        with db() as con:
+            con.execute(
+                "INSERT INTO policy_acceptances(id,user_id,phone,policy_version) VALUES(?,?,?,?)",
+                (slug("pol"), user_id, phone, policy_version),
+            )
+        return self.send_json({"ok": True})
 
     def provider_post(self, path, data):
         session = self.require_provider()
@@ -1297,6 +2331,36 @@ class Handler(SimpleHTTPRequestHandler):
                     con.execute("UPDATE providers SET work_images=? WHERE id=?", (jdump(images), provider["id"]))
                     recompute_provider_quality(con, provider["id"])
                 return self.send_json({"ok": True, "workImageUrls": urls(images)})
+            if path == "/api/provider/media":
+                action = data.get("action")
+                raw_path = str(data.get("path", "") or "")
+                selected_path = raw_path.lstrip("/")
+                allowed = {provider.get("imagePath", ""), *(provider.get("workImages") or [])}
+                if selected_path not in allowed:
+                    return self.send_json({"error": "media_not_found"}, 404)
+                if action == "set-card":
+                    con.execute("UPDATE providers SET card_image=? WHERE id=?", (image_url(selected_path), provider["id"]))
+                    return self.send_json({"ok": True, "cardImage": image_url(selected_path)})
+                if action == "delete":
+                    work_images = [p for p in provider.get("workImages", []) if p != selected_path]
+                    avatar = "" if provider.get("imagePath") == selected_path else provider.get("imagePath", "")
+                    card_image = provider.get("cardImage", "")
+                    if card_image.lstrip("/") == selected_path:
+                        card_image = image_url(avatar) if avatar else (image_url(work_images[0]) if work_images else "")
+                    con.execute(
+                        "UPDATE providers SET image_path=?,work_images=?,card_image=? WHERE id=?",
+                        (avatar, jdump(work_images), card_image, provider["id"]),
+                    )
+                    target = (UPLOAD_DIR / Path(selected_path).name).resolve()
+                    try:
+                        target.relative_to(UPLOAD_DIR.resolve())
+                        if target.is_file():
+                            target.unlink()
+                    except ValueError:
+                        pass
+                    recompute_provider_quality(con, provider["id"])
+                    return self.send_json({"ok": True, "cardImage": card_image})
+                return self.send_json({"error": "invalid_media_action"}, 400)
             if path == "/api/provider/documents":
                 docs = save_many_documents(provider["id"], data.get("documentsData", []), "doc", 3)
                 if docs:
@@ -1305,7 +2369,9 @@ class Handler(SimpleHTTPRequestHandler):
             if path == "/api/provider/pin":
                 if len(str(data.get("pin", ""))) < 4:
                     return self.send_json({"error": "pin_too_short"}, 400)
-                con.execute("UPDATE providers SET pin_hash=? WHERE id=?", (hash_secret(data["pin"]), provider["id"]))
+                if not verify_secret(data.get("currentPin", ""), row["pin_hash"]):
+                    return self.send_json({"error": "current_pin_incorrect"}, 403)
+                con.execute("UPDATE providers SET pin_hash=? WHERE id=?", (hash_pin(data["pin"]), provider["id"]))
                 return self.send_json({"ok": True})
             if path == "/api/provider/subscription-request":
                 package_id = data.get("packageId", "basic")
@@ -1317,8 +2383,19 @@ class Handler(SimpleHTTPRequestHandler):
                     "INSERT INTO subscriptions(id,provider_id,package_id,amount,status,start_date,end_date,note) VALUES(?,?,?,?,?,?,?,?)",
                     (sub_id, provider["id"], package_id, pkg["price"], "pending", "", "", data.get("note", "")),
                 )
+                create_notification(
+                    con, "admin", "", "طلب ترقية باقة",
+                    f"{provider['name']} - {pkg['ar']} - {pkg['price']} ر.ع",
+                    type_="subscription", related_id=sub_id, priority="high",
+                    action_text="مراجعة الطلب", action_route=f"admin:subscription:{sub_id}",
+                )
                 log_audit(con, session, "subscription.requested", provider["id"], package_id)
-                return self.send_json({"ok": True, "subscriptionId": sub_id})
+                return self.send_json(
+                    {
+                        "ok": True, "subscriptionId": sub_id,
+                        "amount": pkg["price"], "durationDays": pkg["duration_days"],
+                    }
+                )
         return self.send_json({"error": "not_found"}, 404)
 
     def admin_post(self, path, data):
@@ -1334,6 +2411,7 @@ class Handler(SimpleHTTPRequestHandler):
             "/api/admin/settings": "manage_settings",
             "/api/admin/users": "manage_admins",
             "/api/admin/test-whatsapp": "manage_settings",
+            "/api/admin/ads": "manage_settings",
         }.get(path, "view_reports")
         session = self.require_admin(permission)
         if not session:
@@ -1478,6 +2556,12 @@ class Handler(SimpleHTTPRequestHandler):
                         "UPDATE providers SET package_id=?, featured=?, subscription_start=?, subscription_until=? WHERE id=?",
                         (package_id, 1 if int(pkg["featured_boost"] or 0) > 0 else 0, start_date, end_date, provider_id),
                     )
+                    create_notification(
+                        con, "provider", provider_id, "تم تفعيل باقتك",
+                        f"{pkg['ar']} حتى {end_date}", type_="subscription",
+                        related_id=sub_id, priority="high",
+                        action_text="عرض الباقة", action_route="provider:subscription",
+                    )
                 log_audit(con, session, "subscription.upserted", sub_id, f"{provider_id}:{package_id}:{status}")
                 return self.send_json({"ok": True, "id": sub_id})
             if path == "/api/admin/payments":
@@ -1501,9 +2585,65 @@ class Handler(SimpleHTTPRequestHandler):
                 log_audit(con, session, "payment.upserted", payment_id, str(data.get("amount", 0)))
                 return self.send_json({"ok": True, "id": payment_id})
             if path == "/api/admin/settings":
-                con.execute("UPDATE settings SET value=? WHERE key='platform'", (jdump(data),))
+                settings_data = dict(data)
+                new_admin_code = str(settings_data.pop("adminCode", "") or "")
+                if new_admin_code:
+                    if not re.fullmatch(r"\d{4,10}", new_admin_code):
+                        return self.send_json({"error": "invalid_admin_code"}, 400)
+                    con.execute(
+                        "UPDATE admin_users SET code_hash=? WHERE id=?",
+                        (hash_pin(new_admin_code), session["id"]),
+                    )
+                con.execute("UPDATE settings SET value=? WHERE key='platform'", (jdump(settings_data),))
                 log_audit(con, session, "settings.updated", "platform", "")
                 return self.send_json({"ok": True})
+            if path == "/api/admin/ads":
+                ad_id = str(data.get("id") or slug("ad"))
+                existing = con.execute("SELECT * FROM advertisements WHERE id=?", (ad_id,)).fetchone()
+                if data.get("action") == "delete":
+                    if not existing:
+                        return self.send_json({"error": "advertisement_not_found"}, 404)
+                    con.execute(
+                        "UPDATE advertisements SET active=0,deleted_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                        (ad_id,),
+                    )
+                    create_notification(
+                        con, "admin", "", "تمت أرشفة إعلان",
+                        existing["advertiser"] or ad_id, type_="advertisement", related_id=ad_id,
+                    )
+                    return self.send_json({"ok": True, "archived": True})
+                image_path = existing["image_path"] if existing else ""
+                if data.get("imageData"):
+                    image_path = save_upload_data(ad_id, data["imageData"], "banner", IMAGE_MIMES, 4_000_000)
+                if not image_path:
+                    return self.send_json({"error": "advertisement_image_required"}, 400)
+                con.execute(
+                    """INSERT INTO advertisements(
+                    id,image_path,advertiser,phone,amount,title,body,starts_at,ends_at,active,deleted_at)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?)
+                    ON CONFLICT(id) DO UPDATE SET image_path=excluded.image_path,
+                    advertiser=excluded.advertiser,phone=excluded.phone,amount=excluded.amount,
+                    title=excluded.title,body=excluded.body,starts_at=excluded.starts_at,
+                    ends_at=excluded.ends_at,active=excluded.active,deleted_at=excluded.deleted_at,
+                    updated_at=CURRENT_TIMESTAMP""",
+                    (
+                        ad_id, image_path, str(data.get("advertiser", "") or "")[:120],
+                        normalize_phone(data.get("phone", "")), float(data.get("amount", 0) or 0),
+                        str(data.get("title", "") or "")[:160],
+                        str(data.get("body", "") or "")[:500],
+                        str(data.get("startsAt", "") or "")[:40],
+                        str(data.get("endsAt", "") or "")[:40],
+                        int(bool(data.get("active", True))), "",
+                    ),
+                )
+                create_notification(
+                    con, "admin", "", "تم حفظ إعلان",
+                    str(data.get("advertiser", "") or ad_id), type_="advertisement",
+                    related_id=ad_id, action_text="فتح الإعلان",
+                    action_route=f"admin:advertisement:{ad_id}",
+                )
+                saved = con.execute("SELECT * FROM advertisements WHERE id=?", (ad_id,)).fetchone()
+                return self.send_json({"ok": True, "advertisement": row_advertisement(saved)})
             if path == "/api/admin/users":
                 role = data.get("role", "support")
                 perms = permissions_for(role, data.get("permissions"))

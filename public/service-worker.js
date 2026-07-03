@@ -1,5 +1,12 @@
-const CACHE_NAME = 'khadamati-shell-v21';
-const SHELL = ['./', './index.html', './app-icon-192.png', './app-icon-512.png'];
+const CACHE_NAME = 'khadamati-shell-v22';
+const SHELL = [
+  './',
+  './index.html',
+  './app-icon-192.png',
+  './app-icon-512.png',
+  './vendor/leaflet.css',
+  './vendor/leaflet.js'
+];
 
 self.addEventListener('install', event => {
   event.waitUntil(caches.open(CACHE_NAME).then(cache => cache.addAll(SHELL)).catch(() => {}));
@@ -29,11 +36,29 @@ self.addEventListener('fetch', event => {
 
 self.addEventListener('notificationclick', event => {
   event.notification.close();
+  const route = event.notification.data?.route || './';
   event.waitUntil(
     self.clients.matchAll({ type: 'window', includeUncontrolled: true }).then(clients => {
       const open = clients.find(client => 'focus' in client);
-      if (open) return open.focus();
-      return self.clients.openWindow('./');
+      if (open) {
+        open.postMessage({ type: 'KHADAMATI_NOTIFICATION', route });
+        return open.focus();
+      }
+      return self.clients.openWindow(route);
+    })
+  );
+});
+
+self.addEventListener('push', event => {
+  let payload = {};
+  try { payload = event.data?.json() || {}; } catch (_) { payload = { body: event.data?.text() || '' }; }
+  event.waitUntil(
+    self.registration.showNotification(payload.title || 'خدماتي', {
+      body: payload.body || payload.message || '',
+      icon: './app-icon-192.png',
+      badge: './app-icon-192.png',
+      tag: payload.tag || payload.id || 'khadamati',
+      data: { route: payload.route || './', notificationId: payload.id || '' }
     })
   );
 });
