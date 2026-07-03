@@ -320,7 +320,7 @@ def init_db():
             CREATE TABLE IF NOT EXISTS providers(
               id TEXT PRIMARY KEY, name TEXT NOT NULL, phone TEXT NOT NULL, gov TEXT, wilayah TEXT,
               areas TEXT, bio TEXT, hours TEXT, status TEXT, active INTEGER, verified INTEGER, featured INTEGER,
-              package_id TEXT, rating REAL, reviews INTEGER, admin_note TEXT DEFAULT '', image_path TEXT DEFAULT '',
+              package_id TEXT, rating REAL, reviews INTEGER, admin_note TEXT DEFAULT '', image_path TEXT DEFAULT '', card_image TEXT DEFAULT '',
               pin_hash TEXT DEFAULT '', services TEXT NOT NULL, work_images TEXT DEFAULT '[]', documents TEXT DEFAULT '[]',
               quality_score INTEGER DEFAULT 60, response_score INTEGER DEFAULT 70, subscription_until TEXT DEFAULT '',
               subscription_start TEXT DEFAULT '', provider_type TEXT DEFAULT 'individual', company_name TEXT DEFAULT '', company_id TEXT DEFAULT '',
@@ -373,6 +373,7 @@ def init_db():
             """
         )
         ensure_column(con, "providers", "image_path", "TEXT DEFAULT ''")
+        ensure_column(con, "providers", "card_image", "TEXT DEFAULT ''")
         ensure_column(con, "providers", "pin_hash", "TEXT DEFAULT ''")
         ensure_column(con, "providers", "work_images", "TEXT DEFAULT '[]'")
         ensure_column(con, "providers", "documents", "TEXT DEFAULT '[]'")
@@ -424,8 +425,13 @@ def init_db():
                     p.get("subscription_until", ""), p.get("subscription_start", ""),
                     p.get("provider_type", "individual"), p.get("company_name", ""),
                     jdump(p.get("stats", {"views": 0, "whatsapp": 0, "calls": 0})),
-                    hash_secret(default_provider_pin(p.get("phone", ""))),
+                    hash_secret("1234"),
                 ),
+            )
+        for p in SEED_PROVIDERS:
+            con.execute(
+                "UPDATE providers SET pin_hash=? WHERE id=? AND pin_hash=?",
+                (hash_secret("1234"), p["id"], hash_secret(default_provider_pin(p.get("phone", "")))),
             )
         for r in con.execute("SELECT id, phone FROM providers WHERE COALESCE(pin_hash,'')=''"):
             con.execute("UPDATE providers SET pin_hash=? WHERE id=?", (hash_secret(default_provider_pin(r["phone"])), r["id"]))
@@ -513,6 +519,7 @@ def row_provider(r, private=False):
     d["adminNote"] = d.pop("admin_note", "")
     d["imagePath"] = d.pop("image_path", "")
     d["imageUrl"] = image_url(d["imagePath"])
+    d["cardImage"] = d.pop("card_image", "") or d["imageUrl"]
     d["qualityScore"] = int(d.pop("quality_score", 0) or 0)
     d["responseScore"] = int(d.pop("response_score", 0) or 0)
     d["subscriptionUntil"] = d.pop("subscription_until", "")
@@ -887,20 +894,30 @@ def upsert_provider(con, data):
     work_images = data.get("workImages") or existing_provider.get("workImages", [])
     if data.get("workImagesData"):
         work_images = save_many_images(p["id"], data.get("workImagesData"), "work", 15 if data.get("providerType") == "company" else 5)
+    card_image = data.get("cardImage") or existing_provider.get("cardImage", "") or image_url(image_path)
+    if isinstance(card_image, str) and card_image.startswith("data:"):
+        if card_image == data.get("imageData"):
+            card_image = image_url(image_path)
+        else:
+            source_images = data.get("workImagesData") or []
+            try:
+                card_image = image_url(work_images[source_images.index(card_image)])
+            except (ValueError, IndexError):
+                card_image = image_url(image_path)
     documents = data.get("documents") or existing_provider.get("documents", [])
     if data.get("documentsData"):
         documents = save_many_documents(p["id"], data.get("documentsData"), "doc", 3)
     location = data.get("location") or existing_provider.get("location") or {}
     con.execute(
         """INSERT INTO providers(id,name,phone,gov,wilayah,areas,bio,hours,status,active,verified,featured,
-        package_id,rating,reviews,admin_note,image_path,pin_hash,services,work_images,documents,quality_score,response_score,
+        package_id,rating,reviews,admin_note,image_path,card_image,pin_hash,services,work_images,documents,quality_score,response_score,
         subscription_until,subscription_start,provider_type,company_name,company_id,commercial_no,
         verification_expiry,commercial_expiry,license_expiry,latitude,longitude,location_updated_at,stats)
-        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         ON CONFLICT(id) DO UPDATE SET name=excluded.name,phone=excluded.phone,gov=excluded.gov,
         wilayah=excluded.wilayah,areas=excluded.areas,bio=excluded.bio,hours=excluded.hours,status=excluded.status,
         active=excluded.active,verified=excluded.verified,featured=excluded.featured,package_id=excluded.package_id,
-        rating=excluded.rating,reviews=excluded.reviews,admin_note=excluded.admin_note,image_path=excluded.image_path,
+        rating=excluded.rating,reviews=excluded.reviews,admin_note=excluded.admin_note,image_path=excluded.image_path,card_image=excluded.card_image,
         pin_hash=excluded.pin_hash,services=excluded.services,work_images=excluded.work_images,documents=excluded.documents,
         quality_score=excluded.quality_score,response_score=excluded.response_score,subscription_until=excluded.subscription_until,
         subscription_start=excluded.subscription_start,provider_type=excluded.provider_type,
@@ -915,7 +932,7 @@ def upsert_provider(con, data):
             p.get("packageId", existing_provider.get("packageId", "intro")),
             float(p.get("rating", existing_provider.get("rating", 0)) or 0),
             int(p.get("reviews", existing_provider.get("reviews", 0)) or 0),
-            p.get("adminNote", ""), image_path, pin_hash, jdump(p.get("services", [])), jdump(work_images), jdump(documents),
+            p.get("adminNote", ""), image_path, card_image, pin_hash, jdump(p.get("services", [])), jdump(work_images), jdump(documents),
             int(p.get("qualityScore", existing_provider.get("qualityScore", 60)) or 60),
             int(p.get("responseScore", existing_provider.get("responseScore", 70)) or 70),
             p.get("subscriptionUntil", existing_provider.get("subscriptionUntil", "")),
@@ -934,6 +951,7 @@ def upsert_provider(con, data):
         ),
     )
     p["imagePath"] = image_path
+    p["cardImage"] = card_image
     p["workImages"] = work_images
     p["documents"] = documents
     recompute_provider_quality(con, p["id"])
@@ -1002,6 +1020,9 @@ class Handler(SimpleHTTPRequestHandler):
         if path.startswith("/uploads/"):
             return self.send_upload(path)
         if path == "/api/classic-state":
+            session = self.require_admin("manage_settings")
+            if not session:
+                return
             state = get_classic_state()
             return self.send_json({"ok": True, "state": state})
         if path == "/api/bootstrap":
@@ -1031,6 +1052,9 @@ class Handler(SimpleHTTPRequestHandler):
         path = urlparse(self.path).path
         data = self.read_json()
         if path == "/api/classic-state":
+            session = self.require_admin("manage_settings")
+            if not session:
+                return
             try:
                 saved_at = save_classic_state(data.get("state", data))
                 return self.send_json({"ok": True, "savedAt": saved_at})
@@ -1248,6 +1272,7 @@ class Handler(SimpleHTTPRequestHandler):
                     "hours": data.get("hours", provider["hours"]),
                     "status": data.get("status", provider["status"]),
                     "services": data.get("services", provider["services"]),
+                    "cardImage": data.get("cardImage", provider.get("cardImage", "")),
                     "active": provider["active"],
                     "verified": provider["verified"],
                     "featured": provider["featured"],

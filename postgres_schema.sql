@@ -49,6 +49,7 @@ CREATE TABLE IF NOT EXISTS providers (
   reviews INTEGER,
   admin_note TEXT DEFAULT '',
   image_path TEXT DEFAULT '',
+  card_image TEXT DEFAULT '',
   pin_hash TEXT DEFAULT '',
   services JSONB NOT NULL,
   work_images JSONB DEFAULT '[]',

@@ -1,4 +1,4 @@
-const CACHE_NAME = 'khadamati-shell-v20';
+const CACHE_NAME = 'khadamati-shell-v21';
 const SHELL = ['./', './index.html', './app-icon-192.png', './app-icon-512.png'];
 
 self.addEventListener('install', event => {
