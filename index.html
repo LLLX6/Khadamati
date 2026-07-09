@@ -255,6 +255,39 @@ body.onboarding-open{overflow:hidden;overscroll-behavior:none}
  .onboarding-visual{flex-basis:220px;min-height:205px}.onboarding-copy{padding:14px 16px 10px}.onboarding-copy h2{font-size:1.3rem}.onboarding-copy>p{font-size:.82rem}.onboarding-benefits{margin-top:10px}.onboarding-benefit:nth-child(n+3){display:none}
 }
 @media(prefers-reduced-motion:reduce){*,*:before,*:after{scroll-behavior:auto!important;animation-duration:.01ms!important;animation-iteration-count:1!important;transition-duration:.01ms!important}}
+/* Khadamati v26: final mobile polish, demo ads, and calmer frame rhythm. */
+.panel,.card,.market-tile,.listing-card,.sheet-action,.entry-choice,.home-ad{border-radius:calc(var(--radius,18px) + 2px)}
+.section-head{gap:8px}.section-head h2{letter-spacing:0}.section-head p{max-width:34rem}
+.market-grid.clean-grid{grid-template-columns:repeat(auto-fit,minmax(104px,1fr));gap:10px}
+.clean-grid .market-tile,.service-strip .market-tile{min-height:112px}
+.home-ad.ad-slider{min-height:clamp(168px,24vw,238px);aspect-ratio:16/6.4}
+.home-ad.ad-slider .ad-slide-image{filter:saturate(1.04) contrast(1.02)}
+.ad-slider-copy{max-width:min(76%,680px)}
+.listing-feed.tight-feed,.listing-feed{gap:10px}
+.provider-card-footer{align-items:center}
+.assistant-result{box-shadow:0 8px 22px rgba(16,42,67,.06)}
+.assistant-examples,.suggest-row{padding-bottom:6px}
+.assistant-match-grid{grid-template-columns:repeat(auto-fit,minmax(142px,1fr))}
+.modal-body{scrollbar-gutter:stable}
+@media(max-width:560px){
+ .container{width:min(100% - 20px,1180px)}
+ .app-top-row{height:40px}
+ .global-search{margin-top:6px}
+ .market-grid.clean-grid{grid-template-columns:repeat(3,minmax(0,1fr));gap:7px}
+ .clean-grid .market-tile,.service-strip .market-tile{min-height:78px!important;padding:7px!important}
+ .clean-grid .market-art,.service-strip .market-art{width:32px!important;height:32px!important}
+ .clean-grid .market-tile strong,.service-strip .market-tile strong{font-size:.66rem!important;line-height:1.22}
+ .clean-grid .market-tile small,.service-strip .market-tile small{display:none}
+ .home-ad.ad-slider{min-height:164px!important;aspect-ratio:16/7!important;border-radius:18px!important}
+ .ad-slider-copy h3{font-size:.95rem}.ad-slider-copy p{display:none}
+ .home-live-map .map-stage{height:154px}
+ .listing-card.provider-listing{grid-template-columns:70px minmax(0,1fr)!important;gap:8px!important}
+ .provider-listing .listing-media{width:70px;height:70px;min-height:70px!important}
+ .provider-listing .badge,.provider-listing .sub-badge{font-size:.64rem;padding:3px 6px}
+ .provider-card-footer{gap:6px}
+ .bottom-nav{padding-top:3px}.nav-item{min-height:48px!important}.app-shell{padding-bottom:calc(58px + env(safe-area-inset-bottom,0px))}
+ .assistant-match-grid{grid-template-columns:1fr}
+}
 </style>
 </head>
 <body>
@@ -549,8 +582,23 @@ const seedPackages = () => [
  {id:'featured_90',ar:'بارزة',en:'Featured',price:20,duration:90,durationDays:90,featuredBoost:40,maxServices:1,maxImages:10,maxProviders:1,scope:'individual',active:true},
  {id:'company_90',ar:'شركة',en:'Company',price:30,duration:90,durationDays:90,featuredBoost:25,maxServices:5,maxImages:15,maxProviders:3,scope:'company',active:true}
 ];
+function demoAdImage(title, subtitle, c1, c2, accent){
+ const svg=`<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="520" viewBox="0 0 1200 520">
+ <defs><linearGradient id="g" x1="0" x2="1" y1="0" y2="1"><stop stop-color="${c1}"/><stop offset="1" stop-color="${c2}"/></linearGradient><filter id="s" x="-20%" y="-20%" width="140%" height="140%"><feDropShadow dx="0" dy="18" stdDeviation="18" flood-color="#061522" flood-opacity=".22"/></filter></defs>
+ <rect width="1200" height="520" rx="46" fill="url(#g)"/><circle cx="120" cy="95" r="128" fill="#fff" opacity=".10"/><circle cx="1030" cy="430" r="185" fill="${accent}" opacity=".20"/>
+ <g filter="url(#s)" transform="translate(130 105)"><rect width="230" height="230" rx="58" fill="#fff" opacity=".95"/><path d="M75 132c45 46 93 45 136 2" fill="none" stroke="${accent}" stroke-width="24" stroke-linecap="round"/><path d="M86 96c31-44 73-57 122-39" fill="none" stroke="#123a63" stroke-width="24" stroke-linecap="round"/><path d="M139 78v76M101 116h76" stroke="#d8b46a" stroke-width="24" stroke-linecap="round"/></g>
+ <text x="1010" y="188" text-anchor="end" direction="rtl" unicode-bidi="plaintext" font-family="Tahoma,Arial,sans-serif" font-size="58" font-weight="900" fill="#fff">${title}</text>
+ <text x="1010" y="260" text-anchor="end" direction="rtl" unicode-bidi="plaintext" font-family="Tahoma,Arial,sans-serif" font-size="30" font-weight="700" fill="#eef7fb">${subtitle}</text>
+ <rect x="780" y="318" width="230" height="58" rx="29" fill="#fff" opacity=".92"/><text x="895" y="356" text-anchor="middle" direction="rtl" unicode-bidi="plaintext" font-family="Tahoma,Arial,sans-serif" font-size="23" font-weight="900" fill="#123a63">جرّب خدماتي الآن</text></svg>`;
+ return `data:image/svg+xml;charset=UTF-8,${encodeURIComponent(svg)}`;
+}
+const demoAdSlides = () => [
+ {id:'demo-ad-services',demo:true,active:true,advertiser:'خدماتي',amount:0,title:'خدماتك اليومية في مكان واحد',text:'اطلب الخدمة، قارن العروض، وتابع التنفيذ من هاتفك.',image:demoAdImage('خدماتك اليومية في مكان واحد','اطلب الخدمة وقارن العروض وتابع التنفيذ من هاتفك','#0f4f73','#15a085','#d8b46a'),createdAt:nowISO()},
+ {id:'demo-ad-trusted',demo:true,active:true,advertiser:'خدماتي',amount:0,title:'مزودون وشركات حولك',text:'خريطة قريبة، تخصصات واضحة، وبطاقات مختصرة.',image:demoAdImage('مزودون وشركات حولك','خريطة قريبة وتخصصات واضحة وبطاقات مختصرة','#123a63','#1f5f8b','#15a085'),createdAt:nowISO()},
+ {id:'demo-ad-assistant',demo:true,active:true,advertiser:'خدماتي',amount:0,title:'مساعدك الشخصي للخدمة المناسبة',text:'اكتب المشكلة وسيقترح التطبيق التخصص الأقرب.',image:demoAdImage('مساعدك الشخصي للخدمة المناسبة','اكتب المشكلة وسيقترح التطبيق التخصص الأقرب','#102a43','#0d8b7f','#f4bd37'),createdAt:nowISO()}
+];
 const seedState = () => ({
- version:25,lang:'ar',theme:'light',view:'entry',lastView:'home',entrySeen:false,splashSeen:false,userUiMode:'simple',filtersOpen:false,user:{name:'',phone:'',gov:'مسقط',wilayah:'السيب',avatar:'',location:null,accessPin:''},session:{mode:'none',userId:''},users:[],guestVisits:[],currentProviderId:null,providerLoginMemory:{phone:'',name:''},loginFailures:{},admin:false,adminTab:'overview',adminNavScroll:0,providerTab:'home',providerNavScroll:0,favorites:[],supportNotes:[],customerRequests:[],requestDraft:null,providerRegistrationDraft:null,activityEvents:[],recentSearches:[],notifications:[],assistantSearches:[],unavailableRequests:[],adSlides:[],adArchive:[],adIndex:0,mapFilters:{service:'',gov:''},serviceAreas:GOVS.map(g=>({ar:g.ar,en:g.en,w:g.w.map(x=>[...x])})),
+ version:26,lang:'ar',theme:'light',view:'entry',lastView:'home',entrySeen:false,splashSeen:false,userUiMode:'simple',filtersOpen:false,user:{name:'',phone:'',gov:'مسقط',wilayah:'السيب',avatar:'',location:null,accessPin:''},session:{mode:'none',userId:''},users:[],guestVisits:[],currentProviderId:null,providerLoginMemory:{phone:'',name:''},loginFailures:{},admin:false,adminTab:'overview',adminNavScroll:0,providerTab:'home',providerNavScroll:0,favorites:[],supportNotes:[],customerRequests:[],requestDraft:null,providerRegistrationDraft:null,activityEvents:[],recentSearches:[],notifications:[],assistantSearches:[],unavailableRequests:[],adSlides:demoAdSlides(),demoAdsSeeded:true,adArchive:[],adIndex:0,mapFilters:{service:'',gov:''},serviceAreas:GOVS.map(g=>({ar:g.ar,en:g.en,w:g.w.map(x=>[...x])})),
  categories:seedCategories(),providers:seedProviders(),providerRequests:[],reviews:[],complaints:[],subscriptions:[],payments:[],leads:[],auditLogs:[],reports:{},serverStats:{},
  platform:{...PLATFORM_DEFAULTS,nameAr:'خدماتي',nameEn:'Khadamati',adminWhatsapp:'96890000000',defaultGov:'مسقط',defaultLang:'ar',acceptProviders:true,subscriptionsEnabled:false,paymentGatewayEnabled:false,monthlyGoal:500},
  packages:seedPackages(),
@@ -692,6 +740,10 @@ function ensurePlatform(){
  S.assistantSearches=S.assistantSearches||[];
  S.unavailableRequests=S.unavailableRequests||[];
   S.adSlides=S.adSlides||[];
+ if(!S.demoAdsSeeded && !S.adSlides.length && !(S.adArchive||[]).length){
+  S.adSlides=demoAdSlides();
+  S.demoAdsSeeded=true;
+ }
  S.adArchive=S.adArchive||[];
  S.mapFilters={service:'',gov:'',...(S.mapFilters||{})};
  S.serviceAreas=(S.serviceAreas&&S.serviceAreas.length)?S.serviceAreas:GOVS.map(g=>({ar:g.ar,en:g.en,w:g.w.map(x=>[...x])}));
@@ -714,7 +766,7 @@ function ensurePlatform(){
  if(!S.session.mode || !['none','registered','guest'].includes(S.session.mode) || (S.session.mode==='none'&&S.user?.phone)) S.session.mode=S.user?.phone?'registered':'none';
  S.providers=(S.providers||[]).map(p=>normalizeProvider({...p,services:p.services||[],areas:p.areas||[],stats:p.stats||{views:0,whatsapp:0,calls:0}}));
  S.providerRequests=(S.providerRequests||[]).map(p=>normalizeProvider({...p,services:p.services||[],areas:p.areas||[]}));
-  S.version=25;
+  S.version=26;
  return S.platform;
 }
 function sessionMode(){ return S.session?.mode||'none'; }
@@ -858,7 +910,22 @@ const ASSISTANT_RULES=[
  {terms:'كمبيوتر لابتوب طابعه كاميرا نقاط بيع تقنيه',serviceIds:['pc','printer','cameras','pos'],role:'فني تقنية',cause:'قد تكون المشكلة في الجهاز، النظام، التوصيلات، أو إعدادات الشبكة.'},
  {terms:'تنظيف بيت منزل شقه كنب سجاد خزان بعد البناء',serviceIds:['home_clean','apt_clean','sofa','carpet','tanks','post_build'],role:'شركة أو مزود تنظيف',cause:'اختر نوع المكان أو القطعة لتحديد المعدات والوقت المطلوب.'},
  {terms:'بناء ترميم بلاط جبس صبغ عزل خرسانه مقاول',serviceIds:['building','renovation','tiles','gypsum','insulation'],role:'مقاول أو فني تشطيبات',cause:'تحتاج المعاينة إلى تحديد المساحة ونوع العمل والمواد المطلوبة.'},
- {terms:'مناسبه تصوير قهوه ضيافه حفله تنسيق كوشه',serviceIds:['photo','hospitality'],role:'مزود مناسبات وضيافة',cause:'حدد التاريخ والموقع وعدد الحضور للحصول على ترشيح أدق.'}
+ {terms:'مناسبه تصوير قهوه ضيافه حفله تنسيق كوشه',serviceIds:['photo','hospitality'],role:'مزود مناسبات وضيافة',cause:'حدد التاريخ والموقع وعدد الحضور للحصول على ترشيح أدق.'},
+ {terms:'حشرات صراصير نمل بق فئران تعقيم ريحه',serviceIds:['cockroach','ants','bedbugs','rodents','home_sanitize','pest'],role:'شركة مكافحة حشرات وتعقيم',cause:'قد تحتاج المشكلة إلى رش آمن، تحديد مصدر الحشرات، إغلاق فتحات الدخول، أو تعقيم المكان بعد المعالجة.'},
+ {terms:'قفل مفتاح باب انغلق ضاع المفتاح فتح قفل سيارة',serviceIds:['locksmith','doors','keys'],role:'فني أقفال ومفاتيح',cause:'قد يكون السبب تلف الأسطوانة، انكسار المفتاح، أو برمجة مفتاح السيارة؛ جهّز صورة للباب أو نوع السيارة إن وجدت.'},
+ {terms:'حديقه شجر عشب زراعه ري مزرعه تقليم ثيل',serviceIds:['garden_design','tree_cut','grass_install','irrigation','farm_care','gardens'],role:'فني حدائق وري',cause:'تختلف الخدمة حسب المساحة ونوع التربة ونظام الري؛ أرسل صورة للموقع لتقدير العمل بسرعة.'},
+ {terms:'ديكور داخلي ورق جدران اضاءة باركيه مطبخ مجلس',serviceIds:['interior_design','wallpaper','lighting','parquet','kitchens','majlis_decor'],role:'مصمم أو فني تشطيب داخلي',cause:'غالباً تحتاج معاينة للمساحة والستايل المطلوب والميزانية قبل تحديد المواد والمدة.'},
+ {terms:'رعايه كبار السن جليسه طفل مريض مساعدة منزلية ترتيب',serviceIds:['elder_care_plus','babysitter','hourly_help','home_organize','elder_care','home_help'],role:'مزود عناية منزلية موثوق',cause:'حدد عدد الساعات، نوع الرعاية، ومكان الخدمة لضمان ترشيح مزود مناسب وآمن.'},
+ {terms:'طباعه مستندات تصوير اوراق رسالة ملف عرض بوربوينت اكسل',serviceIds:['printing_docs','copy_docs','letters','presentations','file_format','data_entry'],role:'مكتب خدمات وطباعة',cause:'حدد نوع الملف وعدد الصفحات وموعد التسليم؛ إرفاق الملف يساعد في تسعير أدق.'},
+ {terms:'شعار اعلان تصميم محتوى سوشيال موقع برمجة تطبيق مونتاج',serviceIds:['logo_design','ad_design','content_design','website_design','website_dev','apps','video_edit'],role:'مصمم أو مطور رقمي',cause:'يحتاج المزود إلى معرفة الهدف، المقاس أو المنصة، والموعد النهائي قبل تقديم العرض.'},
+ {terms:'تسويق حملة اعلانات انستجرام سناب تيك توك تصوير منتجات',serviceIds:['social_ads','campaigns','project_marketing','commercial_photo','product_photo','social_manage'],role:'مسوق رقمي أو مصور إعلاني',cause:'حدد نوع المشروع والجمهور والميزانية التقريبية حتى تكون الخطة الإعلانية واقعية.'},
+ {terms:'عقار شقه ايجار تصوير عقاري وسيط صيانة عقار ادارة شقق',serviceIds:['property_photo','apartment_manage','rental_clean','property_maintenance','property_broker'],role:'مزود خدمات عقارية',cause:'تحتاج الخدمة إلى موقع العقار ونوع الخدمة وصور أولية لتحديد المزود الأقرب.'},
+ {terms:'رحله سياحة حجز مطار استقبال مرشد جولة فندق طيران',serviceIds:['trip_plan','booking_help','tour_guide','airport_receive','airport'],role:'منسق رحلات أو استقبال',cause:'حدد التاريخ وعدد الأشخاص والوجهة لتجهيز عرض مناسب.'},
+ {terms:'ثلاجه فريزر سخان غساله فرن جهاز منزلي لا يعمل',serviceIds:['fridge_repair','freezer_repair','water_heater','appliances'],role:'فني أجهزة منزلية',cause:'قد يكون العطل كهربائياً أو ميكانيكياً؛ اذكر نوع الجهاز والموديل إن أمكن.'},
+ {terms:'سياره كمبيوتر فحص لمبة مكينة حساس كهرباء سيارة',serviceIds:['diagnostics','car_electric','inspection','mechanic'],role:'فني فحص سيارات',cause:'غالباً يحتاج المزود إلى فحص كمبيوتر أو معاينة مباشرة لتحديد الحساس أو العطل.'},
+ {terms:'صيانة مكتب بصمة حضور نقاط بيع كاشير نظام محل',serviceIds:['office_maintenance','attendance','business_pos','pos','admin_services'],role:'مزود خدمات شركات وأنظمة',cause:'حدد عدد الأجهزة أو الموظفين وموقع المكتب لاقتراح نظام مناسب.'},
+ {terms:'هدايا طباعة اكواب تيشيرت ستيكر لوحة محل هدية دعائية',serviceIds:['mug_print','shirt_print','sticker_print','promo_gifts','signboards'],role:'مزود طباعة وهدايا',cause:'تحتاج الخدمة إلى الكمية والمقاس والتصميم وموعد التسليم.'},
+ {terms:'عبايه دشداشه كمه مصر تعديل ملابس خياطه كوي غسيل',serviceIds:['abaya','men_tailor','women_tailor','kumma_mussar','clothes_alter','tailor','ironing','laundry'],role:'خياط أو مزود عناية بالملابس',cause:'أرسل المقاس أو صورة القطعة ونوع التعديل للحصول على تقدير أسرع.'}
 ];
 function findServiceRowByIds(ids){ for(const id of ids){const row=serviceSearchIndex().find(x=>x.svc.id===id);if(row)return row;} return null; }
 function assistantAnalyze(query){
@@ -882,7 +949,7 @@ function recordAssistantSearch(query,result){
 function assistantFollowUp(result){if(result.urgent)return {question:L('هل يوجد خطر مباشر الآن؟','Is there immediate danger?'),options:[L('نعم، الحالة طارئة','Yes, urgent'),L('لا، يمكن الانتظار','No, it can wait')]};if(result.cat?.id==='education')return {question:L('ما المادة أو المرحلة الدراسية؟','Which subject or grade?'),options:[L('رياضيات','Mathematics'),L('إنجليزي','English'),L('مرحلة مدرسية','School level')]};if(['cars','transport','moving'].includes(result.cat?.id))return {question:L('هل تحتاج الخدمة في موقعك الآن؟','Do you need service at your location now?'),options:[L('نعم، في موقعي','Yes, at my location'),L('لا، بموعد لاحق','No, later appointment')]};return {question:L('ما الأولوية المناسبة؟','What priority do you need?'),options:[L('عادي','Normal'),L('اليوم','Today'),L('عاجل','Urgent')]};}
 function assistantResultHtml(query){
  const result=assistantAnalyze(query);
- if(!String(query||'').trim()) return `<div class="empty">${L('اكتب المشكلة بكلمات بسيطة وسيقترح المساعد الخدمة المناسبة.','Describe the issue briefly and the assistant will suggest a service.')}</div>`;
+ if(!String(query||'').trim()) return `<div class="assistant-result"><h3>${L('كيف أساعدك؟','How can I help?')}</h3><p>${L('اكتب المشكلة كما تقولها عادة، مثل: المكيف ما يبرد، عندي تسريب، أريد نقل أثاث، أو أحتاج تصميم إعلان.','Write the issue naturally, such as: AC not cooling, water leak, furniture moving, or ad design.')}</p><div class="assistant-guidance">${icon('sparkle')} ${L('سيقترح المساعد الخدمة، المختص المناسب، سبباً محتملاً، وخطوة الطلب التالية.','The assistant suggests the service, specialist, likely cause, and next request step.')}</div></div>`;
  if(!result) return `<div class="assistant-result"><h3>${L('لم أتعرف على الخدمة بدقة','I could not identify the service precisely')}</h3><p>${L('اكتب كلمة أبسط مثل: مكيف، تسريب، كهرباء، تنظيف، نقل، سيارة، كمبيوتر.','Try a simpler word such as AC, leak, electricity, cleaning, moving, car, or computer.')}</p><div class="assistant-examples">${S.categories.filter(c=>c.active).slice(0,6).map(c=>`<button class="suggest-chip" data-action="category" data-cat="${c.id}">${esc(loc(c))}</button>`).join('')}</div></div>`;
  const matches=visibleProviders().filter(p=>(p.services||[]).some(s=>s.active&&(s.serviceId===result.svc.id||s.catId===result.cat.id)));
  const alternatives=searchServices(query,4).filter(x=>x.value!==result.value).slice(0,3);
@@ -893,7 +960,8 @@ function assistantResultHtml(query){
  return `<div class="assistant-result">${result.urgent?`<span class="badge warn">${L('حالة عاجلة محتملة','Potentially urgent')}</span>`:`<span class="badge ok">${Math.round(result.confidence)}% ${L('تطابق','match')}</span>`}<h3>${L('الخدمة الأنسب','Best matching service')}: ${esc(loc(result.svc))}</h3><p><b>${L('المختص المناسب','Recommended specialist')}:</b> ${esc(L(result.role,result.role))}</p><p><b>${L('التشخيص الأولي','Initial guidance')}:</b> ${esc(L(result.cause,result.cause))}</p><div class="assistant-follow-up"><b>${esc(follow.question)}</b><div class="suggest-row">${follow.options.map(x=>`<button class="suggest-chip" data-action="assistantRefine" data-value="${esc(x)}">${esc(x)}</button>`).join('')}</div></div><div class="assistant-guidance">${icon(result.urgent?'bell':'shield')} ${esc(safety)}</div><div class="listing-meta"><span>${matches.length} ${L('مزوداً مناسباً متاحاً','matching providers available')}</span><span>•</span><span>${esc(loc(result.cat))}</span></div>${alternatives.length?`<div><b>${L('خدمات قريبة','Related services')}</b><div class="assistant-match-grid" style="margin-top:8px">${alternatives.map(x=>`<button class="assistant-match" data-action="assistantChooseService" data-value="${esc(x.value)}"><b>${esc(loc(x.svc))}</b><small>${esc(loc(x.cat))}</small></button>`).join('')}</div></div>`:''}<div class="row-actions"><button class="pill-btn primary" data-action="assistantRequest" data-value="${esc(result.value)}">${L('اطلب هذه الخدمة','Request this service')}</button><button class="ghost-btn" data-action="assistantProviders" data-cat="${result.cat.id}" data-service="${result.svc.id}">${L('اعرض المزودين المناسبين','Show matching providers')}</button></div></div>`;
 }
 function assistantSheet(){
- openModal(`<div class="modal sheet"><div class="modal-head"><div class="modal-title">${icon('brain')} ${L('مساعدك الشخصي','Your personal assistant')}</div><button class="close-btn" data-action="closeModal">×</button></div><div class="modal-body"><div class="field"><label>${L('صف المشكلة أو الخدمة التي تحتاجها','Describe the problem or service you need')}</label><input class="input" id="assistantQuery" placeholder="${L('مثال: المكيف ما يبرد','Example: the AC is not cooling')}" autocomplete="off"></div><div class="assistant-examples" style="margin:10px 0">${['المكيف ما يبرد','تسريب ماء','الكهرباء تقطع','النت ضعيف','أريد أنقل أثاث'].map(q=>`<button class="suggest-chip" data-action="assistantExample" data-q="${q}">${q}</button>`).join('')}</div><div id="assistantResult">${assistantResultHtml('')}</div></div></div>`);
+ const examples=['المكيف ما يبرد','تسريب ماء','الكهرباء تقطع','النت ضعيف','أريد أنقل أثاث','صراصير في المطبخ','القفل ما يفتح','أحتاج تصميم إعلان','ثلاجة لا تبرد','أريد مدرس رياضيات','غسيل سيارة عند البيت','تنسيق حديقة'];
+ openModal(`<div class="modal sheet"><div class="modal-head"><div class="modal-title">${icon('brain')} ${L('مساعدك الشخصي','Your personal assistant')}</div><button class="close-btn" data-action="closeModal">×</button></div><div class="modal-body"><div class="field"><label>${L('صف المشكلة أو الخدمة التي تحتاجها','Describe the problem or service you need')}</label><input class="input" id="assistantQuery" placeholder="${L('مثال: المكيف ما يبرد','Example: the AC is not cooling')}" autocomplete="off"></div><div class="assistant-examples" style="margin:10px 0">${examples.map(q=>`<button class="suggest-chip" data-action="assistantExample" data-q="${q}">${q}</button>`).join('')}</div><div id="assistantResult">${assistantResultHtml('')}</div></div></div>`);
  bindDynamic();
  setTimeout(()=>document.getElementById('assistantQuery')?.focus(),80);
 }
