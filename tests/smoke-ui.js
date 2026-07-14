@@ -55,12 +55,16 @@ async function capture(page, name) {
   await page.locator('[data-action="skipOnboarding"]').click();
 
   assert((await page.locator('.clean-grid .category-tile').count()) <= 6, 'Home must show no more than six categories.');
-  assert(await page.locator('.popular-rail').count(), 'Popular services rail is missing.');
+  assert(await page.locator('main.view > .home-ad.ad-slider').count(), 'Advertisement slider must be the first home block.');
+  assert((await page.locator('.popular-rail').count()) === 0, 'Popular services rail should be removed from home.');
+  assert(await page.locator('.do-it-visual').count(), 'Handle-it visual guide is missing.');
   assert(await page.locator('.context-tip').count(), 'Contextual assistant tip is missing.');
   await capture(page, '01-user-home');
 
-  await page.locator('.popular-rail [data-action="serviceSheet"]').first().click();
-  await page.locator('[data-action="quickRequestForService"]').click();
+  await page.locator('[data-action="openRequestBoard"]').first().click();
+  assert(await page.locator('.request-board-sheet').count(), 'Request board did not open.');
+  await page.locator('[data-action="closeModal"]').click();
+  await page.locator('[data-action="quickRequestForm"]').first().click();
   await page.waitForSelector('.request-wizard');
   await page.locator('#qrName').fill('مستخدم الاختبار الآلي');
   await page.locator('#qrPhone').fill('95550001');
@@ -71,6 +75,9 @@ async function capture(page, name) {
   assert(await page.locator('.match-summary').count(), 'Request matching summary is missing.');
   await page.locator('[data-action="saveQuickRequest"]').click();
   await page.waitForSelector('.active-request-home');
+  await page.locator('[data-action="openRequestBoard"]').first().click();
+  assert(await page.locator('.request-board-card').count(), 'New request is missing from the request board.');
+  await page.locator('[data-action="closeModal"]').click();
   await page.locator('.bottom-nav [data-action="nav"][data-view="myAccount"]').click();
   await page.locator('[data-action="openAppearance"]').click();
   await page.locator('[data-action="setDisplayScale"][data-value="large"]').click();
@@ -98,6 +105,10 @@ async function capture(page, name) {
   await page.locator('[data-action="closeModal"]').click();
 
   await page.locator('.side-nav [data-action="providerTab"][data-tab="leads"]').click();
+  await page.locator('[data-action="openRequestBoard"]').first().click();
+  assert(await page.locator('.request-board-card').count(), 'Provider request board is empty.');
+  assert(await page.locator('.request-board-card [data-action="providerAcceptRequest"]').count(), 'Matching provider cannot offer from the request board.');
+  await page.locator('[data-action="closeModal"]').click();
   await page.locator('[data-action="providerAcceptRequest"]').first().click();
   await page.locator('#offerPrice').fill('12');
   await page.locator('#offerDuration').fill('خلال ساعتين');
