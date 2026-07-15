@@ -1,4 +1,4 @@
-const CACHE_NAME = 'khadamati-shell-v39';
+const CACHE_NAME = 'khadamati-shell-v40';
 const SHELL = [
   './',
   './index.html',

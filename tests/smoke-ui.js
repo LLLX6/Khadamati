@@ -135,6 +135,7 @@ async function clickFirstAction(page, action) {
   await clickUserNav(page, 'myAccount');
   assert(await page.locator('.requests-disclosure').count(), 'Grouped request sections are missing from My Account.');
   assert(await page.locator('.requests-disclosure[open]').count() === 0, 'Request groups should start collapsed.');
+  assert(await page.locator('.loyalty-card-v40 [role="progressbar"]').count(), 'Clear loyalty progress bar is missing.');
   await page.locator('[data-action="openAppearance"]').click();
   await page.locator('[data-action="setDisplayScale"][data-value="large"]').click();
   assert(await page.locator('body').getAttribute('data-scale') === 'large', 'Large text mode was not applied.');
@@ -243,11 +244,25 @@ async function clickFirstAction(page, action) {
   assert((await calendarDownload.suggestedFilename()).endsWith('.ics'), 'Calendar export is not an ICS file.');
 
   await page.locator('.account-menu [data-action="nav"][data-view="provider"]').click();
+  await page.locator('.provider-top-actions [data-action="openNotifications"]').click();
+  assert(await page.locator('.notification-center-tab').count() === 3, 'Notification center must have chats, requests, and updates sections.');
+  await page.locator('[data-action="notificationCenterTab"][data-value="messages"]').click();
+  const providerChatNotice = page.locator('.chat-notification [data-action="notificationAction"]').first();
+  assert(await providerChatNotice.count(), 'Provider chat notification is missing from the chats section.');
+  assert((await page.locator('.chat-notification .notification-copy b').first().textContent()).includes('مستخدم الاختبار الآلي'), 'Provider chat notification does not identify the customer.');
+  await providerChatNotice.locator('xpath=ancestor::details').locator('summary').click();
+  await providerChatNotice.click();
+  await page.waitForSelector('.chat-sheet #chatThread');
+  assert(await page.locator('.chat-sheet .modal-title').filter({ hasText: /مستخدم الاختبار|الخدمة|صيانة/i }).count(), 'Provider notification did not open the correct chat directly.');
+  await page.locator('[data-action="closeModal"]').click();
   await page.locator('.side-nav [data-action="providerTab"][data-tab="leads"]').click();
   await page.locator('[data-action="providerLeadFilter"][data-value="mine"]').click();
   await page.locator('[data-action="openRequestChat"]').first().click();
   assert(await page.locator('[data-action="providerCustomerWhatsapp"]').count(), 'Selected provider cannot use customer-approved WhatsApp.');
   assert(await page.locator('[data-action="providerCustomerCall"]').count(), 'Selected provider cannot use customer-approved calls.');
+  await page.locator('#chatText').fill('رسالة متابعة من سالم البلوشي');
+  await page.locator('[data-action="sendChatMessage"]').click();
+  await page.waitForSelector('.chat-message.mine');
   await page.locator('[data-action="closeModal"]').click();
   await page.locator('[data-action="openArrivalTracking"]').first().click();
   await page.locator('[data-action="updateProviderArrival"][data-status="onTheWay"]').click();
@@ -267,6 +282,16 @@ async function clickFirstAction(page, action) {
   await capture(page, '07-provider-media');
 
   await page.locator('[data-action="providerUserMode"]').click();
+  await page.locator('.app-top [data-action="openNotifications"]').click();
+  await page.locator('[data-action="notificationCenterTab"][data-value="messages"]').click();
+  const userChatNotice = page.locator('.chat-notification [data-action="notificationAction"]').first();
+  assert(await userChatNotice.count(), 'User chat notification is missing from the chats section.');
+  assert((await page.locator('.chat-notification .notification-copy b').first().textContent()).includes('سالم البلوشي'), 'User chat notification does not identify the provider.');
+  await userChatNotice.locator('xpath=ancestor::details').locator('summary').click();
+  await userChatNotice.click();
+  await page.waitForSelector('.chat-sheet #chatThread');
+  assert(await page.locator('.chat-sheet .modal-title').filter({ hasText: /سالم البلوشي/i }).count(), 'User notification did not open the correct chat directly.');
+  await page.locator('[data-action="closeModal"]').click();
   await clickUserNav(page, 'search');
   await page.waitForTimeout(600);
   if (await page.locator('#modalRoot .modal-backdrop.show').count()) {

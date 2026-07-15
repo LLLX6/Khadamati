@@ -2433,12 +2433,20 @@ class Handler(SimpleHTTPRequestHandler):
                 )
                 target_kind = "provider" if is_user else "user"
                 target_id = item["acceptedProviderId"] if is_user else item["userId"]
+                if is_user:
+                    sender_name = item.get("customerName") or "عميل خدماتي"
+                else:
+                    provider_row = con.execute(
+                        "SELECT name FROM providers WHERE id=?", (provider_id,)
+                    ).fetchone()
+                    sender_name = provider_row["name"] if provider_row else "مزود الخدمة"
+                preview = text[:105] or ("صورة جديدة" if image_path else "رسالة صوتية جديدة")
                 create_notification(
-                    con, target_kind, target_id, "رسالة جديدة",
-                    text[:120] or ("صورة جديدة" if image_path else "رسالة صوتية جديدة"),
-                    type_="request", related_id=request_id, priority="normal",
+                    con, target_kind, target_id, f"رسالة جديدة من {sender_name}",
+                    f"{item.get('serviceName') or 'طلب خدمة'} • {preview}",
+                    type_="chat", related_id=request_id, priority="normal",
                     action_text="فتح المحادثة",
-                    action_route=f"{target_kind}:request:{request_id}",
+                    action_route=f"{target_kind}:chat:{request_id}",
                 )
 
             elif action == "arrival":
