@@ -251,6 +251,15 @@ async function clickFirstAction(page, action) {
   assert(await page.locator('#providerRegisterForm .registration-subservice.show').count() === 1, 'Add sub-service should reveal one optional field at a time.');
   await capture(page, '01e-provider-register');
   await page.locator('#modalRoot [data-action="closeModal"]').click();
+  await page.locator('[data-action="toggleLang"]').first().click();
+  await page.locator('[data-action="openProviderAccess"][data-mode="register"]').click();
+  const registrationHasArabic = async () => page.locator('#providerRegisterForm').evaluate(form => [...form.querySelectorAll('label,button,option,[placeholder],.account-type-note,.upload-hint,h3')].some(element => /[\u0600-\u06ff]/.test((element.getAttribute('placeholder') || element.textContent || '').trim())));
+  assert(!(await registrationHasArabic()), 'English individual-provider registration still contains Arabic interface labels.');
+  await page.locator('#regProviderType').selectOption('company');
+  assert(!(await registrationHasArabic()), 'English company registration still contains Arabic interface labels.');
+  assert(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth + 1), 'English provider registration overflows horizontally.');
+  await page.locator('#modalRoot [data-action="closeModal"]').click();
+  await page.locator('[data-action="toggleLang"]').first().click();
   await page.locator('#loginPhone').fill('91234567');
   await page.locator('#loginOtp').fill('1234');
   await page.locator('[data-action="providerLogin"]').click();
