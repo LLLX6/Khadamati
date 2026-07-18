@@ -1,10 +1,16 @@
-const CACHE_NAME = 'khadamati-app-shell-v43-production';
+const CACHE_NAME = 'khadamati-app-shell-v44-production';
 const SHELL = [
   './',
   './index.html',
   './app-icon-192.png',
   './app-icon-512.png',
   './assets/onboarding/khadamati-onboarding.webp',
+  './assets/onboarding/v44/discover-services.webp',
+  './assets/onboarding/v44/direct-request.webp',
+  './assets/onboarding/v44/secure-match.webp',
+  './assets/onboarding/v44/provider-profile.webp',
+  './assets/onboarding/v44/provider-opportunities.webp',
+  './assets/onboarding/v44/company-team.webp',
   './vendor/leaflet.css',
   './vendor/leaflet.js'
 ];

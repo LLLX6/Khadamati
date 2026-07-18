@@ -10,8 +10,8 @@
   "description": "منصة عمانية لطلب الخدمات المحلية ومتابعتها والتواصل مع المزودين والشركات.",
   "categories": ["business", "lifestyle", "utilities"],
   "prefer_related_applications": false,
-  "background_color": "#f5f7fb",
-  "theme_color": "#102a43",
+  "background_color": "#f4f8fa",
+  "theme_color": "#071a2b",
   "dir": "rtl",
   "lang": "ar",
   "icons": [

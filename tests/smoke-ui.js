@@ -119,6 +119,11 @@ async function clickFirstAction(page, action) {
   await page.locator('#customerLoginPin').fill('2468');
   await page.locator('[data-action="customerLogin"]').click();
   await page.waitForSelector('.role-onboarding');
+  const onboardingImage = page.locator('.role-onboarding .onboarding-visual img');
+  assert(/assets\/onboarding\/v44\//.test(await onboardingImage.getAttribute('src')), 'The redesigned role onboarding image is missing.');
+  await onboardingImage.evaluate(image => image.complete ? true : new Promise(resolve => image.addEventListener('load', () => resolve(true), { once: true })));
+  assert(await onboardingImage.evaluate(image => image.naturalWidth >= 900 && image.naturalHeight >= 1100), 'The onboarding image is not a high-resolution launch asset.');
+  await capture(page, '00b-user-onboarding');
   await page.locator('[data-action="skipOnboarding"]').click();
 
   assert((await page.locator('.clean-grid .category-tile').count()) <= 6, 'Home must show no more than six categories.');
@@ -188,6 +193,12 @@ async function clickFirstAction(page, action) {
   assert(await page.locator('.requests-disclosure[open]').count() === 0, 'Request groups should start collapsed.');
   assert(await page.locator('.loyalty-card-v40 [role="progressbar"]').count(), 'Clear loyalty progress bar is missing.');
   await page.locator('[data-action="openAppearance"]').click();
+  await page.locator('[data-action="setTheme"][data-value="dark"]').click();
+  assert(await page.locator('body').getAttribute('data-theme') === 'dark', 'Dark theme was not applied immediately.');
+  const darkPanelColor = await page.locator('.appearance-options').first().evaluate(element => getComputedStyle(element.closest('.modal')).backgroundColor);
+  assert(!/rgb\(255, 255, 255\)/.test(darkPanelColor), 'Dark theme still renders a light appearance panel.');
+  await page.locator('[data-action="setTheme"][data-value="light"]').click();
+  assert(await page.locator('body').getAttribute('data-theme') === 'light', 'Light theme was not restored immediately.');
   await page.locator('[data-action="setDisplayScale"][data-value="large"]').click();
   assert(await page.locator('body').getAttribute('data-scale') === 'large', 'Large text mode was not applied.');
   await page.locator('[data-action="closeModal"]').click();
@@ -228,6 +239,22 @@ async function clickFirstAction(page, action) {
   const dockBox = await page.locator('.provider-request-dock').boundingBox();
   assert(dockBox && dockBox.x >= 0 && dockBox.x + dockBox.width <= VIEWPORT_WIDTH, 'Provider request dock is outside the viewport.');
   await capture(page, '02-provider-dashboard');
+  await page.locator('.provider-top-actions [data-action="toggleLang"]').click();
+  await page.waitForTimeout(150);
+  assert(await page.locator('html').getAttribute('dir') === 'ltr', 'Provider English mode did not switch to LTR.');
+  assert(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth + 1), 'Provider English layout overflows horizontally.');
+  const providerNavFits = await page.locator('.provider-shell .side-nav').evaluate(element => {
+    const rect = element.getBoundingClientRect();
+    return rect.left >= -1 && rect.right <= window.innerWidth + 1 && (window.innerWidth > 940 || getComputedStyle(element).overflowX !== 'visible');
+  });
+  assert(providerNavFits, 'Provider English tabs are not contained in their horizontal scroller.');
+  const englishDockBox = await page.locator('.provider-request-dock').boundingBox();
+  assert(englishDockBox && englishDockBox.x >= 0 && englishDockBox.x + englishDockBox.width <= VIEWPORT_WIDTH, 'English Opportunities dock is outside the viewport.');
+  assert(await page.locator('.provider-request-dock').filter({ hasText: /Opportunities/i }).count(), 'English Opportunities label is missing.');
+  await capture(page, '02a-provider-english');
+  await page.locator('.provider-top-actions [data-action="toggleLang"]').click();
+  await page.waitForTimeout(100);
+  assert(await page.locator('html').getAttribute('dir') === 'rtl', 'Provider Arabic mode was not restored to RTL.');
   await page.locator('[data-action="openQuoteLibrary"]').first().click();
   assert(await page.locator('.modal-title').filter({ hasText: /عرض السعر|price and duration/i }).count(), 'Quote template sheet did not open.');
   await page.locator('[data-action="closeModal"]').click();
@@ -388,6 +415,9 @@ async function clickFirstAction(page, action) {
   await page.locator('[data-action="closeModal"]').click();
   await page.locator('.side-nav [data-action="adminTab"][data-tab="finance"]').click();
   assert(await page.locator('.finance-command-grid').count(), 'Financial control center is missing.');
+  await page.locator('.side-nav [data-action="adminTab"][data-tab="assistant"]').click();
+  assert(await page.locator('.subscription-command h2').filter({ hasText: /ساحة الطلبات|Request marketplace/i }).count(), 'The obsolete assistant health page was not replaced by the request marketplace.');
+  assert(await page.locator('[data-action="openAssistant"]').count() === 0, 'The obsolete assistant test control is still visible in administration.');
   await page.locator('.side-nav [data-action="adminTab"][data-tab="settings"]').click();
   assert(await page.locator('.operations-settings').count(), 'Platform operations settings are missing.');
   await page.locator('[data-action="adminTab"][data-tab="ads"]').click();
