@@ -4,7 +4,8 @@ Compile and run the domain tests first:
 
 ```powershell
 python -m py_compile server.py khadamati_domain.py
-python -m unittest tests.test_domain -v
+python -m unittest discover -s tests -p "test_*.py" -v
+python tests/security-api.py
 ```
 
 API smoke test (run against an isolated server and set its admin code):
@@ -32,5 +33,9 @@ provider video, before/after media, subscriptions, finance, and visitor isolatio
 The API flow verifies registration, exact matching, active request visibility,
 the public request marketplace, provider recommendations and abuse controls,
 subscriptions, contact consent, reviews, and cross-account collaboration.
+The security flow starts an isolated database and verifies public-data
+minimization, CORS, private signed media, cross-provider IDOR protection, owner
+PIN protection, MIME signatures, session revocation, lockout, inactive-account
+revocation, request-size limits, and private-cache blocking.
 
 Set `KHADAMATI_TEST_URL` to test another local or deployed URL.

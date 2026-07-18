@@ -120,19 +120,19 @@ async function clickFirstAction(page, action) {
   await page.locator('[data-action="customerLogin"]').click();
   await page.waitForSelector('.role-onboarding');
   const onboardingImage = page.locator('.role-onboarding .onboarding-visual img');
-  assert(/assets\/onboarding\/v45\//.test(await onboardingImage.getAttribute('src')), 'The redesigned role onboarding image is missing.');
+  assert(/assets\/onboarding\/v49\//.test(await onboardingImage.getAttribute('src')), 'The square role onboarding image is missing.');
   await onboardingImage.evaluate(image => image.complete ? true : new Promise(resolve => image.addEventListener('load', () => resolve(true), { once: true })));
-  assert(await onboardingImage.evaluate(image => image.naturalWidth >= 900 && image.naturalHeight >= 1100), 'The onboarding image is not a high-resolution launch asset.');
-  assert(await onboardingImage.evaluate(image => getComputedStyle(image).objectFit === 'contain'), 'Mobile onboarding artwork must remain fully visible without cropping.');
+  assert(await onboardingImage.evaluate(image => image.naturalWidth >= 900 && image.naturalHeight >= 900 && Math.abs(image.naturalWidth - image.naturalHeight) <= 2), 'The onboarding image is not a high-resolution square launch asset.');
+  assert(await onboardingImage.evaluate(image => getComputedStyle(image).objectFit === 'cover'), 'Mobile onboarding artwork must fill the square frame without side gaps.');
   const onboardingSets = [
-    { role: 'user', slides: ['customer-discover', 'customer-request', 'customer-map', 'customer-track'] },
+    { role: 'user', slides: ['user-service', 'user-direct-request', 'user-matching', 'user-track'] },
     { role: 'guest', slides: ['guest-browse', 'guest-compare', 'guest-signin', 'guest-privacy'] },
-    { role: 'provider', slides: ['provider-profile', 'provider-opportunities', 'provider-availability', 'provider-offer'] },
+    { role: 'provider', slides: ['provider-profile', 'provider-opportunity', 'provider-availability', 'provider-offer'] },
     { role: 'company', slides: ['company-profile', 'company-dispatch', 'company-analytics', 'company-team'] },
-  ].map(set => ({ ...set, slides: set.slides.map(name => `assets/onboarding/v45/${name}.webp`) }));
+  ].map(set => ({ ...set, slides: set.slides.map(name => `assets/onboarding/v49/${name}.webp`) }));
   for (const set of onboardingSets) {
     assert(set.slides.length === 4, `${set.role} onboarding must contain four focused steps.`);
-    assert(set.slides.every(src => /assets\/onboarding\/v45\//.test(src)), `${set.role} onboarding is using an outdated image.`);
+    assert(set.slides.every(src => /assets\/onboarding\/v49\//.test(src)), `${set.role} onboarding is using an outdated image.`);
     assert(new Set(set.slides).size === set.slides.length, `${set.role} onboarding repeats the same artwork.`);
   }
   assert(new Set(onboardingSets.flatMap(set => set.slides)).size === 16, 'Every onboarding state must use its own artwork.');
@@ -143,7 +143,7 @@ async function clickFirstAction(page, action) {
     'assets/ads/v45/business-services.webp',
   ];
   const launchHtml = await page.content();
-  assert(launchSources.every(src => launchHtml.includes(src)), 'The production page is not wired to every v45 launch image.');
+  assert(launchSources.every(src => launchHtml.includes(src)), 'The production page is not wired to every current launch image.');
   const launchImages = await page.evaluate(async sources => {
     return Promise.all(sources.map(async src => ({ src, ok: (await fetch(src, { cache: 'no-store' })).ok })));
   }, launchSources);
@@ -189,10 +189,10 @@ async function clickFirstAction(page, action) {
   assert(await page.locator('.request-board-guide').evaluate(element => element.getBoundingClientRect().right <= window.innerWidth + 1), 'Request board guidance overflows the mobile viewport.');
   await page.locator('.request-board-guide summary').click();
   const recommendationGuide = page.locator('.request-board-guide img');
-  assert(/assets\/onboarding\/v46\/request-provider-recommendation\.webp/.test(await recommendationGuide.getAttribute('src')), 'Provider recommendation guidance artwork is missing.');
+  assert(/assets\/onboarding\/v49\/user-matching\.webp/.test(await recommendationGuide.getAttribute('src')), 'Provider recommendation guidance artwork is missing.');
   await recommendationGuide.evaluate(image => image.complete ? true : new Promise(resolve => image.addEventListener('load', () => resolve(true), { once: true })));
-  assert(await recommendationGuide.evaluate(image => image.naturalWidth >= 1000 && image.naturalHeight >= 650), 'Provider recommendation guidance is not high resolution.');
-  assert(await recommendationGuide.evaluate(image => getComputedStyle(image).objectFit === 'contain'), 'Provider recommendation artwork is cropped on mobile.');
+  assert(await recommendationGuide.evaluate(image => image.naturalWidth >= 900 && image.naturalHeight >= 900), 'Provider recommendation guidance is not high resolution.');
+  assert(await recommendationGuide.evaluate(image => getComputedStyle(image).objectFit === 'cover'), 'Provider recommendation artwork does not fill its square frame.');
   await page.locator('[data-action="closeModal"]').click();
   await page.locator('[data-action="quickRequestForm"]').first().click();
   await page.waitForSelector('.request-wizard');
@@ -438,7 +438,7 @@ async function clickFirstAction(page, action) {
   await page.locator('[data-action="goBack"]').click();
   await page.locator('[data-action="enterGuest"]').click();
   if (await page.locator('.role-onboarding').count()) {
-    assert(/assets\/onboarding\/v45\/guest-browse\.webp/.test(await page.locator('.role-onboarding .onboarding-visual img').getAttribute('src')), 'Guest onboarding did not open its dedicated artwork.');
+    assert(/assets\/onboarding\/v49\/guest-browse\.webp/.test(await page.locator('.role-onboarding .onboarding-visual img').getAttribute('src')), 'Guest onboarding did not open its dedicated artwork.');
     await page.locator('[data-action="skipOnboarding"]').click();
   }
   assert(await page.locator('.app-top [data-action="openNotifications"] .notification-badge').count() === 0, 'Guest must not inherit the previous user notification badge.');

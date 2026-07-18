@@ -1,13 +1,16 @@
 from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
-from urllib.parse import urlparse
+import http.client
+from urllib.parse import parse_qs, urlparse
 from pathlib import Path
 from datetime import datetime, timedelta, UTC
+from contextlib import contextmanager
 import base64
 import csv
 import hashlib
 import hmac
 import html
 import io
+import ipaddress
 import json
 import math
 import mimetypes
@@ -17,8 +20,6 @@ import secrets
 import sqlite3
 import threading
 import time
-import urllib.error
-import urllib.request
 import zipfile
 
 from khadamati_domain import (
@@ -57,7 +58,6 @@ INITIAL_ADMIN_CODE = (
     or (os.environ.get("KHADAMATI_DEV_ADMIN_CODE") if APP_ENV != "production" else "")
     or ""
 )
-TOKENS = {}
 DEFAULT_ALLOWED_ORIGINS = {
     "https://lllx6.github.io",
     "http://127.0.0.1:8080",
@@ -70,6 +70,26 @@ ALLOWED_ORIGINS = {
 }
 SESSION_DAYS = int(os.environ.get("KHADAMATI_SESSION_DAYS", "30"))
 PUBLIC_APP_URL = os.environ.get("KHADAMATI_PUBLIC_URL", "https://lllx6.github.io/Khadamati/").rstrip("/") + "/"
+LOGIN_MAX_ATTEMPTS = max(3, int(os.environ.get("KHADAMATI_LOGIN_MAX_ATTEMPTS", "5")))
+LOGIN_LOCK_MINUTES = max(1, int(os.environ.get("KHADAMATI_LOGIN_LOCK_MINUTES", "15")))
+MEDIA_URL_TTL_SECONDS = max(60, int(os.environ.get("KHADAMATI_MEDIA_URL_TTL_SECONDS", "900")))
+MEDIA_SIGNING_KEY = (
+    os.environ.get("KHADAMATI_MEDIA_SIGNING_KEY")
+    or os.environ.get("KHADAMATI_OTP_PEPPER")
+    or secrets.token_urlsafe(32)
+)
+DEFAULT_JSON_LIMIT = max(65_536, int(os.environ.get("KHADAMATI_MAX_JSON_BYTES", "1000000")))
+JSON_LIMITS = {
+    "/api/provider-requests": 60_000_000,
+    "/api/provider/profile": 60_000_000,
+    "/api/provider/work-images": 50_000_000,
+    "/api/provider/documents": 22_000_000,
+    "/api/provider/image": 4_000_000,
+    "/api/user/profile": 4_000_000,
+    "/api/user/requests": 20_000_000,
+    "/api/request/collaboration": 10_000_000,
+    "/api/admin/ads": 6_000_000,
+}
 
 ALL_PERMISSIONS = [
     "view_reports",
@@ -121,15 +141,20 @@ CHAT_MIMES = {
 VIDEO_MIMES = {"video/mp4": "mp4", "video/webm": "webm", "video/quicktime": "mov"}
 
 
+@contextmanager
 def db():
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     con = sqlite3.connect(DB_PATH, timeout=12)
     con.row_factory = sqlite3.Row
-    return con
+    try:
+        with con:
+            yield con
+    finally:
+        con.close()
 
 
 def slug(prefix):
-    return f"{prefix}_{secrets.token_hex(4)}{int(time.time())}"
+    return f"{prefix}_{secrets.token_hex(16)}"
 
 
 def hash_secret(value):
@@ -174,6 +199,104 @@ def normalize_phone(raw):
     if len(phone) == 8:
         phone = "968" + phone
     return phone
+
+
+def safe_text(value, limit=240):
+    return str(value or "").strip()[:limit]
+
+
+def finite_number(value, default=0.0, *, minimum=None, maximum=None):
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        number = float(default)
+    if not math.isfinite(number):
+        raise DomainError("invalid_number", 400)
+    if minimum is not None and number < minimum:
+        raise DomainError("number_out_of_range", 400)
+    if maximum is not None and number > maximum:
+        raise DomainError("number_out_of_range", 400)
+    return number
+
+
+def bounded_int(value, default=0, *, minimum=None, maximum=None):
+    number = finite_number(value, default, minimum=minimum, maximum=maximum)
+    if not number.is_integer():
+        raise DomainError("invalid_integer", 400)
+    return int(number)
+
+
+def strict_bool(value, default=False):
+    if value is None:
+        return bool(default)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int) and value in (0, 1):
+        return bool(value)
+    raise DomainError("invalid_boolean", 400)
+
+
+def normalized_location(value):
+    if value in (None, ""):
+        return {}
+    if not isinstance(value, dict):
+        raise DomainError("invalid_location", 400)
+    if value.get("lat") in (None, "") or value.get("lng") in (None, ""):
+        return {}
+    lat = finite_number(value.get("lat"), minimum=-90, maximum=90)
+    lng = finite_number(value.get("lng"), minimum=-180, maximum=180)
+    result = {"lat": lat, "lng": lng}
+    if value.get("accuracy") not in (None, ""):
+        result["accuracy"] = finite_number(value.get("accuracy"), minimum=0, maximum=100_000)
+    if value.get("updatedAt"):
+        result["updatedAt"] = safe_text(value.get("updatedAt"), 50)
+    return result
+
+
+def normalized_provider_services(con, value, *, limit, fallback_price=0, default_areas=None):
+    if not isinstance(value, list):
+        raise DomainError("services_must_be_list", 400)
+    services = []
+    seen = set()
+    categories = set()
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        cat_id = safe_text(item.get("catId"), 80)
+        service_id = safe_text(item.get("serviceId"), 80)
+        key = (cat_id, service_id)
+        if not cat_id or not service_id or key in seen:
+            continue
+        exists = con.execute(
+            """SELECT s.id FROM services s JOIN categories c ON c.id=s.category_id
+            WHERE s.id=? AND s.category_id=? AND s.active=1 AND c.active=1""",
+            (service_id, cat_id),
+        ).fetchone()
+        if not exists:
+            raise DomainError("service_not_found", 400, f"{cat_id}|{service_id}")
+        item_areas = item.get("areas", default_areas or [])
+        if not isinstance(item_areas, list):
+            item_areas = default_areas or []
+        areas = list(dict.fromkeys(safe_text(area, 80) for area in item_areas if safe_text(area, 80)))[:50]
+        services.append(
+            {
+                "id": safe_text(item.get("id"), 100) or slug("ps"),
+                "catId": cat_id,
+                "serviceId": service_id,
+                "priceFrom": finite_number(
+                    item.get("priceFrom", fallback_price), minimum=0, maximum=1_000_000
+                ),
+                "active": bool(item.get("active", True)),
+                "areas": areas,
+            }
+        )
+        seen.add(key)
+        categories.add(cat_id)
+        if len(services) >= max(1, int(limit)):
+            break
+    if len(categories) > 1:
+        raise DomainError("provider_category_limit", 409)
+    return services
 
 
 def phone_matches(stored, normalized):
@@ -888,11 +1011,84 @@ def image_url(path):
     return f"/{value.replace(os.sep, '/')}"
 
 
+def upload_filename(path):
+    value = urlparse(str(path or "")).path
+    if value.startswith("/uploads/") or value.startswith("/media/"):
+        return value.rsplit("/", 1)[-1]
+    if value.startswith("uploads/"):
+        return value.split("/", 1)[-1]
+    return ""
+
+
+def is_private_upload(path):
+    filename = upload_filename(path)
+    if not filename:
+        return False
+    lowered = filename.lower()
+    return bool(
+        "-doc" in lowered
+        or "-problem" in lowered
+        or ("-msg_" in lowered and ("-image" in lowered or "-audio" in lowered))
+        or (lowered.startswith("usr") and "-avatar" in lowered)
+    )
+
+
+def secure_media_url(path, ttl_seconds=MEDIA_URL_TTL_SECONDS):
+    value = image_url(path)
+    if not value or not is_private_upload(value):
+        return value
+    filename = upload_filename(value)
+    expires = int(time.time()) + int(ttl_seconds)
+    payload = f"{filename}:{expires}".encode("utf-8")
+    signature = hmac.new(MEDIA_SIGNING_KEY.encode("utf-8"), payload, hashlib.sha256).hexdigest()
+    return f"/media/{filename}?exp={expires}&sig={signature}"
+
+
+def valid_media_signature(filename, expires, signature):
+    if not filename or not re.fullmatch(r"[A-Za-z0-9_.-]{1,220}", filename):
+        return False
+    try:
+        expires_at = int(expires)
+    except (TypeError, ValueError):
+        return False
+    if expires_at < int(time.time()) or expires_at > int(time.time()) + 86_400:
+        return False
+    expected = hmac.new(
+        MEDIA_SIGNING_KEY.encode("utf-8"),
+        f"{filename}:{expires_at}".encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    return hmac.compare_digest(expected, str(signature or ""))
+
+
+def upload_signature_matches(mime, blob):
+    """Validate the declared data-URL type against a small, deterministic magic-byte set."""
+    if not blob:
+        return False
+    if mime == "image/jpeg":
+        return blob.startswith(b"\xff\xd8\xff")
+    if mime == "image/png":
+        return blob.startswith(b"\x89PNG\r\n\x1a\n")
+    if mime == "image/webp":
+        return len(blob) >= 12 and blob[:4] == b"RIFF" and blob[8:12] == b"WEBP"
+    if mime == "application/pdf":
+        return blob.startswith(b"%PDF-")
+    if mime in {"audio/webm", "video/webm"}:
+        return blob.startswith(b"\x1aE\xdf\xa3")
+    if mime in {"audio/mp4", "video/mp4", "video/quicktime"}:
+        return len(blob) >= 12 and blob[4:8] == b"ftyp"
+    if mime == "audio/mpeg":
+        return blob.startswith(b"ID3") or (len(blob) > 1 and blob[0] == 0xFF and blob[1] & 0xE0 == 0xE0)
+    if mime == "audio/ogg":
+        return blob.startswith(b"OggS")
+    return False
+
+
 def urls(paths):
     return [image_url(p) for p in paths if p]
 
 
-def row_provider(r, private=False):
+def row_provider(r, private=False, sign_private=False):
     d = dict(r)
     d["areas"] = jload(d["areas"], [])
     d["services"] = jload(d["services"], [])
@@ -900,6 +1096,8 @@ def row_provider(r, private=False):
     d["workImages"] = jload(d.pop("work_images", "[]"), [])
     d["workImageUrls"] = urls(d["workImages"])
     d["documents"] = jload(d.pop("documents", "[]"), [])
+    if private and sign_private:
+        d["documents"] = [secure_media_url(item) for item in d["documents"] if item]
     before_after = jload(d.pop("before_after", "[]"), [])
     d["beforeAfter"] = [
         {
@@ -938,6 +1136,8 @@ def row_provider(r, private=False):
     latitude = d.pop("latitude", None)
     longitude = d.pop("longitude", None)
     location_updated_at = d.pop("location_updated_at", "")
+    if not private and latitude is not None and longitude is not None:
+        latitude, longitude = round(float(latitude), 3), round(float(longitude), 3)
     d["location"] = (
         {"lat": latitude, "lng": longitude, "updatedAt": location_updated_at}
         if latitude is not None and longitude is not None
@@ -953,14 +1153,21 @@ def row_provider(r, private=False):
     return d
 
 
-def row_review(r):
+def row_review(r, private=False):
     d = dict(r)
     d["approved"] = bool(d["approved"])
+    if not private:
+        for key in ("phone", "user_id", "request_id"):
+            d.pop(key, None)
     return d
 
 
-def row_complaint(r):
-    return dict(r)
+def row_complaint(r, private=False):
+    d = dict(r)
+    if not private:
+        for key in ("phone", "user_id"):
+            d.pop(key, None)
+    return d
 
 
 def row_package(r):
@@ -1095,38 +1302,129 @@ def issue_token(session):
             "INSERT INTO auth_sessions(id,token_hash,session_json,expires_at) VALUES(?,?,?,?)",
             (slug("ses"), hash_secret(token), jdump(session), iso_datetime(days=SESSION_DAYS)),
         )
-    TOKENS[token] = session
     return token
 
 
+def validated_session(con, session):
+    if not isinstance(session, dict):
+        return None
+    kind = session.get("kind")
+    if kind == "admin":
+        row = con.execute(
+            "SELECT * FROM admin_users WHERE id=? AND active=1", (session.get("id", ""),)
+        ).fetchone()
+        return {"kind": "admin", **admin_public(row)} if row else None
+    if kind == "user":
+        row = con.execute(
+            "SELECT id,name,phone,status FROM app_users WHERE id=? AND status='active'",
+            (session.get("userId", ""),),
+        ).fetchone()
+        if not row:
+            return None
+        return {
+            "kind": "user", "userId": row["id"], "name": row["name"], "phone": row["phone"]
+        }
+    if kind == "provider":
+        provider = con.execute(
+            "SELECT id,name,active,status FROM providers WHERE id=?",
+            (session.get("providerId", ""),),
+        ).fetchone()
+        if not provider or not bool(provider["active"]) or provider["status"] == "deleted":
+            return None
+        member_id = safe_text(session.get("memberId", ""), 100)
+        if member_id:
+            member = con.execute(
+                """SELECT id,role,permissions FROM provider_team_members
+                WHERE id=? AND provider_id=? AND active=1""",
+                (member_id, provider["id"]),
+            ).fetchone()
+            if not member:
+                return None
+            role = member["role"]
+            if role not in {"provider_manager", "provider_staff"}:
+                return None
+            provider_permissions = [
+                permission for permission in jload(member["permissions"], [])
+                if permission in PROVIDER_ROLE_PERMISSIONS.get(role, set())
+            ]
+        else:
+            role = "provider_owner"
+            provider_permissions = list(PROVIDER_ROLE_PERMISSIONS["provider_owner"])
+        return {
+            "kind": "provider", "providerId": provider["id"], "name": provider["name"],
+            "role": role, "memberId": member_id, "providerPermissions": provider_permissions,
+        }
+    return None
+
+
 def token_session(headers):
-    token = headers.get("Authorization", "").replace("Bearer ", "")
+    authorization = str(headers.get("Authorization", "") or "")
+    if not authorization.startswith("Bearer "):
+        return None
+    token = authorization[7:].strip()
     if not token:
         return None
-    if token in TOKENS:
-        return TOKENS[token]
     with db() as con:
         row = con.execute(
-            "SELECT session_json,expires_at FROM auth_sessions WHERE token_hash=? AND revoked=0",
+            "SELECT id,session_json,expires_at FROM auth_sessions WHERE token_hash=? AND revoked=0",
             (hash_secret(token),),
         ).fetchone()
-    if not row:
-        return None
-    try:
-        expires_at = datetime.fromisoformat(str(row["expires_at"]).replace("Z", "+00:00"))
-        if expires_at.tzinfo is None:
-            expires_at = expires_at.replace(tzinfo=UTC)
-        if expires_at <= datetime.now(UTC):
+        if not row:
             return None
-    except ValueError:
-        return None
-    session = jload(row["session_json"], None)
-    if session:
-        TOKENS[token] = session
-    return session
+        try:
+            expires_at = datetime.fromisoformat(str(row["expires_at"]).replace("Z", "+00:00"))
+            if expires_at.tzinfo is None:
+                expires_at = expires_at.replace(tzinfo=UTC)
+            if expires_at <= datetime.now(UTC):
+                con.execute("UPDATE auth_sessions SET revoked=1 WHERE id=?", (row["id"],))
+                return None
+        except ValueError:
+            con.execute("UPDATE auth_sessions SET revoked=1 WHERE id=?", (row["id"],))
+            return None
+        session = validated_session(con, jload(row["session_json"], None))
+        if not session:
+            con.execute("UPDATE auth_sessions SET revoked=1 WHERE id=?", (row["id"],))
+            return None
+        return session
 
 
-def row_app_user(r, private=False):
+def revoke_session(headers):
+    authorization = str(headers.get("Authorization", "") or "")
+    if not authorization.startswith("Bearer "):
+        return False
+    token = authorization[7:].strip()
+    if not token:
+        return False
+    with db() as con:
+        result = con.execute(
+            "UPDATE auth_sessions SET revoked=1 WHERE token_hash=?", (hash_secret(token),)
+        )
+    return result.rowcount > 0
+
+
+def revoke_account_sessions(con, kind, account_id, exclude_token_hash=None):
+    """Revoke sessions for one exact account without relying on JSON substring matching."""
+    id_key = {"user": "userId", "provider": "providerId", "admin": "id"}.get(kind)
+    if not id_key or not account_id:
+        return 0
+    revoked = 0
+    rows = con.execute(
+        "SELECT id,token_hash,session_json FROM auth_sessions WHERE revoked=0"
+    ).fetchall()
+    for row in rows:
+        session = jload(row["session_json"], {})
+        if (
+            isinstance(session, dict)
+            and session.get("kind") == kind
+            and str(session.get(id_key, "")) == str(account_id)
+            and row["token_hash"] != (exclude_token_hash or "")
+        ):
+            con.execute("UPDATE auth_sessions SET revoked=1 WHERE id=?", (row["id"],))
+            revoked += 1
+    return revoked
+
+
+def row_app_user(r, private=False, sign_private=False):
     d = dict(r)
     d["firstLogin"] = d.pop("first_login", "")
     d["lastLogin"] = d.pop("last_login", "")
@@ -1134,12 +1432,14 @@ def row_app_user(r, private=False):
     d["failedAttempts"] = int(d.pop("failed_attempts", 0) or 0)
     d["lockedUntil"] = d.pop("locked_until", "")
     d["pinConfigured"] = bool(d.pop("pin_hash", ""))
+    if private and sign_private and d.get("avatar"):
+        d["avatar"] = secure_media_url(d["avatar"])
     if not private:
         d.pop("phone", None)
     return d
 
 
-def row_customer_request(r):
+def row_customer_request(r, sign_private=False):
     d = dict(r)
     d["userId"] = d.pop("user_id", "")
     d["customerName"] = d.pop("customer_name", "")
@@ -1151,6 +1451,8 @@ def row_customer_request(r):
     d["budgetMax"] = d.pop("budget_max", 0)
     d["locationText"] = d.pop("location_text", "")
     d["images"] = jload(d["images"], [])
+    if sign_private:
+        d["images"] = [secure_media_url(item) for item in d["images"] if item]
     d["acceptedProviderId"] = d.pop("accepted_provider_id", "")
     d["matchingProviderIds"] = jload(d.pop("matching_provider_ids", "[]"), [])
     d["declinedProviderIds"] = jload(d.pop("declined_provider_ids", "[]"), [])
@@ -1159,8 +1461,8 @@ def row_customer_request(r):
     d["messages"] = [
         {
             **message,
-            "image": image_url(message.get("image", "")),
-            "audio": image_url(message.get("audio", "")),
+            "image": secure_media_url(message.get("image", "")) if sign_private else image_url(message.get("image", "")),
+            "audio": secure_media_url(message.get("audio", "")) if sign_private else image_url(message.get("audio", "")),
         }
         for message in messages
         if isinstance(message, dict)
@@ -1206,15 +1508,24 @@ def row_request_suggestion(r):
 
 
 def request_suggestions(con, request_id, *, include_hidden=False):
-    where = "s.request_id=?" if include_hidden else "s.request_id=? AND s.status IN ('active','selected')"
-    return [
-        row_request_suggestion(row)
-        for row in con.execute(
-            f"""SELECT s.*,p.name provider_name FROM request_provider_suggestions s
-            LEFT JOIN providers p ON p.id=s.provider_id WHERE {where}
+    if include_hidden:
+        rows = con.execute(
+            """SELECT s.*,p.name provider_name FROM request_provider_suggestions s
+            LEFT JOIN providers p ON p.id=s.provider_id WHERE s.request_id=?
             ORDER BY s.created_at DESC""",
             (request_id,),
         )
+    else:
+        rows = con.execute(
+            """SELECT s.*,p.name provider_name FROM request_provider_suggestions s
+            LEFT JOIN providers p ON p.id=s.provider_id
+            WHERE s.request_id=? AND s.status IN ('active','selected')
+            ORDER BY s.created_at DESC""",
+            (request_id,),
+        )
+    return [
+        row_request_suggestion(row)
+        for row in rows
     ]
 
 
@@ -1227,11 +1538,11 @@ def request_suggestion_by_id(con, suggestion_id):
     return row_request_suggestion(row) if row else None
 
 
-def marketplace_request(item):
+def marketplace_request(item, include_note=False):
     """Return only the fields needed by the public request board."""
     allowed = {
         "id", "serviceValue", "serviceName", "gov", "wilayah", "urgency",
-        "scheduleType", "requestedAt", "note", "images", "status", "offers",
+        "scheduleType", "requestedAt", "note", "status", "offers",
         "acceptedProviderId", "offersOpen", "createdAt", "updatedAt",
     }
     public_item = {key: value for key, value in item.items() if key in allowed}
@@ -1239,6 +1550,7 @@ def marketplace_request(item):
     public_item["offerCount"] = len(public_item.get("offers") or [])
     public_item["offers"] = []
     public_item["acceptedProviderId"] = ""
+    public_item["note"] = safe_text(public_item.get("note", ""), 280) if include_note else ""
     return public_item
 
 
@@ -1427,25 +1739,57 @@ def request_matches_provider(request_item, provider):
     return not request_area or bool(request_area & provider_area)
 
 
+def login_failure_state(con, account_kind, account_id):
+    key = safe_text(account_id, 160) or "unknown"
+    row = con.execute(
+        "SELECT attempts,last_attempt FROM login_failures WHERE account_kind=? AND account_id=?",
+        (account_kind, key),
+    ).fetchone()
+    if not row:
+        return {"locked": False, "attempts": 0, "retryAfter": 0}
+    try:
+        last_attempt = datetime.fromisoformat(str(row["last_attempt"]).replace("Z", "+00:00"))
+        if last_attempt.tzinfo is None:
+            last_attempt = last_attempt.replace(tzinfo=UTC)
+    except (TypeError, ValueError):
+        last_attempt = datetime.now(UTC) - timedelta(minutes=LOGIN_LOCK_MINUTES + 1)
+    unlock_at = last_attempt + timedelta(minutes=LOGIN_LOCK_MINUTES)
+    attempts = int(row["attempts"] or 0)
+    if datetime.now(UTC) >= unlock_at:
+        con.execute(
+            "DELETE FROM login_failures WHERE account_kind=? AND account_id=?",
+            (account_kind, key),
+        )
+        return {"locked": False, "attempts": 0, "retryAfter": 0}
+    retry_after = max(1, math.ceil((unlock_at - datetime.now(UTC)).total_seconds()))
+    return {
+        "locked": attempts >= LOGIN_MAX_ATTEMPTS,
+        "attempts": attempts,
+        "retryAfter": retry_after if attempts >= LOGIN_MAX_ATTEMPTS else 0,
+    }
+
+
 def record_login_failure(con, account_kind, account_id, phone=""):
+    key = safe_text(account_id or phone, 160) or "unknown"
+    login_failure_state(con, account_kind, key)
     con.execute(
         """INSERT INTO login_failures(account_kind,account_id,phone,attempts,last_attempt)
         VALUES(?,?,?,1,CURRENT_TIMESTAMP)
         ON CONFLICT(account_kind,account_id) DO UPDATE SET
         attempts=login_failures.attempts+1,last_attempt=CURRENT_TIMESTAMP""",
-        (account_kind, account_id or phone or "unknown", phone),
+        (account_kind, key, safe_text(phone, 32)),
     )
     row = con.execute(
         "SELECT attempts FROM login_failures WHERE account_kind=? AND account_id=?",
-        (account_kind, account_id or phone or "unknown"),
+        (account_kind, key),
     ).fetchone()
     attempts = int(row["attempts"] or 0)
-    if attempts == 3 or (attempts > 3 and attempts % 5 == 0):
+    if attempts in {3, LOGIN_MAX_ATTEMPTS}:
         create_notification(
             con, "admin", "", "محاولات دخول غير ناجحة",
-            f"{account_kind}: {phone or account_id} - عدد المحاولات {attempts}",
-            type_="security", related_id=account_id, priority="urgent",
-            action_text="مراجعة الحساب", action_route=f"admin:{account_kind}:{account_id}",
+            f"{account_kind}: {phone or key} - عدد المحاولات {attempts}",
+            type_="security", related_id=key, priority="urgent",
+            action_text="مراجعة الحساب", action_route=f"admin:{account_kind}:{key}",
         )
     return attempts
 
@@ -1620,6 +1964,7 @@ def get_bootstrap(session=None):
             row_provider(
                 r,
                 private=is_admin or bool(is_provider and r["id"] == session.get("providerId")),
+                sign_private=is_admin or bool(is_provider and r["id"] == session.get("providerId")),
             )
             for r in provider_rows
         ]
@@ -1636,15 +1981,26 @@ def get_bootstrap(session=None):
                     payload["services"] = [{"id": f"pending-{payload.get('id','')}", "catId": cat_id, "serviceId": service_id, "priceFrom": payload.get("priceFrom", 0), "active": True, "areas": [payload.get("wilayah", "")]}]
                 payload.pop("pinHash", None)
                 requests.append(payload)
-        settings = jload(con.execute("SELECT value FROM settings WHERE key='platform'").fetchone()["value"], {})
+        platform_row = con.execute("SELECT value FROM settings WHERE key='platform'").fetchone()
+        platform_settings = jload(platform_row["value"], {}) if platform_row else {}
+        public_setting_keys = {
+            "nameAr", "nameEn", "defaultGov", "adIntervalSeconds", "displayScale",
+            "uiMode", "maxHomeProviders", "maxPopularServices", "maxRequestMatches",
+            "loyaltyEnabled", "requestBoardEnabled", "contactApprovalRequired",
+            "subscriptionsEnabled", "paymentGatewayEnabled", "serviceAreas",
+            "deviceNotifications", "mergeNotifications",
+        }
+        settings = platform_settings if is_admin else {
+            key: value for key, value in platform_settings.items() if key in public_setting_keys
+        }
         packages = [
             row_package(r) for r in con.execute(
                 "SELECT * FROM packages WHERE active=1 AND COALESCE(legacy,0)=0 ORDER BY price,duration_days"
             )
         ]
         if is_admin:
-            reviews = [row_review(r) for r in con.execute("SELECT * FROM reviews ORDER BY created_at DESC")]
-            complaints = [row_complaint(r) for r in con.execute("SELECT * FROM complaints ORDER BY created_at DESC")]
+            reviews = [row_review(r, private=True) for r in con.execute("SELECT * FROM reviews ORDER BY created_at DESC")]
+            complaints = [row_complaint(r, private=True) for r in con.execute("SELECT * FROM complaints ORDER BY created_at DESC")]
             subscriptions = [row_subscription(r) for r in con.execute("SELECT * FROM subscriptions ORDER BY created_at DESC")]
             payments = [row_payment(r) for r in con.execute("SELECT * FROM payments ORDER BY created_at DESC")]
             audits = [row_audit(r) for r in con.execute("SELECT * FROM audit_logs ORDER BY created_at DESC LIMIT 80")]
@@ -1666,14 +2022,16 @@ def get_bootstrap(session=None):
             reviews = [row_review(r) for r in con.execute("SELECT * FROM reviews WHERE approved=1 ORDER BY created_at DESC")]
             complaints, subscriptions, payments, audits, leads = [], [], [], [], []
         all_customer_requests = [
-            row_customer_request(r)
+            row_customer_request(r, sign_private=bool(is_admin or is_provider or is_user))
             for r in con.execute("SELECT * FROM customer_requests ORDER BY created_at DESC LIMIT 300")
         ]
         marketplace_requests = [
-            marketplace_request(item)
+            marketplace_request(item, include_note=is_user)
             for item in all_customer_requests
             if item.get("status") in ACTIVE_REQUEST_STATES and item.get("offersOpen", True)
         ]
+        if is_admin or is_provider:
+            marketplace_requests = []
         if is_admin:
             customer_requests = all_customer_requests
             for item in customer_requests:
@@ -1683,7 +2041,7 @@ def get_bootstrap(session=None):
                 for r in con.execute("SELECT * FROM app_notifications ORDER BY created_at DESC LIMIT 300")
             ]
             users = [
-                row_app_user(r, private=True)
+                row_app_user(r, private=True, sign_private=True)
                 for r in con.execute("SELECT * FROM app_users ORDER BY last_login DESC LIMIT 300")
             ]
             advertisements = [
@@ -1764,7 +2122,7 @@ def get_bootstrap(session=None):
                 )
             ]
             user_row = con.execute("SELECT * FROM app_users WHERE id=?", (uid,)).fetchone()
-            users = [row_app_user(user_row, private=True)] if user_row else []
+            users = [row_app_user(user_row, private=True, sign_private=True)] if user_row else []
             advertisements = [
                 row_advertisement(r)
                 for r in con.execute(
@@ -1804,6 +2162,11 @@ def get_bootstrap(session=None):
                 "SELECT COUNT(*) n FROM app_notifications WHERE is_read=0"
             ).fetchone()["n"] if is_admin else len([n for n in notifications if not n["read"]]),
         }
+        if not is_admin:
+            stats = {
+                key: stats[key]
+                for key in ("providers", "activeProviders", "reviews", "qualityAverage", "unreadNotifications")
+            }
         reports = {
             "topProviders": sorted(
                 [{"id": p["id"], "name": p["name"], "rating": p["rating"], "qualityScore": p["qualityScore"], "stats": p["stats"]} for p in providers],
@@ -1819,6 +2182,8 @@ def get_bootstrap(session=None):
                 row["status"]: row["n"] for row in con.execute("SELECT status, COUNT(*) n FROM complaints GROUP BY status")
             },
         }
+        if not is_admin:
+            reports = {}
         admin_entities = {}
         financial_metrics = {}
         if is_admin:
@@ -1924,7 +2289,7 @@ def get_bootstrap(session=None):
             "reports": reports,
             "financialMetrics": financial_metrics,
             "adminEntities": admin_entities,
-            "maintenance": maintenance,
+            "maintenance": maintenance if is_admin else {},
             "integrations": {
                 "whatsappConfigured": whatsapp_configured(),
                 "paymentConfigured": PaymentAdapter(con).configured,
@@ -1933,7 +2298,7 @@ def get_bootstrap(session=None):
                 ),
                 "postgresReady": True,
             },
-            "permissions": ALL_PERMISSIONS,
+            "permissions": ALL_PERMISSIONS if is_admin else [],
         }
         if session and session.get("kind") == "admin":
             data["adminUser"] = {k: session[k] for k in ("id", "name", "role", "permissions")}
@@ -2005,30 +2370,32 @@ def send_whatsapp(to, text):
     version = os.environ.get("WHATSAPP_API_VERSION", "v20.0")
     if not token or not phone_id or not target:
         return {"ok": False, "configured": False}
+    if not re.fullmatch(r"v\d{1,2}\.\d{1,2}", version) or not str(phone_id).isdigit():
+        return {"ok": False, "configured": False, "error": "invalid_whatsapp_configuration"}
     payload = {
         "messaging_product": "whatsapp",
         "to": target,
         "type": "text",
         "text": {"preview_url": False, "body": text[:3500]},
     }
-    req = urllib.request.Request(
-        f"https://graph.facebook.com/{version}/{phone_id}/messages",
-        data=jdump(payload).encode("utf-8"),
-        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
-        method="POST",
-    )
+    connection = http.client.HTTPSConnection("graph.facebook.com", 443, timeout=12)
     try:
-        with urllib.request.urlopen(req, timeout=12) as res:
-            body = res.read().decode("utf-8")
+        connection.request(
+            "POST", f"/{version}/{phone_id}/messages", body=jdump(payload).encode("utf-8"),
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+        )
+        response = connection.getresponse()
+        body = response.read().decode("utf-8", errors="replace")
+        if 200 <= response.status < 300:
             log_whatsapp(target, "sent", body)
             return {"ok": True, "configured": True, "response": jload(body, {})}
-    except urllib.error.HTTPError as err:
-        detail = err.read().decode("utf-8", errors="replace")
-        log_whatsapp(target, "failed", detail)
-        return {"ok": False, "configured": True, "error": detail}
+        log_whatsapp(target, "failed", body)
+        return {"ok": False, "configured": True, "error": body}
     except Exception as err:
         log_whatsapp(target, "failed", str(err))
-        return {"ok": False, "configured": True, "error": str(err)}
+        return {"ok": False, "configured": True, "error": "delivery_failed"}
+    finally:
+        connection.close()
 
 
 def save_upload_data(owner_id, data_url, slot, allowed_mimes, max_bytes):
@@ -2044,10 +2411,12 @@ def save_upload_data(owner_id, data_url, slot, allowed_mimes, max_bytes):
     blob = base64.b64decode(raw, validate=True)
     if len(blob) > max_bytes:
         raise ValueError("upload_too_large")
+    if not upload_signature_matches(mime, blob):
+        raise ValueError("upload_content_mismatch")
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
     safe_owner = "".join(ch for ch in str(owner_id) if ch.isalnum() or ch in ("_", "-"))[:60] or "file"
     safe_slot = "".join(ch for ch in str(slot) if ch.isalnum() or ch in ("_", "-"))[:40] or secrets.token_hex(4)
-    filename = f"{safe_owner}-{safe_slot}.{ext}"
+    filename = f"{safe_owner}-{safe_slot}-{secrets.token_hex(12)}.{ext}"
     rel = f"uploads/{filename}"
     (UPLOAD_DIR / filename).write_bytes(blob)
     return rel
@@ -2075,9 +2444,21 @@ def save_many_documents(owner_id, docs, prefix="doc", limit=3):
 
 def upsert_provider(con, data):
     p = data | {"id": data.get("id") or slug("p")}
+    p["id"] = safe_text(p["id"], 120)
+    p["name"] = safe_text(data.get("name", ""), 120)
     p["phone"] = normalize_phone(data.get("phone", ""))
     existing = con.execute("SELECT * FROM providers WHERE id=?", (p["id"],)).fetchone()
     existing_provider = row_provider(existing, private=True) if existing else {}
+    if not p["id"] or not p["name"] or len(p["phone"]) < 8:
+        raise DomainError("provider_identity_required", 400)
+    p["status"] = safe_text(data.get("status", existing_provider.get("status", "available")), 30)
+    if p["status"] not in {"available", "busy", "unavailable", "under_review", "pending", "suspended", "deleted"}:
+        raise DomainError("invalid_provider_status", 400)
+    p["providerType"] = safe_text(
+        data.get("providerType", existing_provider.get("providerType", "individual")), 30
+    )
+    if p["providerType"] not in {"individual", "company"}:
+        raise DomainError("invalid_provider_type", 400)
     image_path = data.get("imagePath") or ""
     if data.get("imageData"):
         image_path = save_data_url(p["id"], data["imageData"])
@@ -2155,7 +2536,7 @@ def upsert_provider(con, data):
         )
     if isinstance(intro_video_url, str) and intro_video_url.startswith("/uploads/"):
         intro_video_url = intro_video_url.lstrip("/")
-    location = data.get("location") or existing_provider.get("location") or {}
+    location = normalized_location(data.get("location") or existing_provider.get("location") or {})
     con.execute(
         """INSERT INTO providers(id,name,phone,gov,wilayah,areas,bio,hours,status,active,verified,featured,
         package_id,rating,reviews,admin_note,image_path,card_image,pin_hash,services,work_images,documents,quality_score,response_score,
@@ -2178,11 +2559,11 @@ def upsert_provider(con, data):
             jdump(p.get("areas", [])), p.get("bio", ""), p.get("hours", ""), p.get("status", "available"),
             int(bool(p.get("active", True))), int(bool(p.get("verified", False))), int(bool(p.get("featured", False))),
             p.get("packageId", existing_provider.get("packageId", "foundation_12m")),
-            float(p.get("rating", existing_provider.get("rating", 0)) or 0),
-            int(p.get("reviews", existing_provider.get("reviews", 0)) or 0),
+            finite_number(p.get("rating", existing_provider.get("rating", 0)), minimum=0, maximum=5),
+            int(finite_number(p.get("reviews", existing_provider.get("reviews", 0)), minimum=0, maximum=10_000_000)),
             p.get("adminNote", ""), image_path, card_image, pin_hash, jdump(p.get("services", [])), jdump(work_images), jdump(documents),
-            int(p.get("qualityScore", existing_provider.get("qualityScore", 60)) or 60),
-            int(p.get("responseScore", existing_provider.get("responseScore", 70)) or 70),
+            int(finite_number(p.get("qualityScore", existing_provider.get("qualityScore", 60)), default=60, minimum=0, maximum=100)),
+            int(finite_number(p.get("responseScore", existing_provider.get("responseScore", 70)), default=70, minimum=0, maximum=100)),
             p.get("subscriptionUntil", existing_provider.get("subscriptionUntil", "")),
             p.get("subscriptionStart", existing_provider.get("subscriptionStart", "")),
             p.get("providerType", existing_provider.get("providerType", "individual")),
@@ -2204,8 +2585,8 @@ def upsert_provider(con, data):
         (
             jdump(before_after), intro_video_url,
             jdump(p.get("availability", existing_provider.get("availability", {}))),
-            int(p.get("responseMinutes", existing_provider.get("responseMinutes", 30)) or 30),
-            int(p.get("completedJobs", existing_provider.get("completedJobs", 0)) or 0),
+            int(finite_number(p.get("responseMinutes", existing_provider.get("responseMinutes", 30)), default=30, minimum=0, maximum=100_000)),
+            int(finite_number(p.get("completedJobs", existing_provider.get("completedJobs", 0)), minimum=0, maximum=100_000_000)),
             p["id"],
         ),
     )
@@ -2229,6 +2610,16 @@ class Handler(SimpleHTTPRequestHandler):
         self.send_header("X-Frame-Options", "SAMEORIGIN")
         self.send_header("Referrer-Policy", "strict-origin-when-cross-origin")
         self.send_header("Permissions-Policy", "camera=(), geolocation=(self), microphone=(self)")
+        self.send_header(
+            "Content-Security-Policy",
+            "default-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'self'; "
+            "script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline' https:; "
+            "img-src 'self' data: blob: https:; media-src 'self' data: blob:; "
+            "font-src 'self' data: https:; connect-src 'self' https://khadamati-app-api.onrender.com https:; "
+            "worker-src 'self' blob:; manifest-src 'self'",
+        )
+        if self.headers.get("X-Forwarded-Proto", "").split(",", 1)[0].strip() == "https":
+            self.send_header("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
         origin = self.headers.get("Origin", "").rstrip("/")
         if origin in ALLOWED_ORIGINS:
             self.send_header("Access-Control-Allow-Origin", origin)
@@ -2259,16 +2650,28 @@ class Handler(SimpleHTTPRequestHandler):
         self.wfile.write(raw)
 
     def read_json(self):
-        length = int(self.headers.get("Content-Length", "0"))
-        if length == 0:
+        path = urlparse(self.path).path
+        raw = self.read_raw(JSON_LIMITS.get(path, DEFAULT_JSON_LIMIT))
+        if not raw:
             return {}
-        return json.loads(self.rfile.read(length).decode("utf-8"))
+        value = json.loads(raw.decode("utf-8"))
+        if not isinstance(value, dict):
+            raise DomainError("json_object_required", 400)
+        return value
 
     def read_raw(self, max_bytes=1_000_000):
-        length = int(self.headers.get("Content-Length", "0"))
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except (TypeError, ValueError) as error:
+            raise DomainError("invalid_content_length", 400) from error
         if length < 0 or length > max_bytes:
             raise DomainError("request_too_large", 413)
         return self.rfile.read(length) if length else b""
+
+    def client_key(self):
+        forwarded = self.headers.get("X-Forwarded-For", "").split(",", 1)[0].strip()
+        remote = forwarded or (self.client_address[0] if self.client_address else "unknown")
+        return hashlib.sha256(remote.encode("utf-8")).hexdigest()[:32]
 
     def send_domain_error(self, error):
         return self.send_json(
@@ -2306,7 +2709,7 @@ class Handler(SimpleHTTPRequestHandler):
         return session
 
     def send_upload(self, path):
-        filename = path.removeprefix("/uploads/")
+        filename = upload_filename(path)
         if not filename or "/" in filename or "\\" in filename:
             return self.send_error(404)
         target = (UPLOAD_DIR / filename).resolve()
@@ -2326,12 +2729,19 @@ class Handler(SimpleHTTPRequestHandler):
     def do_GET(self):
         parsed = urlparse(self.path)
         path = parsed.path
+        if path.startswith("/media/"):
+            filename = path.removeprefix("/media/")
+            query = parse_qs(parsed.query)
+            if not valid_media_signature(
+                filename,
+                (query.get("exp") or [""])[0],
+                (query.get("sig") or [""])[0],
+            ):
+                return self.send_json({"error": "media_link_invalid_or_expired"}, 403)
+            return self.send_upload(path)
         if path.startswith("/uploads/"):
-            filename = path.removeprefix("/uploads/")
-            if "-doc" in filename:
-                session = self.session()
-                if not session or session.get("kind") != "admin" or not has_permission(session, "review_requests"):
-                    return self.send_json({"error": "document_access_denied"}, 403)
+            if is_private_upload(path):
+                return self.send_json({"error": "private_media_requires_signed_url"}, 403)
             return self.send_upload(path)
         if path.startswith("/share/provider/"):
             provider_id = path.rsplit("/", 1)[-1]
@@ -2390,7 +2800,7 @@ class Handler(SimpleHTTPRequestHandler):
                 row = con.execute("SELECT * FROM providers WHERE id=?", (session["providerId"],)).fetchone()
                 if not row:
                     return self.send_json({"error": "not_found"}, 404)
-                return self.send_json({"provider": row_provider(row, private=True)})
+                return self.send_json({"provider": row_provider(row, private=True, sign_private=True)})
         if path == "/api/backup":
             session = self.require_admin("backup")
             if not session:
@@ -2472,6 +2882,24 @@ class Handler(SimpleHTTPRequestHandler):
         return self.send_bytes(page.encode("utf-8"), "text/html; charset=utf-8")
 
     def do_POST(self):
+        try:
+            return self._do_POST()
+        except DomainError as err:
+            return self.send_domain_error(err)
+        except ValueError as err:
+            code = str(err)
+            if code not in {
+                "state_must_be_object", "invalid_upload", "unsupported_upload_type",
+                "upload_too_large", "upload_content_mismatch",
+            }:
+                code = "invalid_request_data"
+            return self.send_json({"error": code}, 400)
+        except (BrokenPipeError, ConnectionResetError):
+            return None
+        except Exception:
+            return self.send_json({"error": "server_error"}, 500)
+
+    def _do_POST(self):
         path = urlparse(self.path).path
         if path == "/api/payments/webhook":
             try:
@@ -2486,13 +2914,19 @@ class Handler(SimpleHTTPRequestHandler):
                 return self.send_json({"error": "invalid_webhook_payload"}, 400)
         try:
             data = self.read_json()
+        except DomainError as err:
+            return self.send_domain_error(err)
         except (json.JSONDecodeError, UnicodeDecodeError, ValueError):
             return self.send_json({"error": "invalid_request_data"}, 400)
+        if path == "/api/auth/logout":
+            return self.send_json({"ok": True, "revoked": revoke_session(self.headers)})
         if path == "/api/otp/request":
             purpose = str(data.get("purpose", "login") or "login")[:80]
             target_kind = str(data.get("targetKind", "user") or "user")[:40]
             if purpose not in {"login", "recovery", "delete_account", "change_pin"}:
                 return self.send_json({"error": "invalid_otp_purpose"}, 400)
+            if target_kind not in {"user", "provider", "company"}:
+                return self.send_json({"error": "invalid_otp_target"}, 400)
 
             def deliver(phone, code):
                 result = send_whatsapp(
@@ -2531,8 +2965,15 @@ class Handler(SimpleHTTPRequestHandler):
             except ValueError as err:
                 return self.send_json({"error": str(err)}, 400)
         if path == "/api/admin/login":
-            supplied_code = str(data.get("code", "") or "")
+            supplied_code = safe_text(data.get("code", ""), 128)
+            lock_key = f"ip:{self.client_key()}"
             with db() as con:
+                lock_state = login_failure_state(con, "admin", lock_key)
+                if lock_state["locked"]:
+                    return self.send_json(
+                        {"error": "login_temporarily_locked", "retryAfter": lock_state["retryAfter"]},
+                        429,
+                    )
                 row = next(
                     (
                         candidate for candidate in con.execute("SELECT * FROM admin_users WHERE active=1")
@@ -2545,8 +2986,10 @@ class Handler(SimpleHTTPRequestHandler):
                         "UPDATE admin_users SET code_hash=? WHERE id=?",
                         (hash_pin(supplied_code), row["id"]),
                     )
-            if not row:
-                return self.send_json({"error": "invalid_code"}, 403)
+                if not row:
+                    attempts = record_login_failure(con, "admin", lock_key)
+                    return self.send_json({"error": "invalid_code", "attempts": attempts}, 403)
+                clear_login_failures(con, "admin", lock_key)
             user = admin_public(row)
             token = issue_token({"kind": "admin", **user})
             return self.send_json({"token": token, "user": user})
@@ -2555,19 +2998,32 @@ class Handler(SimpleHTTPRequestHandler):
             if len(phone) < 11:
                 return self.send_json({"error": "valid_phone_required"}, 400)
             with db() as con:
+                lock_state = login_failure_state(con, "provider", phone)
+                if lock_state["locked"]:
+                    return self.send_json(
+                        {"error": "login_temporarily_locked", "retryAfter": lock_state["retryAfter"]},
+                        429,
+                    )
                 row = con.execute(
-                    "SELECT * FROM providers WHERE phone=? OR phone=?",
+                    """SELECT * FROM providers WHERE active=1 AND status!='deleted'
+                    AND (phone=? OR phone=?)""",
                     (phone, phone.replace("968", "", 1)),
                 ).fetchone()
                 if not row:
                     row = next(
-                        (candidate for candidate in con.execute("SELECT * FROM providers") if phone_matches(candidate["phone"], phone)),
+                        (
+                            candidate for candidate in con.execute(
+                                "SELECT * FROM providers WHERE active=1 AND status!='deleted'"
+                            )
+                            if phone_matches(candidate["phone"], phone)
+                        ),
                         None,
                     )
                 team_row = con.execute(
                     """SELECT tm.*,p.name provider_name FROM provider_team_members tm
                     JOIN providers p ON p.id=tm.provider_id
-                    WHERE tm.active=1 AND (tm.phone=? OR tm.phone=?) LIMIT 1""",
+                    WHERE tm.active=1 AND p.active=1 AND p.status!='deleted'
+                    AND (tm.phone=? OR tm.phone=?) LIMIT 1""",
                     (phone, phone.replace("968", "", 1)),
                 ).fetchone()
                 if not team_row:
@@ -2576,7 +3032,8 @@ class Handler(SimpleHTTPRequestHandler):
                             candidate
                             for candidate in con.execute(
                                 """SELECT tm.*,p.name provider_name FROM provider_team_members tm
-                                JOIN providers p ON p.id=tm.provider_id WHERE tm.active=1"""
+                                JOIN providers p ON p.id=tm.provider_id
+                                WHERE tm.active=1 AND p.active=1 AND p.status!='deleted'"""
                             )
                             if phone_matches(candidate["phone"], phone)
                         ),
@@ -2588,7 +3045,11 @@ class Handler(SimpleHTTPRequestHandler):
                         proof = OTPService(con).verify(
                             str(data.get("challengeId")), str(data.get("otpCode"))
                         )
-                        otp_ok = proof["phone"] == phone and proof["targetKind"] in {"provider", "company"}
+                        otp_ok = (
+                            proof["phone"] == phone
+                            and proof["purpose"] == "login"
+                            and proof["targetKind"] in {"provider", "company"}
+                        )
                     except DomainError:
                         otp_ok = False
                 owner_pin_ok = bool(row and verify_secret(data.get("pin", ""), row["pin_hash"]))
@@ -2596,8 +3057,7 @@ class Handler(SimpleHTTPRequestHandler):
                     team_row and verify_secret(data.get("pin", ""), team_row["pin_hash"])
                 )
                 if not (row or team_row) or not (owner_pin_ok or team_pin_ok or otp_ok):
-                    account_id = row["id"] if row else team_row["id"] if team_row else phone
-                    attempts = record_login_failure(con, "provider", account_id, phone)
+                    attempts = record_login_failure(con, "provider", phone, phone)
                     return self.send_json(
                         {"error": "invalid_provider_login", "attempts": attempts},
                         403,
@@ -2605,9 +3065,10 @@ class Handler(SimpleHTTPRequestHandler):
                 if team_row and (team_pin_ok or (otp_ok and not row)):
                     provider_id = team_row["provider_id"]
                     provider_row = con.execute(
-                        "SELECT * FROM providers WHERE id=?", (provider_id,)
+                        "SELECT * FROM providers WHERE id=? AND active=1 AND status!='deleted'",
+                        (provider_id,),
                     ).fetchone()
-                    clear_login_failures(con, "provider", team_row["id"])
+                    clear_login_failures(con, "provider", phone)
                     if not str(team_row["pin_hash"] or "").startswith("pbkdf2_sha256$"):
                         con.execute(
                             "UPDATE provider_team_members SET pin_hash=? WHERE id=?",
@@ -2619,7 +3080,7 @@ class Handler(SimpleHTTPRequestHandler):
                 else:
                     provider_row = row
                     provider_id = row["id"]
-                    clear_login_failures(con, "provider", row["id"])
+                    clear_login_failures(con, "provider", phone)
                     provider_role = "provider_owner"
                     provider_permissions = list(PROVIDER_ROLE_PERMISSIONS["provider_owner"])
                     member_id = ""
@@ -2630,7 +3091,7 @@ class Handler(SimpleHTTPRequestHandler):
                     )
             if not provider_row:
                 return self.send_json({"error": "invalid_provider_login"}, 403)
-            provider = row_provider(provider_row, private=True)
+            provider = row_provider(provider_row, private=True, sign_private=True)
             token = issue_token({
                 "kind": "provider", "providerId": provider["id"], "name": provider["name"],
                 "role": provider_role, "memberId": member_id,
@@ -2647,25 +3108,39 @@ class Handler(SimpleHTTPRequestHandler):
                 row = con.execute("SELECT * FROM app_users WHERE phone=?", (phone,)).fetchone()
                 if row and row["status"] != "active":
                     return self.send_json({"error": "account_inactive"}, 403)
+                lock_key = row["id"] if row else phone
+                lock_state = login_failure_state(con, "user", lock_key)
+                if lock_state["locked"]:
+                    return self.send_json(
+                        {"error": "login_temporarily_locked", "retryAfter": lock_state["retryAfter"]},
+                        429,
+                    )
                 otp_ok = False
                 if data.get("challengeId") and data.get("otpCode"):
                     try:
                         proof = OTPService(con).verify(
                             str(data.get("challengeId")), str(data.get("otpCode"))
                         )
-                        otp_ok = proof["phone"] == phone and proof["targetKind"] == "user"
+                        otp_ok = (
+                            proof["phone"] == phone
+                            and proof["purpose"] == "login"
+                            and proof["targetKind"] == "user"
+                        )
                     except DomainError:
                         otp_ok = False
                 pin_ok = bool(row and row["pin_hash"] and verify_secret(pin, row["pin_hash"]))
                 if row and row["pin_hash"] and not (pin_ok or otp_ok):
-                    attempts = record_login_failure(con, "user", row["id"], phone)
+                    attempts = record_login_failure(con, "user", lock_key, phone)
                     con.execute("UPDATE app_users SET failed_attempts=? WHERE id=?", (attempts, row["id"]))
                     return self.send_json({"error": "invalid_user_pin", "attempts": attempts}, 403)
                 if not row and len(pin) < 4 and not otp_ok:
                     return self.send_json({"error": "pin_required"}, 400)
                 if row and not row["pin_hash"] and len(pin) < 4 and not otp_ok:
                     return self.send_json({"error": "otp_or_new_pin_required"}, 403)
-                location = data.get("location") or {}
+                try:
+                    location = normalized_location(data.get("location"))
+                except DomainError as err:
+                    return self.send_domain_error(err)
                 if row:
                     con.execute(
                         """UPDATE app_users SET name=COALESCE(NULLIF(?,''),name),gov=COALESCE(NULLIF(?,''),gov),
@@ -2678,7 +3153,7 @@ class Handler(SimpleHTTPRequestHandler):
                         ),
                     )
                     user_id = row["id"]
-                    clear_login_failures(con, "user", user_id)
+                    clear_login_failures(con, "user", lock_key)
                     if not row["pin_hash"] and len(pin) >= 4:
                         con.execute(
                             "UPDATE app_users SET pin_hash=? WHERE id=?", (hash_pin(pin), user_id)
@@ -2705,29 +3180,36 @@ class Handler(SimpleHTTPRequestHandler):
                         action_text="فتح المستخدم", action_route=f"admin:user:{user_id}",
                     )
                 user_row = con.execute("SELECT * FROM app_users WHERE id=?", (user_id,)).fetchone()
-            user = row_app_user(user_row, private=True)
+            user = row_app_user(user_row, private=True, sign_private=True)
             token = issue_token({"kind": "user", "userId": user_id, "name": user["name"], "phone": phone})
             return self.send_json({"token": token, "user": user})
         if path == "/api/provider-requests":
-            pin = str(data.get("pin", "")).strip()
+            pin = str(data.get("pin", "")).strip()[:128]
             req_id = slug("req")
+            try:
+                location = normalized_location(data.get("location"))
+                base_price = finite_number(
+                    data.get("priceFrom", 0), minimum=0, maximum=1_000_000
+                )
+            except DomainError as err:
+                return self.send_domain_error(err)
             item = {
                 "id": req_id,
-                "name": data.get("name", "").strip(),
+                "name": safe_text(data.get("name"), 120),
                 "phone": normalize_phone(data.get("phone", "")),
                 "providerType": data.get("providerType", "individual") if data.get("providerType") in ("individual", "company") else "individual",
-                "companyName": data.get("companyName", "").strip(),
-                "commercialNo": data.get("commercialNo", "").strip(),
-                "companySize": data.get("companySize", "").strip(),
-                "businessRole": data.get("businessRole", "").strip(),
-                "gov": data.get("gov", "مسقط"),
-                "wilayah": data.get("wilayah", ""),
-                "location": data.get("location"),
-                "service": data.get("service", ""),
+                "companyName": safe_text(data.get("companyName"), 160),
+                "commercialNo": safe_text(data.get("commercialNo"), 120),
+                "companySize": safe_text(data.get("companySize"), 80),
+                "businessRole": safe_text(data.get("businessRole"), 80),
+                "gov": safe_text(data.get("gov", "مسقط"), 80),
+                "wilayah": safe_text(data.get("wilayah"), 80),
+                "location": location,
+                "service": safe_text(data.get("service"), 180),
                 "services": [],
-                "priceFrom": data.get("priceFrom", 0),
-                "note": data.get("note", ""),
-                "hours": data.get("hours", ""),
+                "priceFrom": base_price,
+                "note": safe_text(data.get("note"), 600),
+                "hours": safe_text(data.get("hours"), 240),
                 "imagePath": "",
                 "workImages": [],
                 "documents": [],
@@ -2735,37 +3217,28 @@ class Handler(SimpleHTTPRequestHandler):
             }
             raw_services = data.get("services") if isinstance(data.get("services"), list) else []
             service_limit = 5 if item["providerType"] == "company" else 3
-            seen_services = set()
-            for svc in raw_services:
-                if not isinstance(svc, dict):
-                    continue
-                cat_id = str(svc.get("catId", "")).strip()
-                service_id = str(svc.get("serviceId", "")).strip()
-                if not cat_id or not service_id or (cat_id, service_id) in seen_services:
-                    continue
-                seen_services.add((cat_id, service_id))
-                item["services"].append(
-                    {
-                        "id": svc.get("id") or slug("ps"),
-                        "catId": cat_id,
-                        "serviceId": service_id,
-                        "priceFrom": float(svc.get("priceFrom") or item["priceFrom"] or 0),
-                        "active": bool(svc.get("active", True)),
-                        "areas": svc.get("areas") or [item["wilayah"]],
-                    }
-                )
-                if len(item["services"]) >= service_limit:
-                    break
             if not item["services"] and "|" in item["service"]:
                 cat_id, service_id = item["service"].split("|", 1)
-                item["services"] = [{"id": slug("ps"), "catId": cat_id, "serviceId": service_id, "priceFrom": float(item["priceFrom"] or 0), "active": True, "areas": [item["wilayah"]]}]
+                raw_services = [{
+                    "catId": cat_id, "serviceId": service_id,
+                    "priceFrom": item["priceFrom"], "active": True,
+                    "areas": [item["wilayah"]],
+                }]
+            try:
+                with db() as con:
+                    item["services"] = normalized_provider_services(
+                        con, raw_services, limit=service_limit,
+                        fallback_price=item["priceFrom"], default_areas=[item["wilayah"]],
+                    )
+            except DomainError as err:
+                return self.send_domain_error(err)
             if item["services"]:
                 first = item["services"][0]
                 item["service"] = f"{first['catId']}|{first['serviceId']}"
-            if len({svc["catId"] for svc in item["services"]}) > 1:
-                return self.send_json({"error": "provider_category_limit"}, 409)
-            if not item["name"] or not item["phone"] or not item["pinHash"]:
+            if not item["name"] or len(item["phone"]) < 11 or not item["pinHash"]:
                 return self.send_json({"error": "name_phone_pin_required"}, 400)
+            if len(pin) < 4:
+                return self.send_json({"error": "pin_too_short"}, 400)
             if item["providerType"] == "company" and not item["companyName"]:
                 return self.send_json({"error": "company_name_required"}, 400)
             if not item["commercialNo"]:
@@ -2927,7 +3400,7 @@ class Handler(SimpleHTTPRequestHandler):
         # are always sourced from the authenticated session, never from the browser.
         if kind == "quote" and session_kind != "provider":
             return self.send_json({"error": "provider_auth_required"}, 401)
-        if kind in ("request", "whatsapp", "calls") and session_kind != "user":
+        if kind in ("request", "views", "whatsapp", "calls") and session_kind != "user":
             return self.send_json({"error": "user_auth_required"}, 401)
         if kind == "booking" and session_kind != "admin":
             return self.send_json({"error": "permission_denied"}, 403)
@@ -3030,7 +3503,10 @@ class Handler(SimpleHTTPRequestHandler):
                 avatar = user_row["avatar"] or ""
                 if data.get("avatarData"):
                     avatar = save_upload_data(user_id, data["avatarData"], "avatar", IMAGE_MIMES, 2_500_000)
-                location = data.get("location") or {}
+                try:
+                    location = normalized_location(data.get("location"))
+                except DomainError as err:
+                    return self.send_domain_error(err)
                 con.execute(
                     """UPDATE app_users SET name=?,gov=?,wilayah=?,avatar=?,
                     latitude=COALESCE(?,latitude),longitude=COALESCE(?,longitude)
@@ -3043,14 +3519,17 @@ class Handler(SimpleHTTPRequestHandler):
                     ),
                 )
                 updated = con.execute("SELECT * FROM app_users WHERE id=?", (user_id,)).fetchone()
-                return self.send_json({"ok": True, "user": row_app_user(updated, private=True)})
+                return self.send_json({"ok": True, "user": row_app_user(updated, private=True, sign_private=True)})
             if path == "/api/user/pin":
                 pin = str(data.get("pin", ""))
-                if len(pin) < 4:
+                if not re.fullmatch(r"\d{4,8}", pin):
                     return self.send_json({"error": "pin_too_short"}, 400)
                 if user_row["pin_hash"] and not verify_secret(data.get("currentPin", ""), user_row["pin_hash"]):
                     return self.send_json({"error": "current_pin_incorrect"}, 403)
                 con.execute("UPDATE app_users SET pin_hash=? WHERE id=?", (hash_pin(pin), user_id))
+                authorization = str(self.headers.get("Authorization", "") or "")
+                current_hash = hash_secret(authorization[7:].strip()) if authorization.startswith("Bearer ") else ""
+                revoke_account_sessions(con, "user", user_id, current_hash)
                 return self.send_json({"ok": True})
             if path == "/api/user/requests":
                 request_id = str(data.get("id", "") or "")
@@ -3079,15 +3558,25 @@ class Handler(SimpleHTTPRequestHandler):
                             f"الطلب {request_id}", type_="request", related_id=request_id,
                             action_text="فتح الطلب", action_route=f"admin:request:{request_id}",
                         )
-                        return self.send_json({"ok": True, "status": action})
+                        return self.send_json({"ok": True, "status": next_status})
                     if current["accepted_provider_id"]:
                         return self.send_json({"error": "accepted_request_cannot_be_edited"}, 409)
                 else:
                     request_id = slug("ord")
                 service_value = str(data.get("serviceValue", "") or "").strip()[:120]
                 service_name = str(data.get("serviceName", "") or "").strip()[:120]
-                if not service_value:
+                if not service_value or "|" not in service_value:
                     return self.send_json({"error": "service_required"}, 400)
+                cat_id, service_id = service_value.split("|", 1)
+                service_row = con.execute(
+                    """SELECT s.ar,s.en FROM services s JOIN categories c ON c.id=s.category_id
+                    WHERE s.id=? AND s.category_id=? AND s.active=1 AND c.active=1""",
+                    (safe_text(service_id, 80), safe_text(cat_id, 80)),
+                ).fetchone()
+                if not service_row:
+                    return self.send_json({"error": "service_not_found"}, 400)
+                service_value = f"{safe_text(cat_id, 80)}|{safe_text(service_id, 80)}"
+                service_name = service_name or service_row["ar"]
                 images = jload(current["images"], []) if request_id and 'current' in locals() else []
                 if data.get("imagesData"):
                     images = save_many_images(request_id, data["imagesData"], "problem", 5)
@@ -3101,7 +3590,24 @@ class Handler(SimpleHTTPRequestHandler):
                     "gov": str(data.get("gov", user_row["gov"]) or "")[:80],
                     "wilayah": str(data.get("wilayah", user_row["wilayah"]) or "")[:80],
                 }
-                location = data.get("location") or {}
+                try:
+                    location = normalized_location(data.get("location"))
+                    budget_min = finite_number(
+                        data.get("budgetMin", 0), minimum=0, maximum=1_000_000
+                    )
+                    budget_max = finite_number(
+                        data.get("budgetMax", 0), minimum=0, maximum=1_000_000
+                    )
+                except DomainError as err:
+                    return self.send_domain_error(err)
+                if budget_max and budget_min > budget_max:
+                    return self.send_json({"error": "invalid_budget_range"}, 400)
+                urgency = data.get("urgency", "normal")
+                if urgency not in {"normal", "urgent"}:
+                    urgency = "normal"
+                schedule_type = data.get("scheduleType", "flexible")
+                if schedule_type not in {"flexible", "scheduled"}:
+                    schedule_type = "flexible"
                 if data.get("id"):
                     con.execute("DELETE FROM request_dispatches WHERE request_id=?", (request_id,))
                 con.execute(
@@ -3123,9 +3629,9 @@ class Handler(SimpleHTTPRequestHandler):
                     (
                         request_id, user_id, request_item["customerName"], user_row["phone"],
                         service_value, service_name, request_item["gov"], request_item["wilayah"],
-                        location.get("lat"), location.get("lng"), data.get("urgency", "normal"),
-                        data.get("scheduleType", "flexible"), data.get("requestedAt", ""),
-                        float(data.get("budgetMin", 0) or 0), float(data.get("budgetMax", 0) or 0),
+                        location.get("lat"), location.get("lng"), urgency,
+                        schedule_type, safe_text(data.get("requestedAt"), 80),
+                        budget_min, budget_max,
                         str(data.get("locationText", "") or "")[:240],
                         str(data.get("note", "") or "")[:1200], jdump(images), "matching", "",
                         "[]", "[]", 1,
@@ -3147,7 +3653,7 @@ class Handler(SimpleHTTPRequestHandler):
                 return self.send_json(
                     {
                         "ok": True,
-                        "request": row_customer_request(saved),
+                        "request": row_customer_request(saved, sign_private=True),
                         "matchedProviders": len(ranked),
                         "notifiedProviders": len(released),
                     },
@@ -3326,13 +3832,13 @@ class Handler(SimpleHTTPRequestHandler):
                 return self.send_json({
                     "ok": True,
                     "suggestion": request_suggestion_by_id(con, suggestion_id),
-                    "request": row_customer_request(updated),
+                    "request": row_customer_request(updated, sign_private=True),
                 })
 
         return self.send_json({"error": "invalid_suggestion_action"}, 400)
 
     def request_action(self, data):
-        session = self.require_provider()
+        session = self.require_provider("requests")
         if not session:
             return
         request_id = str(data.get("id", ""))
@@ -3428,8 +3934,10 @@ class Handler(SimpleHTTPRequestHandler):
                 if not is_provider or not item["offersOpen"] or item["acceptedProviderId"]:
                     return self.send_json({"error": "offer_not_allowed"}, 403)
                 try:
-                    price = max(0, float(data.get("price", 0) or 0))
-                except (TypeError, ValueError):
+                    price = finite_number(
+                        data.get("price", 0), minimum=0, maximum=1_000_000
+                    )
+                except DomainError:
                     return self.send_json({"error": "invalid_offer_price"}, 400)
                 duration = str(data.get("duration", "") or "").strip()[:100]
                 if not duration:
@@ -3614,7 +4122,10 @@ class Handler(SimpleHTTPRequestHandler):
                 status = str(data.get("status", "onTheWay") or "onTheWay")
                 if status not in ("onTheWay", "near", "arrived"):
                     return self.send_json({"error": "invalid_arrival_status"}, 400)
-                location = data.get("location") or {}
+                try:
+                    location = normalized_location(data.get("location"))
+                except DomainError as err:
+                    return self.send_domain_error(err)
                 arrival = {
                     **(item.get("arrival") or {}),
                     "status": status,
@@ -3659,7 +4170,7 @@ class Handler(SimpleHTTPRequestHandler):
             updated = con.execute(
                 "SELECT * FROM customer_requests WHERE id=?", (request_id,)
             ).fetchone()
-            response_request = row_customer_request(updated)
+            response_request = row_customer_request(updated, sign_private=True)
             if provider_id:
                 consent = response_request.get("contactConsent") or {}
                 if response_request.get("acceptedProviderId") != provider_id or not (
@@ -3706,11 +4217,20 @@ class Handler(SimpleHTTPRequestHandler):
                 row = con.execute("SELECT id,name FROM app_users WHERE phone=? AND status='active'", (phone,)).fetchone()
             else:
                 row = con.execute(
-                    "SELECT id,name FROM providers WHERE phone=? OR phone=?",
+                    """SELECT id,name FROM providers WHERE active=1 AND status!='deleted'
+                    AND (phone=? OR phone=?)""",
                     (phone, phone.replace("968", "", 1)),
                 ).fetchone()
             if not row:
-                return self.send_json({"error": "account_not_found"}, 404)
+                # Keep the response indistinguishable from an existing account.
+                return self.send_json(
+                    {
+                        "ok": True,
+                        "recoveryId": slug("rcv"),
+                        "deliveryConfigured": whatsapp_configured(),
+                    },
+                    202,
+                )
             development_code = os.environ.get("KHADAMATI_DEV_OTP_CODE", "").strip()
             code = (
                 development_code
@@ -3744,7 +4264,7 @@ class Handler(SimpleHTTPRequestHandler):
         recovery_id = str(data.get("recoveryId", ""))
         code = str(data.get("code", ""))
         pin = str(data.get("pin", ""))
-        if len(pin) < 4:
+        if not re.fullmatch(r"\d{4,8}", pin):
             return self.send_json({"error": "pin_too_short"}, 400)
         with db() as con:
             row = con.execute(
@@ -3764,10 +4284,17 @@ class Handler(SimpleHTTPRequestHandler):
             if int(row["attempts"] or 0) >= 5 or not verify_secret(code, row["code_hash"]):
                 con.execute("UPDATE password_recoveries SET attempts=attempts+1 WHERE id=?", (recovery_id,))
                 return self.send_json({"error": "invalid_recovery_code"}, 403)
-            table = "app_users" if row["account_kind"] == "user" else "providers"
-            con.execute(f"UPDATE {table} SET pin_hash=? WHERE id=?", (hash_pin(pin), row["account_id"]))
+            if row["account_kind"] == "user":
+                con.execute(
+                    "UPDATE app_users SET pin_hash=? WHERE id=?", (hash_pin(pin), row["account_id"])
+                )
+            else:
+                con.execute(
+                    "UPDATE providers SET pin_hash=? WHERE id=?", (hash_pin(pin), row["account_id"])
+                )
             con.execute("UPDATE password_recoveries SET used_at=CURRENT_TIMESTAMP WHERE id=?", (recovery_id,))
             clear_login_failures(con, row["account_kind"], row["account_id"])
+            revoke_account_sessions(con, row["account_kind"], row["account_id"])
         return self.send_json({"ok": True})
 
     def delete_account(self, data):
@@ -3815,10 +4342,7 @@ class Handler(SimpleHTTPRequestHandler):
                     "UPDATE push_subscriptions SET active=0 WHERE target_kind='provider' AND target_id=?",
                     (account_id,),
                 )
-            con.execute(
-                "UPDATE auth_sessions SET revoked=1 WHERE session_json LIKE ?",
-                (f'%"{account_id}"%',),
-            )
+            revoke_account_sessions(con, session["kind"], account_id)
             create_notification(
                 con, "admin", "", "تم حذف حساب",
                 f"{session['kind']} - {account_id}", type_="security",
@@ -3832,9 +4356,24 @@ class Handler(SimpleHTTPRequestHandler):
         if not session:
             return self.send_json({"error": "auth_required"}, 401)
         subscription = data.get("subscription") or {}
-        endpoint = str(subscription.get("endpoint", ""))
-        if not endpoint:
+        endpoint = safe_text(subscription.get("endpoint"), 2048)
+        endpoint_url = urlparse(endpoint)
+        keys = subscription.get("keys") if isinstance(subscription.get("keys"), dict) else {}
+        if (
+            endpoint_url.scheme != "https"
+            or not endpoint_url.netloc
+            or not safe_text(keys.get("p256dh"), 512)
+            or not safe_text(keys.get("auth"), 512)
+        ):
             return self.send_json({"error": "push_endpoint_required"}, 400)
+        subscription = {
+            "endpoint": endpoint,
+            "expirationTime": subscription.get("expirationTime"),
+            "keys": {
+                "p256dh": safe_text(keys.get("p256dh"), 512),
+                "auth": safe_text(keys.get("auth"), 512),
+            },
+        }
         target_id = session.get("providerId") or session.get("userId") or session.get("id") or ""
         with db() as con:
             con.execute(
@@ -3912,21 +4451,60 @@ class Handler(SimpleHTTPRequestHandler):
                 return self.send_json({"error": "not_found"}, 404)
             provider = row_provider(row, private=True)
             if path == "/api/provider/profile":
+                entitlements = EntitlementService(con).for_provider(provider["id"])
+                name = safe_text(data.get("name", provider["name"]), 120)
+                phone = normalize_phone(data.get("phone", provider["phone"]))
+                bio = safe_text(data.get("bio", provider["bio"]), 900)
+                commercial_no = safe_text(
+                    data.get("commercialNo", provider.get("commercialNo", "")), 120
+                )
+                status = data.get("status", provider["status"])
+                if status not in {"available", "busy", "unavailable", "under_review"}:
+                    return self.send_json({"error": "invalid_provider_status"}, 400)
+                areas_value = data.get("areas", provider["areas"])
+                if not isinstance(areas_value, list):
+                    return self.send_json({"error": "areas_must_be_list"}, 400)
+                areas = list(
+                    dict.fromkeys(safe_text(area, 80) for area in areas_value if safe_text(area, 80))
+                )
+                try:
+                    location = normalized_location(
+                        data.get("location", provider.get("location"))
+                    )
+                    services = normalized_provider_services(
+                        con,
+                        data.get("services", provider["services"]),
+                        limit=max(1, int(entitlements.get("maxServices") or 1)),
+                        default_areas=areas,
+                    )
+                except DomainError as err:
+                    return self.send_domain_error(err)
+                if not name or len(phone) < 11:
+                    return self.send_json({"error": "name_and_valid_phone_required"}, 400)
+                if not commercial_no:
+                    return self.send_json({"error": "commercial_number_required"}, 400)
+                word_count = len(bio.split())
+                if word_count < 3 or word_count > 20:
+                    return self.send_json({"error": "description_word_limit"}, 400)
+                if not services:
+                    return self.send_json({"error": "service_required"}, 400)
+                if len(areas) > int(entitlements.get("maxWilayats") or max(1, len(areas))):
+                    return self.send_json({"error": "area_limit_exceeded"}, 409)
                 provider.update({
-                    "name": data.get("name", provider["name"]),
-                    "phone": data.get("phone", provider["phone"]),
-                    "commercialNo": data.get("commercialNo", provider.get("commercialNo", "")),
-                    "verificationExpiry": data.get("verificationExpiry", provider.get("verificationExpiry", "")),
-                    "commercialExpiry": data.get("commercialExpiry", provider.get("commercialExpiry", "")),
-                    "licenseExpiry": data.get("licenseExpiry", provider.get("licenseExpiry", "")),
-                    "gov": data.get("gov", provider["gov"]),
-                    "wilayah": data.get("wilayah", provider["wilayah"]),
-                    "location": data.get("location", provider.get("location")),
-                    "areas": data.get("areas", provider["areas"]),
-                    "bio": data.get("bio", provider["bio"]),
-                    "hours": data.get("hours", provider["hours"]),
-                    "status": data.get("status", provider["status"]),
-                    "services": data.get("services", provider["services"]),
+                    "name": name,
+                    "phone": phone,
+                    "commercialNo": commercial_no,
+                    "verificationExpiry": safe_text(data.get("verificationExpiry", provider.get("verificationExpiry", "")), 40),
+                    "commercialExpiry": safe_text(data.get("commercialExpiry", provider.get("commercialExpiry", "")), 40),
+                    "licenseExpiry": safe_text(data.get("licenseExpiry", provider.get("licenseExpiry", "")), 40),
+                    "gov": safe_text(data.get("gov", provider["gov"]), 80),
+                    "wilayah": safe_text(data.get("wilayah", provider["wilayah"]), 80),
+                    "location": location,
+                    "areas": areas,
+                    "bio": bio,
+                    "hours": safe_text(data.get("hours", provider["hours"]), 240),
+                    "status": status,
+                    "services": services,
                     "cardImage": data.get("cardImage", provider.get("cardImage", "")),
                     "beforeAfter": data.get("beforeAfter", provider.get("beforeAfter", [])),
                     "beforeAfterData": data.get("beforeAfterData", {}),
@@ -3971,7 +4549,7 @@ class Handler(SimpleHTTPRequestHandler):
                         )
                 log_audit(con, session, "provider.profile.updated", provider["id"], provider["name"])
                 updated = con.execute("SELECT * FROM providers WHERE id=?", (provider["id"],)).fetchone()
-                return self.send_json({"ok": True, "provider": row_provider(updated, private=True)})
+                return self.send_json({"ok": True, "provider": row_provider(updated, private=True, sign_private=True)})
             if path == "/api/provider/image":
                 image_path = save_data_url(provider["id"], data.get("imageData", ""))
                 con.execute("UPDATE providers SET image_path=? WHERE id=?", (image_path, provider["id"]))
@@ -4021,13 +4599,22 @@ class Handler(SimpleHTTPRequestHandler):
                 docs = save_many_documents(provider["id"], data.get("documentsData", []), "doc", 3)
                 if docs:
                     con.execute("UPDATE providers SET documents=? WHERE id=?", (jdump(docs), provider["id"]))
-                return self.send_json({"ok": True, "documents": docs})
+                return self.send_json({
+                    "ok": True,
+                    "documents": [secure_media_url(path) for path in docs],
+                })
             if path == "/api/provider/pin":
-                if len(str(data.get("pin", ""))) < 4:
+                if session.get("role") != "provider_owner" or session.get("memberId"):
+                    return self.send_json({"error": "provider_owner_required"}, 403)
+                pin = str(data.get("pin", ""))
+                if not re.fullmatch(r"\d{4,8}", pin):
                     return self.send_json({"error": "pin_too_short"}, 400)
                 if not verify_secret(data.get("currentPin", ""), row["pin_hash"]):
                     return self.send_json({"error": "current_pin_incorrect"}, 403)
-                con.execute("UPDATE providers SET pin_hash=? WHERE id=?", (hash_pin(data["pin"]), provider["id"]))
+                con.execute("UPDATE providers SET pin_hash=? WHERE id=?", (hash_pin(pin), provider["id"]))
+                authorization = str(self.headers.get("Authorization", "") or "")
+                current_hash = hash_secret(authorization[7:].strip()) if authorization.startswith("Bearer ") else ""
+                revoke_account_sessions(con, "provider", provider["id"], current_hash)
                 return self.send_json({"ok": True})
             if path == "/api/provider/subscription-request":
                 package_id = str(data.get("packageId", "") or "")
@@ -4062,12 +4649,25 @@ class Handler(SimpleHTTPRequestHandler):
                 return self.send_json({"ok": True, **result}, 201)
             if path == "/api/provider/team":
                 entitlements = EntitlementService(con).for_provider(provider["id"])
-                member_id = str(data.get("id") or slug("member"))
+                requested_id = safe_text(data.get("id"), 100)
+                member_id = requested_id or slug("member")
+                owned_member = None
+                if requested_id:
+                    owned_member = con.execute(
+                        "SELECT * FROM provider_team_members WHERE id=? AND provider_id=?",
+                        (member_id, provider["id"]),
+                    ).fetchone()
+                    if not owned_member:
+                        return self.send_json({"error": "team_member_not_found"}, 404)
+                if session.get("role") == "provider_manager" and owned_member and owned_member["role"] != "provider_staff":
+                    return self.send_json({"error": "provider_permission_denied"}, 403)
                 if data.get("action") == "delete":
-                    con.execute(
+                    result = con.execute(
                         "UPDATE provider_team_members SET active=0,updated_at=CURRENT_TIMESTAMP WHERE id=? AND provider_id=?",
                         (member_id, provider["id"]),
                     )
+                    if result.rowcount != 1:
+                        return self.send_json({"error": "team_member_not_found"}, 404)
                     log_audit(con, session, "provider.team.disabled", member_id, provider["id"])
                     return self.send_json({"ok": True})
                 existing_count = con.execute(
@@ -4080,38 +4680,57 @@ class Handler(SimpleHTTPRequestHandler):
                 role = str(data.get("role", "provider_staff") or "provider_staff")
                 if role not in {"provider_manager", "provider_staff"}:
                     return self.send_json({"error": "invalid_provider_role"}, 400)
-                existing = con.execute(
-                    "SELECT pin_hash FROM provider_team_members WHERE id=? AND provider_id=?",
-                    (member_id, provider["id"]),
-                ).fetchone()
-                pin_hash = existing["pin_hash"] if existing else ""
+                if session.get("role") == "provider_manager" and role != "provider_staff":
+                    return self.send_json({"error": "provider_permission_denied"}, 403)
+                name = safe_text(data.get("name"), 120)
+                phone = normalize_phone(data.get("phone", ""))
+                if not name or len(phone) < 11:
+                    return self.send_json({"error": "name_and_valid_phone_required"}, 400)
+                pin_hash = owned_member["pin_hash"] if owned_member else ""
                 if data.get("pin"):
+                    if len(str(data["pin"])) < 4 or len(str(data["pin"])) > 128:
+                        return self.send_json({"error": "invalid_pin_length"}, 400)
                     pin_hash = hash_pin(str(data["pin"]))
                 if not pin_hash:
                     return self.send_json({"error": "pin_required"}, 400)
-                con.execute(
-                    """INSERT INTO provider_team_members(
-                    id,provider_id,name,phone,role,pin_hash,permissions,active)
-                    VALUES(?,?,?,?,?,?,?,1) ON CONFLICT(id) DO UPDATE SET
-                    name=excluded.name,phone=excluded.phone,role=excluded.role,
-                    pin_hash=excluded.pin_hash,permissions=excluded.permissions,active=1,
-                    updated_at=CURRENT_TIMESTAMP""",
-                    (
-                        member_id, provider["id"], str(data.get("name", "") or "")[:120],
-                        normalize_phone(data.get("phone", "")), role, pin_hash,
-                        jdump(data.get("permissions", [])),
-                    ),
-                )
+                selected_permissions = [
+                    item for item in data.get("permissions", [])
+                    if item in PROVIDER_ROLE_PERMISSIONS[role]
+                ] if isinstance(data.get("permissions"), list) else []
+                try:
+                    con.execute(
+                        """INSERT INTO provider_team_members(
+                        id,provider_id,name,phone,role,pin_hash,permissions,active)
+                        VALUES(?,?,?,?,?,?,?,1) ON CONFLICT(id) DO UPDATE SET
+                        name=excluded.name,phone=excluded.phone,role=excluded.role,
+                        pin_hash=excluded.pin_hash,permissions=excluded.permissions,active=1,
+                        updated_at=CURRENT_TIMESTAMP
+                        WHERE provider_team_members.provider_id=excluded.provider_id""",
+                        (
+                            member_id, provider["id"], name, phone, role, pin_hash,
+                            jdump(selected_permissions),
+                        ),
+                    )
+                except sqlite3.IntegrityError:
+                    return self.send_json({"error": "team_phone_already_used"}, 409)
                 log_audit(con, session, "provider.team.upserted", member_id, role)
                 return self.send_json({"ok": True, "id": member_id})
             if path == "/api/provider/branches":
                 entitlements = EntitlementService(con).for_provider(provider["id"])
-                branch_id = str(data.get("id") or slug("branch"))
+                requested_id = safe_text(data.get("id"), 100)
+                branch_id = requested_id or slug("branch")
+                if requested_id and not con.execute(
+                    "SELECT id FROM provider_branches WHERE id=? AND provider_id=?",
+                    (branch_id, provider["id"]),
+                ).fetchone():
+                    return self.send_json({"error": "branch_not_found"}, 404)
                 if data.get("action") == "delete":
-                    con.execute(
+                    result = con.execute(
                         "UPDATE provider_branches SET active=0,updated_at=CURRENT_TIMESTAMP WHERE id=? AND provider_id=?",
                         (branch_id, provider["id"]),
                     )
+                    if result.rowcount != 1:
+                        return self.send_json({"error": "branch_not_found"}, 404)
                     log_audit(con, session, "provider.branch.disabled", branch_id, provider["id"])
                     return self.send_json({"ok": True})
                 existing_count = con.execute(
@@ -4121,18 +4740,25 @@ class Handler(SimpleHTTPRequestHandler):
                 ).fetchone()["n"]
                 if int(existing_count or 0) >= int(entitlements.get("branches") or 1):
                     return self.send_json({"error": "branch_limit_exceeded"}, 409)
-                location = data.get("location") if isinstance(data.get("location"), dict) else {}
+                name = safe_text(data.get("name"), 120)
+                if not name:
+                    return self.send_json({"error": "branch_name_required"}, 400)
+                try:
+                    location = normalized_location(data.get("location"))
+                except DomainError as err:
+                    return self.send_domain_error(err)
                 con.execute(
                     """INSERT INTO provider_branches(
                     id,provider_id,name,gov,wilayah,address,latitude,longitude,phone,active)
                     VALUES(?,?,?,?,?,?,?,?,?,1) ON CONFLICT(id) DO UPDATE SET
                     name=excluded.name,gov=excluded.gov,wilayah=excluded.wilayah,
                     address=excluded.address,latitude=excluded.latitude,longitude=excluded.longitude,
-                    phone=excluded.phone,active=1,updated_at=CURRENT_TIMESTAMP""",
+                    phone=excluded.phone,active=1,updated_at=CURRENT_TIMESTAMP
+                    WHERE provider_branches.provider_id=excluded.provider_id""",
                     (
-                        branch_id, provider["id"], str(data.get("name", "") or "")[:120],
-                        str(data.get("gov", "") or "")[:80], str(data.get("wilayah", "") or "")[:80],
-                        str(data.get("address", "") or "")[:240], location.get("lat"), location.get("lng"),
+                        branch_id, provider["id"], name,
+                        safe_text(data.get("gov"), 80), safe_text(data.get("wilayah"), 80),
+                        safe_text(data.get("address"), 240), location.get("lat"), location.get("lng"),
                         normalize_phone(data.get("phone", provider.get("phone", ""))),
                     ),
                 )
@@ -4170,12 +4796,24 @@ class Handler(SimpleHTTPRequestHandler):
                 log_audit(con, session, "provider.upserted", p["id"], p.get("name", ""))
                 return self.send_json({"ok": True, "provider": p})
             if path == "/api/admin/provider-status":
+                provider_id = safe_text(data.get("id"), 120)
+                status = safe_text(data.get("status", "available"), 30)
+                if status not in {"available", "busy", "unavailable", "under_review", "pending", "suspended", "deleted"}:
+                    return self.send_json({"error": "invalid_provider_status"}, 400)
+                flags = []
+                for key, default in (("active", 1), ("verified", 0), ("featured", 0)):
+                    value = data.get(key, default)
+                    if value not in (True, False, 0, 1):
+                        return self.send_json({"error": "invalid_boolean", "field": key}, 400)
+                    flags.append(int(bool(value)))
+                if not con.execute("SELECT id FROM providers WHERE id=?", (provider_id,)).fetchone():
+                    return self.send_json({"error": "provider_not_found"}, 404)
                 con.execute(
                     "UPDATE providers SET active=?, verified=?, featured=?, status=? WHERE id=?",
-                    (int(data.get("active", 1)), int(data.get("verified", 0)), int(data.get("featured", 0)), data.get("status", "available"), data.get("id")),
+                    (*flags, status, provider_id),
                 )
-                recompute_provider_quality(con, data.get("id"))
-                log_audit(con, session, "provider.status.updated", data.get("id", ""), data.get("status", ""))
+                recompute_provider_quality(con, provider_id)
+                log_audit(con, session, "provider.status.updated", provider_id, status)
                 return self.send_json({"ok": True})
             if path == "/api/admin/provider-delete":
                 provider_id = str(data.get("id", "") or "")
@@ -4200,14 +4838,18 @@ class Handler(SimpleHTTPRequestHandler):
                     "UPDATE push_subscriptions SET active=0 WHERE target_kind='provider' AND target_id=?",
                     (provider_id,),
                 )
+                revoke_account_sessions(con, "provider", provider_id)
                 log_audit(con, session, "provider.deleted", provider_id, provider_row["name"])
                 return self.send_json({"ok": True})
             if path == "/api/admin/request-decision":
+                decision = safe_text(data.get("decision"), 20)
+                if decision not in {"accept", "reject"}:
+                    return self.send_json({"error": "invalid_request_decision"}, 400)
                 row = con.execute("SELECT payload FROM provider_requests WHERE id=?", (data.get("id"),)).fetchone()
                 if not row:
                     return self.send_json({"error": "not_found"}, 404)
                 payload = jload(row["payload"], {})
-                if data.get("decision") == "accept":
+                if decision == "accept":
                     note_words = len(str(payload.get("note", "")).split())
                     if not payload.get("commercialNo"):
                         return self.send_json({"error": "commercial_number_required"}, 400)
@@ -4218,7 +4860,7 @@ class Handler(SimpleHTTPRequestHandler):
                     if not payload.get("pinHash"):
                         return self.send_json({"error": "pin_not_configured"}, 400)
                 con.execute("DELETE FROM provider_requests WHERE id=?", (data.get("id"),))
-                if data.get("decision") == "accept":
+                if decision == "accept":
                     provider = {
                         "id": slug("p"),
                         "name": payload.get("name", ""),
@@ -4292,23 +4934,26 @@ class Handler(SimpleHTTPRequestHandler):
                     log_audit(con, session, "provider.request.rejected", data.get("id", ""), payload.get("name", ""))
                 return self.send_json({"ok": True})
             if path == "/api/admin/review-status":
-                con.execute("UPDATE reviews SET approved=? WHERE id=?", (int(bool(data.get("approved", True))), data.get("id")))
-                row = con.execute("SELECT provider_id FROM reviews WHERE id=?", (data.get("id"),)).fetchone()
-                if row:
-                    recompute_provider_quality(con, row["provider_id"])
-                log_audit(con, session, "review.status.updated", data.get("id", ""), str(data.get("approved", True)))
+                review_id = safe_text(data.get("id"), 120)
+                approved = strict_bool(data.get("approved"), True)
+                row = con.execute("SELECT provider_id FROM reviews WHERE id=?", (review_id,)).fetchone()
+                if not row:
+                    return self.send_json({"error": "review_not_found"}, 404)
+                con.execute("UPDATE reviews SET approved=? WHERE id=?", (int(approved), review_id))
+                recompute_provider_quality(con, row["provider_id"])
+                log_audit(con, session, "review.status.updated", review_id, str(approved))
                 return self.send_json({"ok": True})
             if path == "/api/admin/complaint-status":
                 complaint_id = data.get("id")
                 row = con.execute("SELECT provider_id FROM complaints WHERE id=?", (complaint_id,)).fetchone()
                 if not row:
                     return self.send_json({"error": "not_found"}, 404)
-                status = data.get("status", "open")
-                priority = data.get("priority", "normal")
+                status = safe_text(data.get("status", "open"), 30)
+                priority = safe_text(data.get("priority", "normal"), 30)
                 if status not in ("open", "reviewing", "closed"):
-                    status = "open"
+                    return self.send_json({"error": "invalid_complaint_status"}, 400)
                 if priority not in ("low", "normal", "high"):
-                    priority = "normal"
+                    return self.send_json({"error": "invalid_complaint_priority"}, 400)
                 con.execute(
                     "UPDATE complaints SET status=?, priority=?, resolution=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
                     (status, priority, data.get("resolution", ""), complaint_id),
@@ -4322,16 +4967,16 @@ class Handler(SimpleHTTPRequestHandler):
                 if package_id not in PLAN_IDS:
                     return self.send_json({"error": "fixed_plan_catalog"}, 409)
                 entitlements = {
-                    "maxServices": max(1, int(data.get("maxServices", 1) or 1)),
-                    "maxImages": max(1, int(data.get("maxImages", 5) or 5)),
-                    "maxWilayats": max(1, int(data.get("maxWilayats", 5) or 5)),
-                    "maxGovernorates": max(1, int(data.get("maxGovernorates", 1) or 1)),
-                    "monthlyResponses": max(0, int(data.get("monthlyResponses", 0) or 0)),
-                    "leadDelayMinutes": max(0, int(data.get("leadDelayMinutes", 0) or 0)),
-                    "teamMembers": max(1, int(data.get("teamMembers", 1) or 1)),
-                    "branches": max(1, int(data.get("branches", 1) or 1)),
-                    "sharedInbox": bool(data.get("sharedInbox", False)),
-                    "advancedReports": bool(data.get("advancedReports", False)),
+                    "maxServices": bounded_int(data.get("maxServices", 1), 1, minimum=1, maximum=100),
+                    "maxImages": bounded_int(data.get("maxImages", 5), 5, minimum=1, maximum=100),
+                    "maxWilayats": bounded_int(data.get("maxWilayats", 5), 5, minimum=1, maximum=100),
+                    "maxGovernorates": bounded_int(data.get("maxGovernorates", 1), 1, minimum=1, maximum=20),
+                    "monthlyResponses": bounded_int(data.get("monthlyResponses", 0), 0, minimum=0, maximum=100000),
+                    "leadDelayMinutes": bounded_int(data.get("leadDelayMinutes", 0), 0, minimum=0, maximum=1440),
+                    "teamMembers": bounded_int(data.get("teamMembers", 1), 1, minimum=1, maximum=100),
+                    "branches": bounded_int(data.get("branches", 1), 1, minimum=1, maximum=100),
+                    "sharedInbox": strict_bool(data.get("sharedInbox"), False),
+                    "advancedReports": strict_bool(data.get("advancedReports"), False),
                 }
                 con.execute(
                     """UPDATE packages SET ar=?,en=?,price=?,currency='OMR',duration_days=?,
@@ -4342,8 +4987,8 @@ class Handler(SimpleHTTPRequestHandler):
                     (
                         data.get("ar", "باقة"),
                         data.get("en", "Package"),
-                        max(0, float(data.get("price", 0) or 0)),
-                        max(1, int(data.get("durationDays", 30) or 30)),
+                        finite_number(data.get("price", 0), 0, minimum=0, maximum=1_000_000),
+                        bounded_int(data.get("durationDays", 30), 30, minimum=1, maximum=3650),
                         entitlements["maxServices"], entitlements["maxImages"],
                         entitlements["maxWilayats"], entitlements["maxGovernorates"],
                         entitlements["monthlyResponses"], entitlements["leadDelayMinutes"],
@@ -4351,7 +4996,7 @@ class Handler(SimpleHTTPRequestHandler):
                         int(entitlements["sharedInbox"]), int(entitlements["advancedReports"]),
                         str(data.get("badgeAr", "") or "")[:80],
                         str(data.get("badgeEn", "") or "")[:80],
-                        jdump(entitlements), int(bool(data.get("active", True))), package_id,
+                        jdump(entitlements), int(strict_bool(data.get("active"), True)), package_id,
                     ),
                 )
                 log_audit(con, session, "package.upserted", package_id, data.get("ar", ""))
@@ -4469,6 +5114,8 @@ class Handler(SimpleHTTPRequestHandler):
                         payment = con.execute("SELECT * FROM payments WHERE id=?", (payment_id,)).fetchone()
                         if not payment:
                             raise DomainError("payment_not_found", 404)
+                        if payment["status"] != "paid":
+                            raise DomainError("invalid_payment_transition", 409)
                         con.execute(
                             """UPDATE payments SET status='refunded',refunded_at=CURRENT_TIMESTAMP,
                             updated_at=CURRENT_TIMESTAMP WHERE id=?""", (payment_id,)
@@ -4511,7 +5158,7 @@ class Handler(SimpleHTTPRequestHandler):
                 discount_type = str(data.get("discountType", "fixed") or "fixed")
                 if not code or discount_type not in {"fixed", "percent"}:
                     return self.send_json({"error": "invalid_coupon"}, 400)
-                value = max(0, float(data.get("discountValue", 0) or 0))
+                value = finite_number(data.get("discountValue", 0), minimum=0, maximum=1_000_000)
                 if discount_type == "percent" and value > 100:
                     return self.send_json({"error": "invalid_coupon_value"}, 400)
                 applies_to = [plan for plan in data.get("appliesTo", []) if plan in PLAN_IDS]
@@ -4553,29 +5200,48 @@ class Handler(SimpleHTTPRequestHandler):
                         str(data.get("kind", "subscription") or "subscription")[:40],
                         str(data.get("startsAt", "") or "")[:40],
                         str(data.get("endsAt", "") or "")[:40],
-                        max(0, float(data.get("budget", 0) or 0)), status,
+                        finite_number(data.get("budget", 0), minimum=0, maximum=1_000_000_000), status,
                         jdump(data.get("rules", {}) if isinstance(data.get("rules"), dict) else {}),
                     ),
                 )
                 log_audit(con, session, "campaign.upserted", campaign_id, status)
                 return self.send_json({"ok": True, "id": campaign_id})
             if path == "/api/admin/team":
-                member_id = str(data.get("id") or slug("member"))
+                member_id = safe_text(data.get("id"), 100) or slug("member")
                 if data.get("action") == "delete":
-                    con.execute("UPDATE provider_team_members SET active=0 WHERE id=?", (member_id,))
+                    result = con.execute("UPDATE provider_team_members SET active=0 WHERE id=?", (member_id,))
+                    if result.rowcount != 1:
+                        return self.send_json({"error": "team_member_not_found"}, 404)
                     log_audit(con, session, "team.disabled", member_id, "")
                     return self.send_json({"ok": True})
+                provider_id = safe_text(data.get("providerId"), 120)
+                if not con.execute("SELECT id FROM providers WHERE id=?", (provider_id,)).fetchone():
+                    return self.send_json({"error": "provider_not_found"}, 404)
                 role = str(data.get("role", "provider_staff") or "provider_staff")
                 if role not in {"provider_owner", "provider_manager", "provider_staff"}:
                     return self.send_json({"error": "invalid_provider_role"}, 400)
+                name = safe_text(data.get("name"), 120)
+                phone = normalize_phone(data.get("phone", ""))
+                if not name or len(phone) < 11:
+                    return self.send_json({"error": "name_and_valid_phone_required"}, 400)
                 existing = con.execute(
-                    "SELECT pin_hash FROM provider_team_members WHERE id=?", (member_id,)
+                    "SELECT pin_hash,provider_id FROM provider_team_members WHERE id=?", (member_id,)
                 ).fetchone()
+                if existing and existing["provider_id"] != provider_id:
+                    return self.send_json({"error": "team_member_provider_mismatch"}, 409)
                 pin_hash = existing["pin_hash"] if existing else ""
                 if data.get("pin"):
-                    pin_hash = hash_pin(str(data["pin"]))
+                    pin = str(data["pin"])
+                    if not re.fullmatch(r"\d{4,10}", pin):
+                        return self.send_json({"error": "invalid_pin"}, 400)
+                    pin_hash = hash_pin(pin)
                 if not pin_hash:
                     return self.send_json({"error": "pin_required"}, 400)
+                selected_permissions = [
+                    item for item in data.get("permissions", [])
+                    if item in PROVIDER_ROLE_PERMISSIONS[role]
+                ] if isinstance(data.get("permissions"), list) else []
+                active = strict_bool(data.get("active"), True)
                 con.execute(
                     """INSERT INTO provider_team_members(
                     id,provider_id,name,phone,role,pin_hash,permissions,active)
@@ -4584,20 +5250,33 @@ class Handler(SimpleHTTPRequestHandler):
                     role=excluded.role,pin_hash=excluded.pin_hash,permissions=excluded.permissions,
                     active=excluded.active,updated_at=CURRENT_TIMESTAMP""",
                     (
-                        member_id, data.get("providerId", ""), str(data.get("name", "") or "")[:120],
-                        normalize_phone(data.get("phone", "")), role, pin_hash,
-                        jdump(data.get("permissions", [])), int(bool(data.get("active", True))),
+                        member_id, provider_id, name, phone, role, pin_hash,
+                        jdump(selected_permissions), int(active),
                     ),
                 )
                 log_audit(con, session, "team.upserted", member_id, role)
                 return self.send_json({"ok": True, "id": member_id})
             if path == "/api/admin/branches":
-                branch_id = str(data.get("id") or slug("branch"))
+                branch_id = safe_text(data.get("id"), 100) or slug("branch")
                 if data.get("action") == "delete":
-                    con.execute("UPDATE provider_branches SET active=0 WHERE id=?", (branch_id,))
+                    result = con.execute("UPDATE provider_branches SET active=0 WHERE id=?", (branch_id,))
+                    if result.rowcount != 1:
+                        return self.send_json({"error": "branch_not_found"}, 404)
                     log_audit(con, session, "branch.disabled", branch_id, "")
                     return self.send_json({"ok": True})
-                location = data.get("location") if isinstance(data.get("location"), dict) else {}
+                provider_id = safe_text(data.get("providerId"), 120)
+                if not con.execute("SELECT id FROM providers WHERE id=?", (provider_id,)).fetchone():
+                    return self.send_json({"error": "provider_not_found"}, 404)
+                existing = con.execute(
+                    "SELECT provider_id FROM provider_branches WHERE id=?", (branch_id,)
+                ).fetchone()
+                if existing and existing["provider_id"] != provider_id:
+                    return self.send_json({"error": "branch_provider_mismatch"}, 409)
+                name = safe_text(data.get("name"), 120)
+                if not name:
+                    return self.send_json({"error": "branch_name_required"}, 400)
+                location = normalized_location(data.get("location"))
+                active = strict_bool(data.get("active"), True)
                 con.execute(
                     """INSERT INTO provider_branches(
                     id,provider_id,name,gov,wilayah,address,latitude,longitude,phone,active)
@@ -4607,13 +5286,13 @@ class Handler(SimpleHTTPRequestHandler):
                     longitude=excluded.longitude,phone=excluded.phone,active=excluded.active,
                     updated_at=CURRENT_TIMESTAMP""",
                     (
-                        branch_id, data.get("providerId", ""), str(data.get("name", "") or "")[:120],
+                        branch_id, provider_id, name,
                         str(data.get("gov", "") or "")[:80], str(data.get("wilayah", "") or "")[:80],
                         str(data.get("address", "") or "")[:240], location.get("lat"), location.get("lng"),
-                        normalize_phone(data.get("phone", "")), int(bool(data.get("active", True))),
+                        normalize_phone(data.get("phone", "")), int(active),
                     ),
                 )
-                log_audit(con, session, "branch.upserted", branch_id, data.get("providerId", ""))
+                log_audit(con, session, "branch.upserted", branch_id, provider_id)
                 return self.send_json({"ok": True, "id": branch_id})
             if path == "/api/admin/contact-consents":
                 if data.get("action") != "revoke":
@@ -4689,7 +5368,8 @@ class Handler(SimpleHTTPRequestHandler):
                     updated_at=CURRENT_TIMESTAMP""",
                     (
                         ad_id, image_path, str(data.get("advertiser", "") or "")[:120],
-                        normalize_phone(data.get("phone", "")), float(data.get("amount", 0) or 0),
+                        normalize_phone(data.get("phone", "")),
+                        finite_number(data.get("amount", 0), minimum=0, maximum=1_000_000_000),
                         str(data.get("title", "") or "")[:160],
                         str(data.get("body", "") or "")[:500],
                         str(data.get("startsAt", "") or "")[:40],
@@ -4710,7 +5390,10 @@ class Handler(SimpleHTTPRequestHandler):
                 if role not in {"super_admin", "admin", "manager", "support", "finance"}:
                     return self.send_json({"error": "invalid_admin_role"}, 400)
                 perms = permissions_for(role, data.get("permissions"))
-                user_id = data.get("id") or slug("admin")
+                user_id = safe_text(data.get("id"), 100) or slug("admin")
+                name = safe_text(data.get("name", "مشرف"), 120)
+                if not name:
+                    return self.send_json({"error": "admin_name_required"}, 400)
                 existing = con.execute("SELECT code_hash FROM admin_users WHERE id=?", (user_id,)).fetchone()
                 code_hash = existing["code_hash"] if existing else ""
                 if data.get("code"):
@@ -4723,7 +5406,7 @@ class Handler(SimpleHTTPRequestHandler):
                     """INSERT INTO admin_users(id,name,code_hash,role,permissions,active) VALUES(?,?,?,?,?,?)
                     ON CONFLICT(id) DO UPDATE SET name=excluded.name,code_hash=excluded.code_hash,
                     role=excluded.role,permissions=excluded.permissions,active=excluded.active""",
-                    (user_id, data.get("name", "مشرف"), code_hash, role, jdump(perms), int(bool(data.get("active", True)))),
+                    (user_id, name, code_hash, role, jdump(perms), int(strict_bool(data.get("active"), True))),
                 )
                 log_audit(con, session, "admin_user.upserted", user_id, role)
                 return self.send_json({"ok": True})
@@ -4734,8 +5417,11 @@ class Handler(SimpleHTTPRequestHandler):
 
 if __name__ == "__main__":
     init_db()
-    host = os.environ.get("HOST", "0.0.0.0")
+    host = os.environ.get("HOST", "127.0.0.1")
     port = int(os.environ.get("PORT", "8080"))
-    display_host = "127.0.0.1" if host in ("0.0.0.0", "::") else host
+    try:
+        display_host = "127.0.0.1" if ipaddress.ip_address(host).is_unspecified else host
+    except ValueError:
+        display_host = host
     print(f"Khadamati platform running: http://{display_host}:{port}", flush=True)
     ThreadingHTTPServer((host, port), Handler).serve_forever()

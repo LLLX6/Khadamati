@@ -1,27 +1,25 @@
-const CACHE_NAME = 'khadamati-app-shell-v47-production';
+const CACHE_NAME = 'khadamati-app-shell-v49-onboarding';
 const SHELL = [
   './',
   './index.html',
   './app-icon-192.png',
   './app-icon-512.png',
-  './assets/onboarding/khadamati-onboarding.webp',
-  './assets/onboarding/v45/customer-discover.webp',
-  './assets/onboarding/v45/customer-request.webp',
-  './assets/onboarding/v45/customer-map.webp',
-  './assets/onboarding/v45/customer-track.webp',
-  './assets/onboarding/v45/guest-browse.webp',
-  './assets/onboarding/v45/guest-compare.webp',
-  './assets/onboarding/v45/guest-signin.webp',
-  './assets/onboarding/v45/guest-privacy.webp',
-  './assets/onboarding/v45/provider-profile.webp',
-  './assets/onboarding/v45/provider-opportunities.webp',
-  './assets/onboarding/v45/provider-availability.webp',
-  './assets/onboarding/v45/provider-offer.webp',
-  './assets/onboarding/v45/company-profile.webp',
-  './assets/onboarding/v45/company-dispatch.webp',
-  './assets/onboarding/v45/company-analytics.webp',
-  './assets/onboarding/v45/company-team.webp',
-  './assets/onboarding/v46/request-provider-recommendation.webp',
+  './assets/onboarding/v49/user-service.webp',
+  './assets/onboarding/v49/user-direct-request.webp',
+  './assets/onboarding/v49/user-matching.webp',
+  './assets/onboarding/v49/user-track.webp',
+  './assets/onboarding/v49/guest-browse.webp',
+  './assets/onboarding/v49/guest-compare.webp',
+  './assets/onboarding/v49/guest-signin.webp',
+  './assets/onboarding/v49/guest-privacy.webp',
+  './assets/onboarding/v49/provider-profile.webp',
+  './assets/onboarding/v49/provider-opportunity.webp',
+  './assets/onboarding/v49/provider-availability.webp',
+  './assets/onboarding/v49/provider-offer.webp',
+  './assets/onboarding/v49/company-profile.webp',
+  './assets/onboarding/v49/company-dispatch.webp',
+  './assets/onboarding/v49/company-analytics.webp',
+  './assets/onboarding/v49/company-team.webp',
   './assets/ads/v45/home-services.webp',
   './assets/ads/v45/nearby-services.webp',
   './assets/ads/v45/business-services.webp',
@@ -48,6 +46,12 @@ self.addEventListener('message', event => {
 
 self.addEventListener('fetch', event => {
   if (event.request.method !== 'GET') return;
+  const url = new URL(event.request.url);
+  const privatePath = /\/(api|media|uploads)\//.test(url.pathname);
+  if (url.origin !== self.location.origin || privatePath) {
+    event.respondWith(fetch(event.request, { cache: 'no-store' }));
+    return;
+  }
   const acceptsHtml = event.request.headers.get('accept')?.includes('text/html');
   if (event.request.mode === 'navigate' || acceptsHtml) {
     event.respondWith(
@@ -64,8 +68,10 @@ self.addEventListener('fetch', event => {
   event.respondWith(
     fetch(event.request)
       .then(response => {
-        const copy = response.clone();
-        caches.open(CACHE_NAME).then(cache => cache.put(event.request, copy)).catch(() => {});
+        if (response.ok && response.type === 'basic') {
+          const copy = response.clone();
+          caches.open(CACHE_NAME).then(cache => cache.put(event.request, copy)).catch(() => {});
+        }
         return response;
       })
       .catch(() => caches.match(event.request))

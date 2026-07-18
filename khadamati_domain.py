@@ -278,16 +278,19 @@ class PlanCatalog:
                     plan["foundation_once"], plan["verified_required"], dump(entitlements),
                 ),
             )
-        placeholders = ",".join("?" for _ in PLAN_IDS)
         con.execute(
-            f"UPDATE packages SET active=0,legacy=1 WHERE id NOT IN ({placeholders})",
+            "UPDATE packages SET active=0,legacy=1 WHERE id NOT IN (?,?,?,?,?)",
             PLAN_IDS,
         )
 
     @staticmethod
     def get(con, plan_id: str, active_only: bool = True) -> dict[str, Any] | None:
-        sql = "SELECT * FROM packages WHERE id=?" + (" AND active=1 AND legacy=0" if active_only else "")
-        row = con.execute(sql, (plan_id,)).fetchone()
+        if active_only:
+            row = con.execute(
+                "SELECT * FROM packages WHERE id=? AND active=1 AND legacy=0", (plan_id,)
+            ).fetchone()
+        else:
+            row = con.execute("SELECT * FROM packages WHERE id=?", (plan_id,)).fetchone()
         if not row:
             return None
         result = row_dict(row)
@@ -1005,17 +1008,25 @@ class RequestMarketplace:
 
     def release_due(self, request_id: str | None = None) -> list[dict[str, Any]]:
         params: list[Any] = [iso(self.now)]
-        where = "d.status='scheduled' AND d.release_at<=?"
         if request_id:
-            where += " AND d.request_id=?"
             params.append(request_id)
-        rows = list(self.con.execute(
-            f"""SELECT d.*,r.service_name,r.service_value,r.gov,r.wilayah,r.offers,
-            r.expansion_at,r.status request_status FROM request_dispatches d
-            JOIN customer_requests r ON r.id=d.request_id WHERE {where}
-            ORDER BY d.request_id,d.rank""",
-            params,
-        ))
+            rows = list(self.con.execute(
+                """SELECT d.*,r.service_name,r.service_value,r.gov,r.wilayah,r.offers,
+                r.expansion_at,r.status request_status FROM request_dispatches d
+                JOIN customer_requests r ON r.id=d.request_id
+                WHERE d.status='scheduled' AND d.release_at<=? AND d.request_id=?
+                ORDER BY d.request_id,d.rank""",
+                params,
+            ))
+        else:
+            rows = list(self.con.execute(
+                """SELECT d.*,r.service_name,r.service_value,r.gov,r.wilayah,r.offers,
+                r.expansion_at,r.status request_status FROM request_dispatches d
+                JOIN customer_requests r ON r.id=d.request_id
+                WHERE d.status='scheduled' AND d.release_at<=?
+                ORDER BY d.request_id,d.rank""",
+                params,
+            ))
         released = []
         by_request: dict[str, list[Any]] = {}
         for row in rows:
@@ -1140,6 +1151,13 @@ class PaymentAdapter:
         status = str(payload.get("status") or "").lower()
         if status not in {"paid", "failed", "cancelled", "refunded"}:
             raise DomainError("invalid_payment_status")
+        current_status = str(payment["status"] or "pending").lower()
+        if current_status == "refunded" and status != "refunded":
+            raise DomainError("invalid_payment_transition", 409)
+        if status == "refunded" and current_status != "paid":
+            raise DomainError("invalid_payment_transition", 409)
+        if current_status == "paid" and status in {"failed", "cancelled"}:
+            raise DomainError("invalid_payment_transition", 409)
         self.con.execute(
             """INSERT INTO webhook_events(
             id,provider,event_id,signature_valid,payload_hash,processed)
@@ -1175,6 +1193,8 @@ class PaymentAdapter:
             raise DomainError("payment_not_found", 404)
         if payment["status"] == "paid":
             return row_dict(payment)
+        if payment["status"] != "pending":
+            raise DomainError("invalid_payment_transition", 409)
         self.con.execute(
             "UPDATE payments SET status='paid',verified_at=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",
             (iso(self.now), payment_id),

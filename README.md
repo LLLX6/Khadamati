@@ -60,6 +60,10 @@ http://127.0.0.1:8080
 
 - `KHADAMATI_ADMIN_CODE`: رمز إدارة قوي وغير محفوظ في المستودع.
 - `KHADAMATI_OTP_PEPPER`: سر عشوائي لتجزئة رموز OTP.
+- `KHADAMATI_MEDIA_SIGNING_KEY`: سر مستقل لتوقيع روابط الوثائق والوسائط الخاصة.
+- `KHADAMATI_LOGIN_MAX_ATTEMPTS`, `KHADAMATI_LOGIN_LOCK_MINUTES`: حدود قفل محاولات الدخول.
+- `KHADAMATI_MEDIA_URL_TTL_SECONDS`: عمر رابط الوسائط الخاصة الموقّع.
+- `KHADAMATI_MAX_JSON_BYTES`: الحد الأعلى لجسم JSON قبل رفضه.
 - `KHADAMATI_DB_PATH`, `KHADAMATI_UPLOAD_DIR`, `KHADAMATI_BACKUP_DIR`: مسارات تخزين دائمة.
 - `KHADAMATI_PUBLIC_URL`: رابط GitHub Pages النهائي.
 - `KHADAMATI_ALLOWED_ORIGINS`: الأصول المسموح بها.
@@ -100,7 +104,8 @@ https://lllx6.github.io/Khadamati/
 
 ```powershell
 python -m py_compile server.py khadamati_domain.py
-python -m unittest tests.test_domain -v
+python -m unittest discover -s tests -p "test_*.py" -v
+python tests/security-api.py
 node tests/smoke-ui.js
 ```
 
@@ -122,6 +127,7 @@ python tests/smoke-api.py
 ```
 
 الاختبارات تغطي المستخدم والمزود والإدارة والطلب والمطابقة والمحادثة والموافقة والخرائط والهاتف، كما تتحقق من رفض التلاعب بمبلغ الاشتراك.
+تفاصيل التهديدات والإصلاحات ونتائج الأدوات موثقة في `SECURITY_AND_QUALITY_AUDIT.md`.
 
 ## التوسع إلى PostgreSQL
 

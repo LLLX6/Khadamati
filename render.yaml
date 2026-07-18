@@ -23,5 +23,13 @@ services:
         sync: false
       - key: KHADAMATI_OTP_PEPPER
         sync: false
+      - key: KHADAMATI_MEDIA_SIGNING_KEY
+        sync: false
+      - key: KHADAMATI_LOGIN_MAX_ATTEMPTS
+        value: 5
+      - key: KHADAMATI_LOGIN_LOCK_MINUTES
+        value: 15
+      - key: KHADAMATI_MEDIA_URL_TTL_SECONDS
+        value: 900
       - key: KHADAMATI_PAYMENT_WEBHOOK_SECRET
         sync: false
