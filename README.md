@@ -82,6 +82,10 @@ KHADAMATI_SUBSCRIPTION_MIGRATION_V1
 
 `render.yaml` يجهز خادم Python. في Render أضف أسرار الإدارة وOTP والدفع يدوياً، واضبط قرصاً دائماً أو PostgreSQL وتخزين ملفات دائم قبل الإطلاق العام.
 
+[نشر أو استعادة خادم خدماتي على Render](https://render.com/deploy?repo=https://github.com/LLLX6/Khadamati)
+
+إذا أعاد `https://khadamati.onrender.com/api/bootstrap` حالة `503` مع عبارة `Service Suspended`، فخدمة Render نفسها متوقفة وليست المشكلة في الواجهة أو رقم الهاتف. افتح الخدمة من لوحة Render واختر **Resume**، أو أنشئها من رابط النشر أعلاه. إذا كان الإيقاف مفروضاً من Render على الخطة المجانية، يلزم نقل الخدمة إلى خطة مدفوعة وفق سياسة Render.
+
 GitHub Pages يقدم الواجهة الثابتة وService Worker فقط. لا يستطيع وحده تشغيل قاعدة البيانات أو تسجيل المزود أو OTP أو الدفع أو إرسال Push؛ هذه الوظائف تحتاج رابط خادم HTTPS متاحاً للواجهة.
 
 رابط الواجهة المتوقع:

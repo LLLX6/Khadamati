@@ -1,9 +1,12 @@
 services:
   - type: web
-    name: khadamati-app
+    name: khadamati
+    repo: https://github.com/LLLX6/Khadamati
     runtime: python
     plan: free
     branch: main
+    autoDeployTrigger: commit
+    renderSubdomainPolicy: enabled
     buildCommand: pip install -r requirements.txt
     startCommand: python server.py
     healthCheckPath: /api/bootstrap
@@ -14,6 +17,8 @@ services:
         value: production
       - key: KHADAMATI_PUBLIC_URL
         value: https://lllx6.github.io/Khadamati/
+      - key: KHADAMATI_ALLOWED_ORIGINS
+        value: https://lllx6.github.io
       - key: KHADAMATI_ADMIN_CODE
         sync: false
       - key: KHADAMATI_OTP_PEPPER
