@@ -29,7 +29,8 @@ node tests/performance-ui.js
 The UI flow covers Arabic RTL and English LTR, 320px mobile fit, offer comparison,
 consent-gated contact, text/image/voice chat, calendar export, arrival tracking,
 provider video, before/after media, subscriptions, finance, and visitor isolation.
-The API flow verifies registration, exact matching, waitlists, subscriptions,
-contact consent, reviews, and cross-account collaboration.
+The API flow verifies registration, exact matching, active request visibility,
+the public request marketplace, provider recommendations and abuse controls,
+subscriptions, contact consent, reviews, and cross-account collaboration.
 
 Set `KHADAMATI_TEST_URL` to test another local or deployed URL.

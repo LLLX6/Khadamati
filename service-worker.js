@@ -1,4 +1,4 @@
-const CACHE_NAME = 'khadamati-app-shell-v45-production';
+const CACHE_NAME = 'khadamati-app-shell-v46-production';
 const SHELL = [
   './',
   './index.html',
@@ -21,6 +21,7 @@ const SHELL = [
   './assets/onboarding/v45/company-dispatch.webp',
   './assets/onboarding/v45/company-analytics.webp',
   './assets/onboarding/v45/company-team.webp',
+  './assets/onboarding/v46/request-provider-recommendation.webp',
   './assets/ads/v45/home-services.webp',
   './assets/ads/v45/nearby-services.webp',
   './assets/ads/v45/business-services.webp',

@@ -146,10 +146,15 @@ def main():
     expect(status, subscription, {200}, "Professional subscription activation failed")
 
     status, provider_login = request(
-        "/api/provider/login", {"phone": provider_phone, "pin": provider_pin}
+        "/api/provider/login", {"phone": provider_phone[-8:], "pin": provider_pin}
     )
-    expect(status, provider_login, {200}, "Provider login failed")
+    expect(status, provider_login, {200}, "Provider login with a local 8-digit phone failed")
     provider_token = provider_login["token"]
+
+    status, formatted_provider_login = request(
+        "/api/provider/login", {"phone": "+968 9555 0991", "pin": provider_pin}
+    )
+    expect(status, formatted_provider_login, {200}, "Provider login with a formatted phone failed")
 
     status, unauthenticated_lead = request(
         "/api/leads",
@@ -206,6 +211,143 @@ def main():
     expect(status, created, {201}, "Request creation failed")
     request_id = created["request"]["id"]
     assert created.get("matchedProviders", 0) >= 1, "Exact matching returned no providers"
+
+    status, owner_state = request("/api/bootstrap", token=user_token)
+    expect(status, owner_state, {200}, "Request owner bootstrap failed")
+    owner_request = next(
+        (item for item in owner_state["customerRequests"] if item["id"] == request_id),
+        None,
+    )
+    assert owner_request, "Created request is missing from the owner's active requests"
+
+    status, visitor_state = request("/api/bootstrap")
+    expect(status, visitor_state, {200}, "Visitor marketplace bootstrap failed")
+    visitor_request = next(
+        (item for item in visitor_state.get("marketplaceRequests", []) if item["id"] == request_id),
+        None,
+    )
+    assert visitor_request, "Created request is missing from the request marketplace"
+    assert not any(
+        key in visitor_request for key in ("phone", "userId", "location", "latitude", "longitude")
+    ), "Marketplace request exposed private requester data"
+
+    status, recommender = request(
+        "/api/users/login",
+        {
+            "phone": "96895550993",
+            "name": "مستخدم مرشح للمزود",
+            "pin": "3579",
+            "gov": "مسقط",
+            "wilayah": "السيب",
+            "location": {"lat": 23.623, "lng": 58.223},
+        },
+    )
+    expect(status, recommender, {200}, "Recommender login failed")
+    recommender_token = recommender["token"]
+
+    status, recommender_state = request("/api/bootstrap", token=recommender_token)
+    expect(status, recommender_state, {200}, "Recommender bootstrap failed")
+    marketplace_request = next(
+        (item for item in recommender_state.get("marketplaceRequests", []) if item["id"] == request_id),
+        None,
+    )
+    assert marketplace_request, "Another user cannot see the published request"
+
+    status, owner_candidates = request(
+        "/api/request-suggestions", {"action": "candidates", "requestId": request_id}, user_token
+    )
+    assert status == 403 and owner_candidates.get("error") == "request_owner_cannot_suggest", (
+        "The request owner was allowed to recommend a provider to themselves"
+    )
+
+    status, provider_candidates = request(
+        "/api/request-suggestions", {"action": "candidates", "requestId": request_id}, provider_token
+    )
+    assert status in {401, 403}, "A provider account was allowed to recommend another provider"
+
+    status, candidates = request(
+        "/api/request-suggestions",
+        {"action": "candidates", "requestId": request_id},
+        recommender_token,
+    )
+    expect(status, candidates, {200}, "Provider recommendation candidates failed")
+    candidate_rows = candidates.get("providers", [])
+    assert any(item["id"] == provider_id for item in candidate_rows), "Eligible provider was not suggested"
+    for candidate in candidate_rows:
+        service_keys = {
+            f"{item.get('catId', '')}|{item.get('serviceId', '')}"
+            for item in candidate.get("services", [])
+            if isinstance(item, dict)
+        }
+        assert candidate.get("service") == "homecare|electrician" or "homecare|electrician" in service_keys, (
+            f"Unrelated provider leaked into recommendation candidates: {candidate.get('id')}"
+        )
+        assert candidate.get("active") and candidate.get("verified") and candidate.get("status") == "available", (
+            f"Inactive or incomplete provider was suggested: {candidate.get('id')}"
+        )
+
+    status, suggested = request(
+        "/api/request-suggestions",
+        {
+            "action": "create",
+            "requestId": request_id,
+            "providerId": provider_id,
+            "presetKey": "worked_before",
+            "comment": "ملتزم بالمواعيد ويشرح العمل بوضوح",
+        },
+        recommender_token,
+    )
+    expect(status, suggested, {201}, "Provider recommendation creation failed")
+    suggestion_id = suggested["suggestion"]["id"]
+
+    status, duplicate_suggestion = request(
+        "/api/request-suggestions",
+        {
+            "action": "create",
+            "requestId": request_id,
+            "providerId": provider_id,
+            "presetKey": "excellent_work",
+        },
+        recommender_token,
+    )
+    assert status == 409 and duplicate_suggestion.get("error") == "suggestion_already_exists", (
+        "Duplicate provider recommendation was accepted"
+    )
+
+    status, owner_with_suggestion = request("/api/bootstrap", token=user_token)
+    expect(status, owner_with_suggestion, {200}, "Owner recommendation bootstrap failed")
+    owner_request = next(item for item in owner_with_suggestion["customerRequests"] if item["id"] == request_id)
+    assert any(item["id"] == suggestion_id for item in owner_request.get("providerSuggestions", [])), (
+        "Recommendation did not reach the request owner"
+    )
+    owner_notification = next(
+        (item for item in owner_with_suggestion["notifications"] if item.get("relatedId") == suggestion_id),
+        None,
+    )
+    assert owner_notification and suggestion_id in owner_notification.get("actionRoute", ""), (
+        "Recommendation notification does not open the exact recommendation"
+    )
+
+    status, provider_before_selection = request("/api/bootstrap", token=provider_token)
+    expect(status, provider_before_selection, {200}, "Provider pre-selection bootstrap failed")
+    assert not any(
+        item.get("relatedId") == suggestion_id for item in provider_before_selection.get("notifications", [])
+    ), "Provider was notified before the request owner selected the recommendation"
+
+    status, selected_suggestion = request(
+        "/api/request-suggestions",
+        {"action": "select", "suggestionId": suggestion_id},
+        user_token,
+    )
+    expect(status, selected_suggestion, {200}, "Selecting a provider recommendation failed")
+    assert selected_suggestion["suggestion"]["status"] == "selected"
+
+    status, provider_after_selection = request("/api/bootstrap", token=provider_token)
+    expect(status, provider_after_selection, {200}, "Provider post-selection bootstrap failed")
+    assert any(
+        item.get("relatedId") == request_id and "اختارك" in item.get("title", "")
+        for item in provider_after_selection.get("notifications", [])
+    ), "Provider was not notified after the request owner selected the recommendation"
 
     status, provider_state = request("/api/bootstrap", token=provider_token)
     expect(status, provider_state, {200}, "Provider bootstrap failed")
@@ -302,6 +444,10 @@ def main():
                 "public_privacy": True,
                 "provider_registration": True,
                 "exact_matching": True,
+                "request_marketplace": True,
+                "active_request_visibility": True,
+                "provider_recommendations": True,
+                "recommendation_abuse_controls": True,
                 "subscription_entitlements": True,
                 "payment_integrity": True,
                 "contact_consent": True,

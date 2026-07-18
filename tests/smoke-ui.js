@@ -185,6 +185,14 @@ async function clickFirstAction(page, action) {
 
   await clickFirstAction(page, 'openRequestBoard');
   assert(await page.locator('.request-board-sheet').count(), 'Request board did not open.');
+  assert(await page.locator('.request-board-guide').count(), 'Request board guidance is missing.');
+  assert(await page.locator('.request-board-guide').evaluate(element => element.getBoundingClientRect().right <= window.innerWidth + 1), 'Request board guidance overflows the mobile viewport.');
+  await page.locator('.request-board-guide summary').click();
+  const recommendationGuide = page.locator('.request-board-guide img');
+  assert(/assets\/onboarding\/v46\/request-provider-recommendation\.webp/.test(await recommendationGuide.getAttribute('src')), 'Provider recommendation guidance artwork is missing.');
+  await recommendationGuide.evaluate(image => image.complete ? true : new Promise(resolve => image.addEventListener('load', () => resolve(true), { once: true })));
+  assert(await recommendationGuide.evaluate(image => image.naturalWidth >= 1000 && image.naturalHeight >= 650), 'Provider recommendation guidance is not high resolution.');
+  assert(await recommendationGuide.evaluate(image => getComputedStyle(image).objectFit === 'contain'), 'Provider recommendation artwork is cropped on mobile.');
   await page.locator('[data-action="closeModal"]').click();
   await page.locator('[data-action="quickRequestForm"]').first().click();
   await page.waitForSelector('.request-wizard');
@@ -216,6 +224,9 @@ async function clickFirstAction(page, action) {
   await clickUserNav(page, 'myAccount');
   assert(await page.locator('.requests-disclosure').count(), 'Grouped request sections are missing from My Account.');
   assert(await page.locator('.requests-disclosure[open]').count() === 0, 'Request groups should start collapsed.');
+  await page.locator('.requests-disclosure summary').first().click();
+  assert(await page.locator('.requests-disclosure[open] .request-card').count(), 'Created request is missing from the active request section.');
+  await page.locator('.requests-disclosure summary').first().click();
   assert(await page.locator('.loyalty-card-v40 [role="progressbar"]').count(), 'Clear loyalty progress bar is missing.');
   await page.locator('[data-action="openAppearance"]').click();
   await page.locator('[data-action="setTheme"][data-value="dark"]').click();

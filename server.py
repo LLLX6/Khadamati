@@ -9,6 +9,7 @@ import hmac
 import html
 import io
 import json
+import math
 import mimetypes
 import os
 import re
@@ -32,6 +33,7 @@ from khadamati_domain import (
     OTPService,
     PaymentAdapter,
     PlanCatalog,
+    RankingService,
     RequestMarketplace,
     SubscriptionService,
     run_subscription_migration_v1,
@@ -172,6 +174,11 @@ def normalize_phone(raw):
     if len(phone) == 8:
         phone = "968" + phone
     return phone
+
+
+def phone_matches(stored, normalized):
+    """Compare current and legacy phone formats without forcing a data reset."""
+    return bool(normalized) and normalize_phone(stored) == normalized
 
 
 def iso_date(days=0):
@@ -523,6 +530,15 @@ def init_db():
               offers_open INTEGER NOT NULL DEFAULT 1, created_at TEXT DEFAULT CURRENT_TIMESTAMP,
               updated_at TEXT DEFAULT CURRENT_TIMESTAMP
             );
+            CREATE TABLE IF NOT EXISTS request_provider_suggestions(
+              id TEXT PRIMARY KEY, request_id TEXT NOT NULL, provider_id TEXT NOT NULL,
+              suggested_by_user_id TEXT NOT NULL, preset_key TEXT NOT NULL DEFAULT '',
+              comment TEXT DEFAULT '', status TEXT NOT NULL DEFAULT 'active',
+              report_reason TEXT DEFAULT '', selected_at TEXT DEFAULT '', reported_at TEXT DEFAULT '',
+              deleted_at TEXT DEFAULT '', created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+              updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+              UNIQUE(request_id,provider_id)
+            );
             CREATE TABLE IF NOT EXISTS app_notifications(
               id TEXT PRIMARY KEY, target_kind TEXT NOT NULL, target_id TEXT DEFAULT '', type TEXT DEFAULT 'general',
               title TEXT NOT NULL, message TEXT DEFAULT '', related_id TEXT DEFAULT '',
@@ -640,6 +656,8 @@ def init_db():
               processed INTEGER NOT NULL DEFAULT 0, created_at TEXT DEFAULT CURRENT_TIMESTAMP
             );
             CREATE INDEX IF NOT EXISTS idx_requests_status ON customer_requests(status, created_at);
+            CREATE INDEX IF NOT EXISTS idx_request_suggestions_request ON request_provider_suggestions(request_id,status,created_at);
+            CREATE INDEX IF NOT EXISTS idx_request_suggestions_user ON request_provider_suggestions(suggested_by_user_id,created_at);
             CREATE INDEX IF NOT EXISTS idx_notifications_target ON app_notifications(target_kind, target_id, is_read);
             CREATE INDEX IF NOT EXISTS idx_sessions_hash ON auth_sessions(token_hash, expires_at);
             CREATE INDEX IF NOT EXISTS idx_dispatch_release ON request_dispatches(status,release_at,wave);
@@ -1160,6 +1178,130 @@ def row_customer_request(r):
     return d
 
 
+SUGGESTION_PRESET_KEYS = {
+    "excellent_work",
+    "fast_execution",
+    "fair_price",
+    "worked_before",
+    "recommended_contact",
+}
+ACTIVE_REQUEST_STATES = {"matching", "viewed", "unavailable", "paused", "open"}
+
+
+def row_request_suggestion(r):
+    d = dict(r)
+    d["requestId"] = d.pop("request_id", "")
+    d["providerId"] = d.pop("provider_id", "")
+    d["suggestedByUserId"] = d.pop("suggested_by_user_id", "")
+    d["presetKey"] = d.pop("preset_key", "")
+    d["reportReason"] = d.pop("report_reason", "")
+    d["selectedAt"] = d.pop("selected_at", "")
+    d["reportedAt"] = d.pop("reported_at", "")
+    d["deletedAt"] = d.pop("deleted_at", "")
+    d["createdAt"] = d.pop("created_at", "")
+    d["updatedAt"] = d.pop("updated_at", "")
+    if "provider_name" in d:
+        d["providerName"] = d.pop("provider_name", "")
+    return d
+
+
+def request_suggestions(con, request_id, *, include_hidden=False):
+    where = "s.request_id=?" if include_hidden else "s.request_id=? AND s.status IN ('active','selected')"
+    return [
+        row_request_suggestion(row)
+        for row in con.execute(
+            f"""SELECT s.*,p.name provider_name FROM request_provider_suggestions s
+            LEFT JOIN providers p ON p.id=s.provider_id WHERE {where}
+            ORDER BY s.created_at DESC""",
+            (request_id,),
+        )
+    ]
+
+
+def request_suggestion_by_id(con, suggestion_id):
+    row = con.execute(
+        """SELECT s.*,p.name provider_name FROM request_provider_suggestions s
+        LEFT JOIN providers p ON p.id=s.provider_id WHERE s.id=?""",
+        (suggestion_id,),
+    ).fetchone()
+    return row_request_suggestion(row) if row else None
+
+
+def marketplace_request(item):
+    """Return only the fields needed by the public request board."""
+    allowed = {
+        "id", "serviceValue", "serviceName", "gov", "wilayah", "urgency",
+        "scheduleType", "requestedAt", "note", "images", "status", "offers",
+        "acceptedProviderId", "offersOpen", "createdAt", "updatedAt",
+    }
+    public_item = {key: value for key, value in item.items() if key in allowed}
+    public_item["requesterLabel"] = "مستخدم خدماتي"
+    public_item["offerCount"] = len(public_item.get("offers") or [])
+    public_item["offers"] = []
+    public_item["acceptedProviderId"] = ""
+    return public_item
+
+
+def distance_km(request_row, provider_row):
+    values = (
+        request_row.get("latitude"), request_row.get("longitude"),
+        provider_row.get("latitude"), provider_row.get("longitude"),
+    )
+    if any(value is None for value in values):
+        return None
+    lat1, lng1, lat2, lng2 = map(math.radians, map(float, values))
+    dlat, dlng = lat2 - lat1, lng2 - lng1
+    value = math.sin(dlat / 2) ** 2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlng / 2) ** 2
+    return round(6371 * 2 * math.atan2(math.sqrt(value), math.sqrt(max(0, 1 - value))), 2)
+
+
+def provider_profile_complete(provider):
+    services = jload(provider.get("services"), []) if isinstance(provider.get("services"), str) else provider.get("services", [])
+    documents = jload(provider.get("documents"), []) if isinstance(provider.get("documents"), str) else provider.get("documents", [])
+    return bool(
+        provider.get("verified")
+        and provider.get("commercial_no")
+        and documents
+        and services
+        and len(str(provider.get("bio") or "").split()) >= 3
+        and provider.get("hours")
+    )
+
+
+def ranked_suggestion_candidates(con, request_row, *, limit=10):
+    request = dict(request_row)
+    entitlements = EntitlementService(con)
+    candidates = []
+    for row in con.execute(
+        """SELECT * FROM providers WHERE active=1 AND verified=1 AND status='available'
+        AND COALESCE(listing_enabled,1)=1 AND COALESCE(request_enabled,1)=1"""
+    ):
+        provider = dict(row)
+        if not provider_profile_complete(provider):
+            continue
+        try:
+            allowed, _, grants = entitlements.can_receive(provider["id"])
+        except DomainError:
+            allowed, grants = False, {}
+        if not allowed:
+            continue
+        score, breakdown = RankingService.score(request, provider, grants.get("planId", provider.get("package_id", "")), datetime.now(UTC))
+        if score <= 0 or not RankingService.exact_service_match(request, provider):
+            continue
+        distance = distance_km(request, provider)
+        area_priority = 0 if request.get("wilayah") and request.get("wilayah") == provider.get("wilayah") else 1
+        candidates.append((area_priority, distance if distance is not None else 9999, -score, provider, breakdown))
+    candidates.sort(key=lambda item: (item[0], item[1], item[2], item[3]["id"]))
+    result = []
+    for _, distance, negative_score, provider, breakdown in candidates[: max(1, min(int(limit), 20))]:
+        public_provider = row_provider(provider, private=False)
+        public_provider["suggestionScore"] = round(-negative_score, 1)
+        public_provider["distanceKm"] = None if distance == 9999 else distance
+        public_provider["matchBreakdown"] = breakdown
+        result.append(public_provider)
+    return result
+
+
 def row_notification(r):
     d = dict(r)
     d["targetKind"] = d.pop("target_kind")
@@ -1527,8 +1669,15 @@ def get_bootstrap(session=None):
             row_customer_request(r)
             for r in con.execute("SELECT * FROM customer_requests ORDER BY created_at DESC LIMIT 300")
         ]
+        marketplace_requests = [
+            marketplace_request(item)
+            for item in all_customer_requests
+            if item.get("status") in ACTIVE_REQUEST_STATES and item.get("offersOpen", True)
+        ]
         if is_admin:
             customer_requests = all_customer_requests
+            for item in customer_requests:
+                item["providerSuggestions"] = request_suggestions(con, item["id"], include_hidden=True)
             notifications = [
                 row_notification(r)
                 for r in con.execute("SELECT * FROM app_notifications ORDER BY created_at DESC LIMIT 300")
@@ -1581,6 +1730,18 @@ def get_bootstrap(session=None):
         elif is_user:
             uid = session["userId"]
             customer_requests = [item for item in all_customer_requests if item["userId"] == uid]
+            for item in customer_requests:
+                item["providerSuggestions"] = request_suggestions(con, item["id"])
+            marketplace_requests = [item for item in marketplace_requests if item["id"] not in {request["id"] for request in customer_requests}]
+            for item in marketplace_requests:
+                item["mySuggestedProviderIds"] = [
+                    row["provider_id"]
+                    for row in con.execute(
+                        """SELECT provider_id FROM request_provider_suggestions
+                        WHERE request_id=? AND suggested_by_user_id=? AND status IN ('active','selected')""",
+                        (item["id"], uid),
+                    )
+                ]
             consent_service = ContactConsentService(con)
             for item in customer_requests:
                 if item.get("acceptedProviderId"):
@@ -1747,6 +1908,7 @@ def get_bootstrap(session=None):
             "leads": leads,
             "auditLogs": audits,
             "customerRequests": customer_requests,
+            "marketplaceRequests": marketplace_requests,
             "notifications": notifications,
             "users": users,
             "advertisements": advertisements,
@@ -1913,6 +2075,7 @@ def save_many_documents(owner_id, docs, prefix="doc", limit=3):
 
 def upsert_provider(con, data):
     p = data | {"id": data.get("id") or slug("p")}
+    p["phone"] = normalize_phone(data.get("phone", ""))
     existing = con.execute("SELECT * FROM providers WHERE id=?", (p["id"],)).fetchone()
     existing_provider = row_provider(existing, private=True) if existing else {}
     image_path = data.get("imagePath") or ""
@@ -2389,17 +2552,36 @@ class Handler(SimpleHTTPRequestHandler):
             return self.send_json({"token": token, "user": user})
         if path == "/api/provider/login":
             phone = normalize_phone(data.get("phone", ""))
+            if len(phone) < 11:
+                return self.send_json({"error": "valid_phone_required"}, 400)
             with db() as con:
                 row = con.execute(
                     "SELECT * FROM providers WHERE phone=? OR phone=?",
                     (phone, phone.replace("968", "", 1)),
                 ).fetchone()
+                if not row:
+                    row = next(
+                        (candidate for candidate in con.execute("SELECT * FROM providers") if phone_matches(candidate["phone"], phone)),
+                        None,
+                    )
                 team_row = con.execute(
                     """SELECT tm.*,p.name provider_name FROM provider_team_members tm
                     JOIN providers p ON p.id=tm.provider_id
                     WHERE tm.active=1 AND (tm.phone=? OR tm.phone=?) LIMIT 1""",
                     (phone, phone.replace("968", "", 1)),
                 ).fetchone()
+                if not team_row:
+                    team_row = next(
+                        (
+                            candidate
+                            for candidate in con.execute(
+                                """SELECT tm.*,p.name provider_name FROM provider_team_members tm
+                                JOIN providers p ON p.id=tm.provider_id WHERE tm.active=1"""
+                            )
+                            if phone_matches(candidate["phone"], phone)
+                        ),
+                        None,
+                    )
                 otp_ok = False
                 if data.get("challengeId") and data.get("otpCode"):
                     try:
@@ -2532,7 +2714,7 @@ class Handler(SimpleHTTPRequestHandler):
             item = {
                 "id": req_id,
                 "name": data.get("name", "").strip(),
-                "phone": data.get("phone", "").strip(),
+                "phone": normalize_phone(data.get("phone", "")),
                 "providerType": data.get("providerType", "individual") if data.get("providerType") in ("individual", "company") else "individual",
                 "companyName": data.get("companyName", "").strip(),
                 "commercialNo": data.get("commercialNo", "").strip(),
@@ -2623,6 +2805,8 @@ class Handler(SimpleHTTPRequestHandler):
             return self.user_post(path, data)
         if path == "/api/requests/action":
             return self.request_action(data)
+        if path == "/api/request-suggestions":
+            return self.request_suggestion(data)
         if path == "/api/request/collaboration":
             return self.request_collaboration(data)
         if path == "/api/notifications/action":
@@ -2970,6 +3154,182 @@ class Handler(SimpleHTTPRequestHandler):
                     200 if data.get("id") else 201,
                 )
         return self.send_json({"error": "not_found"}, 404)
+
+    def request_suggestion(self, data):
+        session = self.require_user()
+        if not session:
+            return
+        user_id = session["userId"]
+        action = str(data.get("action") or "candidates")
+        suggestion_id = str(data.get("suggestionId") or "")
+        request_id = str(data.get("requestId") or "")
+        with db() as con:
+            suggestion_row = None
+            if suggestion_id:
+                suggestion_row = con.execute(
+                    """SELECT s.*,r.user_id request_owner_id FROM request_provider_suggestions s
+                    JOIN customer_requests r ON r.id=s.request_id WHERE s.id=?""",
+                    (suggestion_id,),
+                ).fetchone()
+                if not suggestion_row:
+                    return self.send_json({"error": "suggestion_not_found"}, 404)
+                request_id = suggestion_row["request_id"]
+            request_row = con.execute(
+                "SELECT * FROM customer_requests WHERE id=?", (request_id,)
+            ).fetchone()
+            if not request_row:
+                return self.send_json({"error": "request_not_found"}, 404)
+            if request_row["status"] not in ACTIVE_REQUEST_STATES or not bool(request_row["offers_open"]):
+                return self.send_json({"error": "request_not_open"}, 409)
+
+            if action == "candidates":
+                if request_row["user_id"] == user_id:
+                    return self.send_json({"error": "request_owner_cannot_suggest"}, 403)
+                existing = {
+                    row["provider_id"]
+                    for row in con.execute(
+                        """SELECT provider_id FROM request_provider_suggestions
+                        WHERE request_id=? AND status IN ('active','selected')""",
+                        (request_id,),
+                    )
+                }
+                providers = [
+                    provider for provider in ranked_suggestion_candidates(con, request_row)
+                    if provider["id"] not in existing
+                ]
+                return self.send_json({"ok": True, "providers": providers})
+
+            if action == "create":
+                if request_row["user_id"] == user_id:
+                    return self.send_json({"error": "request_owner_cannot_suggest"}, 403)
+                provider_id = str(data.get("providerId") or "")
+                preset_key = str(data.get("presetKey") or "")
+                comment = re.sub(r"\s+", " ", str(data.get("comment") or "")).strip()[:160]
+                if preset_key not in SUGGESTION_PRESET_KEYS:
+                    return self.send_json({"error": "suggestion_comment_required"}, 400)
+                candidates = {provider["id"]: provider for provider in ranked_suggestion_candidates(con, request_row, limit=20)}
+                provider = candidates.get(provider_id)
+                if not provider:
+                    return self.send_json({"error": "provider_not_eligible_for_request"}, 409)
+                duplicate = con.execute(
+                    "SELECT id FROM request_provider_suggestions WHERE request_id=? AND provider_id=?",
+                    (request_id, provider_id),
+                ).fetchone()
+                if duplicate:
+                    return self.send_json({"error": "suggestion_already_exists"}, 409)
+                per_request = con.execute(
+                    """SELECT COUNT(*) n FROM request_provider_suggestions
+                    WHERE request_id=? AND suggested_by_user_id=? AND status IN ('active','selected')""",
+                    (request_id, user_id),
+                ).fetchone()["n"]
+                daily = con.execute(
+                    """SELECT COUNT(*) n FROM request_provider_suggestions
+                    WHERE suggested_by_user_id=? AND created_at>=datetime('now','-1 day')""",
+                    (user_id,),
+                ).fetchone()["n"]
+                if int(per_request) >= 3 or int(daily) >= 10:
+                    return self.send_json({"error": "suggestion_rate_limited"}, 429)
+                suggestion_id = slug("suggestion")
+                con.execute(
+                    """INSERT INTO request_provider_suggestions(
+                    id,request_id,provider_id,suggested_by_user_id,preset_key,comment)
+                    VALUES(?,?,?,?,?,?)""",
+                    (suggestion_id, request_id, provider_id, user_id, preset_key, comment),
+                )
+                create_notification(
+                    con, "user", request_row["user_id"], "ترشيح مزود جديد",
+                    f"تم ترشيح {provider['name']} لطلب {request_row['service_name'] or request_row['service_value']}",
+                    type_="provider_suggestion", related_id=suggestion_id, priority="normal",
+                    action_text="عرض الترشيح",
+                    action_route=f"user:suggestion:{suggestion_id}:provider:{provider_id}:request:{request_id}",
+                )
+                item = request_suggestion_by_id(con, suggestion_id)
+                return self.send_json({"ok": True, "suggestion": item}, 201)
+
+            if action == "delete":
+                if suggestion_row["status"] not in ("active", "selected"):
+                    return self.send_json({"error": "suggestion_not_active"}, 409)
+                if user_id not in {suggestion_row["suggested_by_user_id"], suggestion_row["request_owner_id"]}:
+                    return self.send_json({"error": "suggestion_action_denied"}, 403)
+                con.execute(
+                    """UPDATE request_provider_suggestions SET status='deleted',deleted_at=CURRENT_TIMESTAMP,
+                    updated_at=CURRENT_TIMESTAMP WHERE id=?""",
+                    (suggestion_id,),
+                )
+                con.execute(
+                    "DELETE FROM app_notifications WHERE type='provider_suggestion' AND related_id=?",
+                    (suggestion_id,),
+                )
+                return self.send_json({"ok": True})
+
+            if action == "report":
+                if suggestion_row["status"] not in ("active", "selected"):
+                    return self.send_json({"error": "suggestion_not_active"}, 409)
+                if user_id not in {suggestion_row["suggested_by_user_id"], suggestion_row["request_owner_id"]}:
+                    return self.send_json({"error": "suggestion_action_denied"}, 403)
+                reason = re.sub(r"\s+", " ", str(data.get("reason") or "")).strip()[:240]
+                if not reason:
+                    return self.send_json({"error": "report_reason_required"}, 400)
+                con.execute(
+                    """UPDATE request_provider_suggestions SET status='reported',report_reason=?,
+                    reported_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP WHERE id=?""",
+                    (reason, suggestion_id),
+                )
+                con.execute(
+                    "DELETE FROM app_notifications WHERE type='provider_suggestion' AND related_id=?",
+                    (suggestion_id,),
+                )
+                create_notification(
+                    con, "admin", "", "بلاغ عن ترشيح مزود", reason,
+                    type_="provider_suggestion", related_id=suggestion_id, priority="high",
+                    action_text="فتح الطلب", action_route=f"admin:request:{request_id}",
+                )
+                return self.send_json({"ok": True})
+
+            if action == "select":
+                if suggestion_row["status"] != "active":
+                    return self.send_json({"error": "suggestion_not_active"}, 409)
+                if user_id != suggestion_row["request_owner_id"]:
+                    return self.send_json({"error": "suggestion_action_denied"}, 403)
+                provider_id = suggestion_row["provider_id"]
+                candidates = {provider["id"]: provider for provider in ranked_suggestion_candidates(con, request_row, limit=20)}
+                provider = candidates.get(provider_id)
+                if not provider:
+                    return self.send_json({"error": "provider_no_longer_available"}, 409)
+                matching = jload(request_row["matching_provider_ids"], [])
+                matching = list(dict.fromkeys([*matching, provider_id]))
+                con.execute(
+                    """UPDATE request_provider_suggestions SET status='selected',selected_at=CURRENT_TIMESTAMP,
+                    updated_at=CURRENT_TIMESTAMP WHERE id=?""",
+                    (suggestion_id,),
+                )
+                con.execute(
+                    """UPDATE customer_requests SET matching_provider_ids=?,status='matching',waitlisted=0,
+                    updated_at=CURRENT_TIMESTAMP WHERE id=?""",
+                    (jdump(matching), request_id),
+                )
+                con.execute(
+                    """INSERT INTO request_dispatches(
+                    id,request_id,provider_id,rank,score,score_breakdown,wave,release_at,status,notified_at)
+                    VALUES(?,?,?,?,?,'{}',1,CURRENT_TIMESTAMP,'notified',CURRENT_TIMESTAMP)
+                    ON CONFLICT(request_id,provider_id) DO UPDATE SET status='notified',
+                    release_at=CURRENT_TIMESTAMP,notified_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP""",
+                    (slug("dispatch"), request_id, provider_id, 1, float(provider.get("suggestionScore") or 0)),
+                )
+                create_notification(
+                    con, "provider", provider_id, "طلب خدمة اختارك صاحبه",
+                    f"أرسل لك صاحب الطلب خدمة {request_row['service_name'] or request_row['service_value']}",
+                    type_="request", related_id=request_id, priority="high",
+                    action_text="فتح الطلب", action_route=f"provider:request:{request_id}",
+                )
+                updated = con.execute("SELECT * FROM customer_requests WHERE id=?", (request_id,)).fetchone()
+                return self.send_json({
+                    "ok": True,
+                    "suggestion": request_suggestion_by_id(con, suggestion_id),
+                    "request": row_customer_request(updated),
+                })
+
+        return self.send_json({"error": "invalid_suggestion_action"}, 400)
 
     def request_action(self, data):
         session = self.require_provider()

@@ -11,7 +11,7 @@ import secrets
 from typing import Any, Callable, Iterable
 
 
-SUPPORT_EMAIL = "support@khadamatiapp.com"
+SUPPORT_EMAIL = os.environ.get("KHADAMATI_SUPPORT_EMAIL", "om.khadamati@gmail.com").strip()
 POLICY_VERSION = "2026-07-18.1"
 MIGRATION_KEY = "KHADAMATI_SUBSCRIPTION_MIGRATION_V1"
 RANKING_VERSION = "khadamati-ranking-v1"
