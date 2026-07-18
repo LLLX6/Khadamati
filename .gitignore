@@ -8,3 +8,10 @@ server.log
 server.err
 public/uploads/*
 !public/uploads/.gitkeep
+backups/
+__*.sqlite3
+__*-uploads/
+tests/__*.sqlite3
+tests/__*-uploads/
+tests/__screens-*/
+tests/__debug*.png

@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: khadamati
+    name: khadamati-app
     runtime: python
     plan: free
     branch: main
@@ -10,5 +10,13 @@ services:
     envVars:
       - key: HOST
         value: 0.0.0.0
+      - key: KHADAMATI_ENV
+        value: production
+      - key: KHADAMATI_PUBLIC_URL
+        value: https://lllx6.github.io/khadamati-app/
       - key: KHADAMATI_ADMIN_CODE
-        value: "0000"
+        sync: false
+      - key: KHADAMATI_OTP_PEPPER
+        sync: false
+      - key: KHADAMATI_PAYMENT_WEBHOOK_SECRET
+        sync: false

@@ -1,13 +1,42 @@
 const { chromium } = require('playwright');
 const fs = require('fs');
+const http = require('http');
 const path = require('path');
 
-const BASE_URL = process.env.KHADAMATI_TEST_URL || 'http://127.0.0.1:8080/';
+const BASE_URL = process.env.KHADAMATI_TEST_URL || '';
 const CHROME_PATH = process.env.CHROME_PATH || 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe';
 const SCREENSHOT_DIR = process.env.KHADAMATI_SCREENSHOT_DIR || '';
 const VIEWPORT_WIDTH = Number(process.env.KHADAMATI_VIEWPORT_WIDTH || 390);
 const VIEWPORT_HEIGHT = Number(process.env.KHADAMATI_VIEWPORT_HEIGHT || 844);
 const IS_MOBILE = VIEWPORT_WIDTH <= 760;
+let LOCAL_SERVER = null;
+
+async function startStaticServer() {
+  const root = path.resolve(__dirname, '..');
+  const mime = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.json': 'application/json; charset=utf-8', '.svg': 'image/svg+xml', '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.webp': 'image/webp', '.ico': 'image/x-icon' };
+  LOCAL_SERVER = http.createServer(async (request, response) => {
+    try {
+      const pathname = decodeURIComponent(new URL(request.url, 'http://127.0.0.1').pathname);
+      const relative = pathname === '/' ? 'index.html' : pathname.replace(/^\/+/, '');
+      const target = path.resolve(root, relative);
+      if (target !== root && !target.startsWith(`${root}${path.sep}`)) {
+        response.writeHead(403).end();
+        return;
+      }
+      const data = await fs.promises.readFile(target);
+      response.writeHead(200, { 'content-type': mime[path.extname(target).toLowerCase()] || 'application/octet-stream', 'cache-control': 'no-store' });
+      response.end(data);
+    } catch (_) {
+      response.writeHead(404, { 'content-type': 'text/plain; charset=utf-8' });
+      response.end('Not found');
+    }
+  });
+  await new Promise((resolve, reject) => {
+    LOCAL_SERVER.once('error', reject);
+    LOCAL_SERVER.listen(0, '127.0.0.1', resolve);
+  });
+  return `http://127.0.0.1:${LOCAL_SERVER.address().port}/`;
+}
 
 function assert(value, message) {
   if (!value) throw new Error(message);
@@ -32,6 +61,7 @@ async function clickFirstAction(page, action) {
 }
 
 (async () => {
+  const testUrl = BASE_URL || await startStaticServer();
   const browser = await chromium.launch({
     headless: true,
     executablePath: CHROME_PATH,
@@ -42,6 +72,7 @@ async function clickFirstAction(page, action) {
     deviceScaleFactor: 2,
     isMobile: IS_MOBILE,
     hasTouch: IS_MOBILE,
+    serviceWorkers: 'block',
     locale: 'ar-OM',
     permissions: ['geolocation', 'microphone', 'notifications'],
     geolocation: { latitude: 23.61, longitude: 58.24 },
@@ -55,9 +86,23 @@ async function clickFirstAction(page, action) {
     }
   });
 
-  // Keep the smoke test local and deterministic without writing test accounts to the server.
-  await page.route('**/api/**', route => route.abort());
-  await page.goto(BASE_URL, { waitUntil: 'domcontentloaded' });
+  // Keep the visual smoke test deterministic while still exercising authenticated UI paths.
+  await page.route('**/api/**', async route => {
+    const url = new URL(route.request().url());
+    const json = body => route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(body) });
+    if (url.pathname === '/api/users/login') {
+      return json({ token: 'ui-user-token', user: { id: 'ui-user', phone: '96895550001', name: 'مستخدم الاختبار الآلي', gov: 'مسقط', wilayah: 'السيب', pinConfigured: true } });
+    }
+    if (url.pathname === '/api/provider/login') {
+      return json({ token: 'ui-provider-token', provider: { id: 'p1', name: 'سالم البلوشي', phone: '96891234567', gov: 'مسقط', wilayah: 'السيب', areas: ['السيب'], bio: 'كهربائي منازل بخبرة وعناية', hours: 'الأحد - الخميس: 8:00 ص - 8:00 م', status: 'available', active: true, verified: true, featured: true, packageId: 'professional_12m', subscriptionState: 'active', services: [{ id: 'p1s1', catId: 'homecare', serviceId: 'electrician', priceFrom: 8, active: true, areas: ['السيب'] }], workImages: [], documents: [], rating: 4.9, reviews: 12, qualityScore: 94, pinConfigured: true } });
+    }
+    if (url.pathname === '/api/provider/profile') return json({});
+    if (url.pathname === '/api/admin/login') return json({ token: 'ui-admin-token', user: { id: 'ui-admin', name: 'إدارة خدماتي', role: 'super_admin' } });
+    if (url.pathname === '/api/bootstrap' || url.pathname === '/api/admin/session') return json({});
+    if (url.pathname === '/api/push/public-key') return json({ publicKey: '' });
+    return route.fulfill({ status: 503, contentType: 'application/json', body: JSON.stringify({ error: 'request_failed' }) });
+  });
+  await page.goto(testUrl, { waitUntil: 'domcontentloaded' });
   await page.evaluate(() => localStorage.clear());
   try {
     await page.reload({ waitUntil: 'domcontentloaded' });
@@ -71,6 +116,7 @@ async function clickFirstAction(page, action) {
   await page.locator('[data-action="openUserLogin"]').click();
   await page.locator('#customerLoginPhone').fill('95550001');
   await page.locator('#customerLoginName').fill('مستخدم الاختبار الآلي');
+  await page.locator('#customerLoginPin').fill('2468');
   await page.locator('[data-action="customerLogin"]').click();
   await page.waitForSelector('.role-onboarding');
   await page.locator('[data-action="skipOnboarding"]').click();
@@ -212,11 +258,18 @@ async function clickFirstAction(page, action) {
   await capture(page, '04-offer-comparison');
   await page.locator('[data-action="acceptRequestOffer"]').first().click();
 
+  await page.waitForSelector('#contactAllowChat');
+  assert(!(await page.locator('#contactAllowChat').isChecked()), 'Chat consent must start disabled.');
+  assert(!(await page.locator('#contactAllowWhatsapp').isChecked()), 'WhatsApp consent must start disabled.');
+  assert(!(await page.locator('#contactAllowCall').isChecked()), 'Call consent must start disabled.');
+  await page.locator('[data-action="closeModal"]').click();
+
   await page.locator('.requests-disclosure').first().locator('summary').click();
   assert(await page.locator('[data-action="manageRequestContact"]').count(), 'Contact privacy control is missing after provider selection.');
   assert(await page.locator('[data-action="requestWhatsapp"]').count() === 0, 'WhatsApp must stay hidden before customer consent.');
   assert(await page.locator('[data-action="requestCall"]').count() === 0, 'Phone calls must stay hidden before customer consent.');
   await page.locator('[data-action="manageRequestContact"]').first().click();
+  await page.locator('#contactAllowChat').check();
   await page.locator('#contactAllowWhatsapp').check();
   await page.locator('#contactAllowCall').check();
   await page.locator('[data-action="saveRequestContactConsent"]').click();
@@ -326,7 +379,13 @@ async function clickFirstAction(page, action) {
   await page.waitForSelector('.admin-shell');
   await page.locator('.side-nav [data-action="adminTab"][data-tab="subscriptions"]').click();
   assert(await page.locator('.subscription-command').count(), 'Subscription control center is missing.');
-  assert(await page.locator('.package-admin-grid .package-admin-card').count() >= 4, 'Editable subscription plans are missing.');
+  assert(await page.locator('.package-admin-grid .package-admin-card').count() === 5, 'The production plan catalog must contain exactly five plans.');
+  await page.locator('.package-admin-grid [data-action="packageForm"]').first().click();
+  await page.waitForSelector('#pkgMaxWilayats');
+  assert(await page.locator('#pkgLeadDelay').count(), 'Plan lead-delay entitlement is missing.');
+  assert(await page.locator('#pkgMonthlyResponses').count(), 'Plan monthly-response entitlement is missing.');
+  assert(await page.locator('#pkgSharedInbox').count(), 'Plan shared-inbox entitlement is missing.');
+  await page.locator('[data-action="closeModal"]').click();
   await page.locator('.side-nav [data-action="adminTab"][data-tab="finance"]').click();
   assert(await page.locator('.finance-command-grid').count(), 'Financial control center is missing.');
   await page.locator('.side-nav [data-action="adminTab"][data-tab="settings"]').click();
@@ -341,6 +400,11 @@ async function clickFirstAction(page, action) {
   assert(await page.locator('.system-health').count(), 'System health monitoring panel is missing.');
   await capture(page, '03-admin-quality');
 
+  await page.locator('.topbar [data-action="toggleLang"]').click();
+  assert(await page.locator('html').getAttribute('dir') === 'ltr', 'English mode did not switch the document to LTR.');
+  assert(await page.locator('.brand').filter({ hasText: /Administration/i }).count(), 'English administration title is missing.');
+  assert(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth), 'English layout overflows horizontally.');
+
   const fits = await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth);
   assert(fits, 'Mobile layout overflows horizontally.');
   assert(errors.length === 0, `Browser errors: ${errors.join(' | ')}`);
@@ -354,7 +418,9 @@ async function clickFirstAction(page, action) {
     mobileFit: fits,
   }, null, 2));
   await browser.close();
+  LOCAL_SERVER?.close();
 })().catch(async error => {
   console.error(error);
+  LOCAL_SERVER?.close();
   process.exit(1);
 });

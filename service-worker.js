@@ -1,4 +1,4 @@
-const CACHE_NAME = 'khadamati-app-shell-v40-public';
+const CACHE_NAME = 'khadamati-app-shell-v41-production';
 const SHELL = [
   './',
   './index.html',
@@ -48,7 +48,7 @@ self.addEventListener('fetch', event => {
         caches.open(CACHE_NAME).then(cache => cache.put(event.request, copy)).catch(() => {});
         return response;
       })
-      .catch(() => caches.match(event.request).then(cached => cached || caches.match('./index.html')))
+      .catch(() => caches.match(event.request))
   );
 });
 

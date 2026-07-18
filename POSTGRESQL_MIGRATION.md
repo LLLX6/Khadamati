@@ -21,6 +21,12 @@
    - `subscriptions`
    - `payments`
    - `audit_logs`
+   - `app_users`, `auth_sessions`, `customer_requests`, `app_notifications`
+   - `contact_consents`, `request_dispatches`
+   - `subscription_events`, `foundation_claims`, `invoices`
+   - `coupons`, `coupon_redemptions`, `campaigns`, `provider_promotions`
+   - `provider_team_members`, `provider_branches`
+   - `otp_challenges`, `webhook_events`, `policy_acceptances`
 5. انقل مجلد الصور `public/uploads`.
 6. حدّث طبقة الاتصال في `server.py` لاستخدام PostgreSQL driver مثل `psycopg`.
 
@@ -30,3 +36,5 @@
 - لا تنقل رموز الاختبار إلى الإنتاج.
 - استخدم متغيرات بيئة للاتصال بقاعدة PostgreSQL بدل حفظ بيانات الاتصال داخل الكود.
 - عند الوصول إلى استخدام فعلي متكرر، PostgreSQL أفضل من SQLite للتزامن، النسخ الاحتياطي، والمراقبة.
+- لا تنفذ النقل مباشرة على قاعدة الإنتاج. اختبر المخطط والاستيراد والتحقق من الأعداد والعلاقات في بيئة مرحلية أولاً.
+- طبقة الخادم الحالية تستخدم SQLite؛ يلزم تنفيذ Data Adapter لـ`psycopg` واختبارات تزامن قبل تحويل الاتصال الإنتاجي.
