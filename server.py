@@ -524,7 +524,22 @@ SEED_PROVIDERS = [
 def ensure_column(con, table, column, definition):
     columns = [r["name"] for r in con.execute(f"PRAGMA table_info({table})")]
     if column not in columns:
-        con.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+        original_definition = definition or "TEXT"
+        effective_definition = original_definition
+        if "current_timestamp" in original_definition.lower() or "datetime('now')" in original_definition.lower():
+            effective_definition = re.sub(
+                r"\bDEFAULT\s+CURRENT_TIMESTAMP\b|\bDEFAULT\s+DATETIME\('now'\)",
+                "DEFAULT ''",
+                original_definition,
+                flags=re.IGNORECASE,
+            )
+            if "DEFAULT" not in effective_definition.upper():
+                effective_definition = effective_definition.strip() + " DEFAULT ''"
+        con.execute(f"ALTER TABLE {table} ADD COLUMN {column} {effective_definition}")
+        if "current_timestamp" in original_definition.lower() or "datetime('now')" in original_definition.lower():
+            con.execute(
+                f"UPDATE {table} SET {column}=CURRENT_TIMESTAMP WHERE {column} IS NULL OR {column}=''"
+            )
 
 
 def create_pre_migration_backup():
@@ -1911,7 +1926,14 @@ def permissions_for(role, selected=None):
 def has_permission(session, permission):
     if not session or session.get("kind") != "admin":
         return False
-    return session.get("role") in {"owner", "super_admin"} or permission in session.get("permissions", [])
+    role = str(session.get("role") or "")
+    raw_permissions = session.get("permissions")
+    if isinstance(raw_permissions, str):
+        raw_permissions = jload(raw_permissions, [])
+    if not isinstance(raw_permissions, list):
+        raw_permissions = []
+    permissions = raw_permissions if raw_permissions else permissions_for(role)
+    return role in {"owner", "super_admin"} or permission in permissions
 
 
 def scan_expirations(con):
@@ -3118,6 +3140,9 @@ class Handler(SimpleHTTPRequestHandler):
                 return self.send_json({"error": "valid_phone_required"}, 400)
             pending_request = None
             provider_row = None
+            pin = safe_text(data.get("pin", ""), 8)
+            if not pin:
+                pin = safe_text(data.get("code", ""), 8)
             with db() as con:
                 lock_state = login_failure_state(con, "provider", phone)
                 if lock_state["locked"]:
@@ -3173,9 +3198,9 @@ class Handler(SimpleHTTPRequestHandler):
                         )
                     except DomainError:
                         otp_ok = False
-                owner_pin_ok = bool(row and verify_secret(data.get("pin", ""), row["pin_hash"]))
+                owner_pin_ok = bool(row and row["pin_hash"] and verify_secret(pin, row["pin_hash"]))
                 team_pin_ok = bool(
-                    team_row and verify_secret(data.get("pin", ""), team_row["pin_hash"])
+                    team_row and team_row["pin_hash"] and verify_secret(pin, team_row["pin_hash"])
                 )
                 if not (owner_pin_ok or team_pin_ok or otp_ok):
                     for request_row in con.execute(
@@ -3185,7 +3210,7 @@ class Handler(SimpleHTTPRequestHandler):
                         if (
                             phone_matches(request_payload.get("phone", ""), phone)
                             and request_payload.get("pinHash")
-                            and verify_secret(data.get("pin", ""), request_payload["pinHash"])
+                            and verify_secret(pin, request_payload["pinHash"])
                         ):
                             pending_request = provider_request_view(
                                 request_payload, request_row["created_at"]
@@ -3199,7 +3224,14 @@ class Handler(SimpleHTTPRequestHandler):
                     )
                 if pending_request:
                     clear_login_failures(con, "provider", phone)
-                elif team_row and (team_pin_ok or (otp_ok and not row)):
+                elif row and (owner_pin_ok or otp_ok):
+                    provider_row = row
+                    provider_id = row["id"]
+                    clear_login_failures(con, "provider", phone)
+                    provider_role = "provider_owner"
+                    provider_permissions = list(PROVIDER_ROLE_PERMISSIONS["provider_owner"])
+                    member_id = ""
+                elif team_row and (team_pin_ok or otp_ok):
                     provider_id = team_row["provider_id"]
                     provider_row = con.execute(
                         "SELECT * FROM providers WHERE id=? AND active=1 AND status!='deleted'",
@@ -3209,22 +3241,15 @@ class Handler(SimpleHTTPRequestHandler):
                     if not str(team_row["pin_hash"] or "").startswith("pbkdf2_sha256$"):
                         con.execute(
                             "UPDATE provider_team_members SET pin_hash=? WHERE id=?",
-                            (hash_pin(data.get("pin", "")), team_row["id"]),
+                            (hash_pin(pin), team_row["id"]),
                         )
                     provider_role = team_row["role"]
                     provider_permissions = jload(team_row["permissions"], [])
                     member_id = team_row["id"]
-                elif row:
-                    provider_row = row
-                    provider_id = row["id"]
-                    clear_login_failures(con, "provider", phone)
-                    provider_role = "provider_owner"
-                    provider_permissions = list(PROVIDER_ROLE_PERMISSIONS["provider_owner"])
-                    member_id = ""
                 if owner_pin_ok and row and not str(row["pin_hash"] or "").startswith("pbkdf2_sha256$"):
                     con.execute(
                         "UPDATE providers SET pin_hash=? WHERE id=?",
-                        (hash_pin(data.get("pin", "")), row["id"]),
+                        (hash_pin(pin), row["id"]),
                     )
             if pending_request:
                 token = issue_token({

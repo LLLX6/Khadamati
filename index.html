@@ -3075,7 +3075,13 @@ function modalSnapshot(){
 function openModal(html,options={}){
  const root=document.getElementById('modalRoot'),snapshot=options.stack?modalSnapshot():null;
  if(snapshot)MODAL_STACK.push(snapshot);else if(!options.preserveStack)MODAL_STACK.length=0;
- destroyLeafletMaps();root.innerHTML=`<div class="modal-backdrop show" data-action="closeModalSoft">${html}</div>`;localizeStaticDom();
+ destroyLeafletMaps();
+ let safeHtml=String(html);
+ if(options.stack){
+   safeHtml=safeHtml.replace(/data-action="closeModal"/g,'data-action="closeModalSoft"');
+   safeHtml=safeHtml.replace(/data-action='closeModal'/g,"data-action='closeModalSoft'");
+ }
+ root.innerHTML=`<div class="modal-backdrop show" data-action="${options.stack?'closeModalSoft':'closeModal'}">${safeHtml}</div>`;localizeStaticDom();
 }
 function closeModal(){clearInterval(window.__khadamatiArrivalPoll);window.__khadamatiArrivalPoll=null;if(CHAT_RECORDER?.state==='recording')stopChatRecording();stopMapLocationWatch();destroyLeafletMaps();MODAL_STACK.length=0;document.getElementById('modalRoot').innerHTML='';document.body.classList.remove('onboarding-open');}
 function closeModalLayer(){
@@ -3434,7 +3440,8 @@ function simpleFinanceForm(kind){ openModal(`<div class="modal"><div class="moda
 function sponsorForm(){ openModal(`<div class="modal"><div class="modal-head"><div class="modal-title">${tr('sponsors')}</div><button class="close-btn" data-action="closeModal">×</button></div><div class="modal-body"><div class="two-col"><div class="field"><label>${tr('sponsorName')}</label><input class="input" id="spName"></div><div class="field"><label>${tr('amount')}</label><input class="input" type="number" id="spAmount"></div><div class="field"><label>${tr('startDate')}</label><input class="input" type="date" id="spStart"></div><div class="field"><label>${tr('endDate')}</label><input class="input" type="date" id="spEnd"></div></div><button class="pill-btn primary" data-action="saveSponsor" style="margin-top:14px">${tr('save')}</button></div></div>`); }
 function couponForm(){ openModal(`<div class="modal"><div class="modal-head"><div class="modal-title">${tr('coupons')}</div><button class="close-btn" data-action="closeModal">×</button></div><div class="modal-body"><div class="two-col"><div class="field"><label>${tr('couponCode')}</label><input class="input" id="cpCode"></div><div class="field"><label>${tr('discount')}</label><input class="input" type="number" id="cpValue"></div></div><button class="pill-btn primary" data-action="saveCoupon" style="margin-top:14px">${tr('save')}</button></div></div>`); }
 async function onClick(e){ const el=e.target.closest('[data-action]'); if(!el)return; const a=el.dataset.action; if(a==='closeModalSoft'&&e.target!==el)return; const id=el.dataset.id; try{
- if(a==='closeModal'||a==='closeModalSoft'){closeModalLayer();return;}
+ if(a==='closeModal'){closeModal();return;}
+ if(a==='closeModalSoft'){closeModalLayer();return;}
  if(a==='openNotificationSettings'||(a==='openNotifications'&&el.classList.contains('menu-row'))){notificationPreferencesSheet();return;}
  if(a==='dismissTip'){S.tipsSeen=S.tipsSeen||{};S.tipsSeen[el.dataset.tip||'general']=true;save();render();return;}
  if(a==='retryOfflineQueue'){if(!navigator.onLine){toast(L('لا يوجد اتصال بالإنترنت حالياً.','No internet connection right now.'));return;}await flushOfflineQueue();render();return;}
