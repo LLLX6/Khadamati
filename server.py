@@ -2855,7 +2855,12 @@ class Handler(SimpleHTTPRequestHandler):
             return self.send_upload(path)
         if path.startswith("/uploads/"):
             if is_private_upload(path):
-                return self.send_json({"error": "private_media_requires_signed_url"}, 403)
+                session = self.session()
+                if not (
+                    has_permission(session, "review_requests")
+                    or has_permission(session, "manage_providers")
+                ):
+                    return self.send_json({"error": "private_media_requires_signed_url"}, 403)
             return self.send_upload(path)
         if path.startswith("/share/provider/"):
             provider_id = path.rsplit("/", 1)[-1]

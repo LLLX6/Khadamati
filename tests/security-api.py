@@ -180,6 +180,10 @@ def run():
             assert parsed.path.startswith("/media/") and parsed.query
             expect(http(base, parsed.path), {403}, "unsigned private document")
             assert http(base, parsed.path + "?" + parsed.query)[0] == 200
+            raw_document = "/uploads/" + parsed.path.rsplit("/", 1)[-1]
+            expect(http(base, raw_document), {403}, "anonymous raw private document")
+            expect(http(base, raw_document, token=token_a), {403}, "provider raw private document")
+            assert http(base, raw_document, token=admin_token)[0] == 200
             expired_query = urllib.parse.parse_qs(parsed.query)
             expired_query["exp"] = ["1"]
             expect(http(base, parsed.path + "?" + urllib.parse.urlencode(expired_query, doseq=True)), {403}, "expired media link")
