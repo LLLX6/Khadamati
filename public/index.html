@@ -716,14 +716,42 @@ function providerDistanceLabel(p){
  return `${info.approximate?L('تقريباً ','About '):''}${value}`;
 }
 const AUTH_KEY = 'KHADAMATI_AUTH_V3';
-let AUTH = JSON.parse(sessionStorage.getItem(AUTH_KEY) || localStorage.getItem(AUTH_KEY) || localStorage.getItem('FORAN_AUTH_V2') || '{}');
-localStorage.removeItem(AUTH_KEY);localStorage.removeItem('FORAN_AUTH_V2');
+const LEGACY_AUTH_KEY = 'FORAN_AUTH_V2';
+const LEGACY_AUTH_KEY_2 = 'KHADAMATI_AUTH';
+const AUTH_STABLE_KEYS = [LEGACY_AUTH_KEY, LEGACY_AUTH_KEY_2];
+function safeJson(value, fallback = null){
+  if (!value) return fallback;
+  try { return JSON.parse(value); } catch (_) { return fallback; }
+}
+function readStoredAuth(){
+  const sessionRaw = sessionStorage.getItem(AUTH_KEY);
+  const localRaw = localStorage.getItem(AUTH_KEY);
+  const legacyRaw = localStorage.getItem(LEGACY_AUTH_KEY) || localStorage.getItem(LEGACY_AUTH_KEY_2);
+  const auth = safeJson(sessionRaw, safeJson(localRaw, safeJson(legacyRaw, {})));
+  return {
+    adminToken: typeof auth?.adminToken === 'string' ? auth.adminToken : '',
+    providerToken: typeof auth?.providerToken === 'string' ? auth.providerToken : '',
+    userToken: typeof auth?.userToken === 'string' ? auth.userToken : ''
+  };
+}
+let AUTH = readStoredAuth();
+for (const legacy of AUTH_STABLE_KEYS) localStorage.removeItem(legacy);
+if(AUTH.adminToken||AUTH.providerToken||AUTH.userToken) sessionStorage.setItem(AUTH_KEY,JSON.stringify(AUTH));
 let LAST_AUTH={...AUTH};
 function saveAuth(){
- if(!AUTH.userToken&&AUTH.providerToken&&!LAST_AUTH.providerToken&&!AUTH.adminToken&&LAST_AUTH.userToken)AUTH.userToken=LAST_AUTH.userToken;
- for(const key of ['adminToken','providerToken','userToken'])if(LAST_AUTH[key]&&LAST_AUTH[key]!==AUTH[key])revokeAuthToken(LAST_AUTH[key]);
- sessionStorage.setItem(AUTH_KEY,JSON.stringify(AUTH));localStorage.removeItem(AUTH_KEY);localStorage.removeItem('FORAN_AUTH_V2');LAST_AUTH={...AUTH};
- if(!activeAuthToken()&&typeof S!=='undefined')scrubPrivateSessionState(S);
+  if(!AUTH.userToken&&AUTH.providerToken&&!LAST_AUTH.providerToken&&!AUTH.adminToken&&LAST_AUTH.userToken)AUTH.userToken=LAST_AUTH.userToken;
+  for(const key of ['adminToken','providerToken','userToken'])if(LAST_AUTH[key]&&LAST_AUTH[key]!==AUTH[key])revokeAuthToken(LAST_AUTH[key]);
+  const serialized = JSON.stringify(AUTH);
+  if(activeAuthToken()){
+    sessionStorage.setItem(AUTH_KEY, serialized);
+    localStorage.setItem(AUTH_KEY, serialized);
+  } else {
+    sessionStorage.removeItem(AUTH_KEY);
+    localStorage.removeItem(AUTH_KEY);
+  }
+  localStorage.removeItem(LEGACY_AUTH_KEY);localStorage.removeItem(LEGACY_AUTH_KEY_2);
+  LAST_AUTH={...AUTH};
+  if(!activeAuthToken()&&typeof S!=='undefined')scrubPrivateSessionState(S);
 }
 function activeAuthToken(){return AUTH.adminToken||AUTH.providerToken||AUTH.userToken||'';}
 const DEFAULT_REMOTE_API='https://khadamati-app-api.onrender.com';
