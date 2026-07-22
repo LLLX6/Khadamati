@@ -88,6 +88,26 @@ def main():
         {"phone": provider_phone, "name": "مستخدم ومزود", "pin": "2468"},
     )
     expect(status, same_phone_user, {200}, "User account with provider phone failed")
+    status, missing_expiry = request(
+        "/api/provider-requests",
+        {
+            "name": "مزود بلا تاريخ",
+            "phone": "96895550992",
+            "pin": provider_pin,
+            "providerType": "individual",
+            "commercialNo": "TEST-LIC-NO-EXPIRY",
+            "registrationVersion": 57,
+            "gov": "مسقط",
+            "wilayah": "السيب",
+            "service": "homecare|electrician",
+            "services": [{"catId": "homecare", "serviceId": "electrician", "priceFrom": 8}],
+            "note": "خدمة كهرباء منزلية دقيقة وموثوقة",
+            "hours": "الأحد: 8:00 ص - 8:00 م",
+            "documentsData": [TEST_PNG],
+        },
+    )
+    expect(status, missing_expiry, {400}, "Provider registration accepted a missing licence expiry")
+    assert missing_expiry.get("error") == "credential_expiry_required"
     status, registration = request(
         "/api/provider-requests",
         {
@@ -96,6 +116,8 @@ def main():
             "pin": provider_pin,
             "providerType": "individual",
             "commercialNo": "TEST-LIC-991",
+            "licenseExpiry": "2028-12-31",
+            "registrationVersion": 57,
             "businessRole": "كهربائي منازل",
             "gov": "مسقط",
             "wilayah": "السيب",

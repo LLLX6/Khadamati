@@ -3453,6 +3453,9 @@ class Handler(SimpleHTTPRequestHandler):
                 "providerType": data.get("providerType", "individual") if data.get("providerType") in ("individual", "company") else "individual",
                 "companyName": safe_text(data.get("companyName"), 160),
                 "commercialNo": safe_text(data.get("commercialNo"), 120),
+                "commercialExpiry": safe_text(data.get("commercialExpiry"), 40),
+                "licenseExpiry": safe_text(data.get("licenseExpiry"), 40),
+                "registrationVersion": 57,
                 "companySize": safe_text(data.get("companySize"), 80),
                 "businessRole": safe_text(data.get("businessRole"), 80),
                 "gov": safe_text(data.get("gov", "مسقط"), 80),
@@ -3501,6 +3504,13 @@ class Handler(SimpleHTTPRequestHandler):
                 return self.send_json({"error": "company_name_required"}, 400)
             if not item["commercialNo"]:
                 return self.send_json({"error": "commercial_number_required"}, 400)
+            credential_expiry = (
+                item["commercialExpiry"]
+                if item["providerType"] == "company"
+                else item["licenseExpiry"]
+            )
+            if not credential_expiry:
+                return self.send_json({"error": "credential_expiry_required"}, 400)
             note_words = len(str(item["note"]).split())
             if note_words < 3 or note_words > 20:
                 return self.send_json({"error": "description_word_limit"}, 400)
@@ -5131,6 +5141,13 @@ class Handler(SimpleHTTPRequestHandler):
                     note_words = len(description.split())
                     if not payload.get("commercialNo"):
                         return self.send_json({"error": "commercial_number_required"}, 400)
+                    credential_expiry = (
+                        payload.get("commercialExpiry")
+                        if payload.get("providerType") == "company"
+                        else payload.get("licenseExpiry")
+                    )
+                    if int(payload.get("registrationVersion") or 0) >= 57 and not credential_expiry:
+                        return self.send_json({"error": "credential_expiry_required"}, 400)
                     if note_words < 3 or note_words > 20:
                         return self.send_json({"error": "description_word_limit"}, 400)
                     if not payload.get("documents"):
@@ -5147,6 +5164,8 @@ class Handler(SimpleHTTPRequestHandler):
                         "companyName": payload.get("companyName", ""),
                         "companyId": payload.get("companyName", "") if payload.get("providerType") == "company" else "",
                         "commercialNo": payload.get("commercialNo", ""),
+                        "commercialExpiry": payload.get("commercialExpiry", ""),
+                        "licenseExpiry": payload.get("licenseExpiry", ""),
                         "companySize": payload.get("companySize", ""),
                         "businessRole": payload.get("businessRole", ""),
                         "gov": payload.get("gov", ""),

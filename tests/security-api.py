@@ -72,6 +72,7 @@ def register_provider(base: str, admin_token: str, suffix: str):
                 "pin": pin,
                 "providerType": "individual",
                 "commercialNo": f"SEC-{suffix}",
+                "licenseExpiry": "2028-12-31",
                 "businessRole": "كهربائي منازل",
                 "gov": "مسقط",
                 "wilayah": "السيب",
@@ -315,7 +316,7 @@ def run():
                 assert error.code == 413, f"oversized body returned HTTP {error.code}"
 
             sw = (ROOT / "service-worker.js").read_text(encoding="utf-8")
-            assert "khadamati-app-shell-v56-semantic-visuals-reports" in sw
+            assert "khadamati-app-shell-v57-mobile-request-media" in sw
             assert "api|media|uploads" in sw and "cache: 'no-store'" in sw
 
             return {

@@ -247,8 +247,12 @@ async function clickAdminTab(page, tab) {
     const favourite = card.querySelector('.heart')?.getBoundingClientRect();
     if (!media || !title || !price || !status || !favourite) return { ok: false, reason: 'missing element' };
     const controlsOverlap = !(status.right <= favourite.left || status.left >= favourite.right || status.bottom <= favourite.top || status.top >= favourite.bottom);
+    const usesMobileOverlay = window.matchMedia('(max-width: 760px)').matches;
     return {
-      ok: title.top >= media.bottom - 1 && price.top >= media.bottom - 1 && status.top >= media.top - 1 && status.bottom <= media.bottom + 1 && !controlsOverlap,
+      ok: (usesMobileOverlay
+        ? title.top >= media.top + media.height * 0.34 && title.bottom <= media.bottom + 1 && price.top >= title.top && price.bottom <= media.bottom + 1
+        : title.top >= media.bottom - 1 && price.top >= title.top) && status.top >= media.top - 1 && status.bottom <= media.bottom + 1 && !controlsOverlap,
+      mode: usesMobileOverlay ? 'mobile-overlay' : 'desktop-body',
       media: { top: media.top, bottom: media.bottom },
       title: { top: title.top, bottom: title.bottom },
       price: { top: price.top, bottom: price.bottom },
@@ -257,7 +261,7 @@ async function clickAdminTab(page, tab) {
       controlsOverlap,
     };
   }));
-  assert(providerContentMetrics.every(item => item.ok), `Provider text or price covers the provider image instead of staying in the card body: ${JSON.stringify(providerContentMetrics)}`);
+  assert(providerContentMetrics.every(item => item.ok), `Provider card overlay is not readable or leaves too little portrait space: ${JSON.stringify(providerContentMetrics)}`);
   assert(await page.locator('.search-results-grid .provider-card-title-row .status.off').count() === 0, 'Unavailable providers must stay hidden from public search.');
   const firstProviderImage = page.locator('.search-results-grid .provider-listing .listing-media img').first();
   assert(/assets\/providers\/omani-electrician-v53\.webp/.test(await firstProviderImage.getAttribute('src')), 'The launch provider card is still using a generated placeholder.');
@@ -287,26 +291,35 @@ async function clickAdminTab(page, tab) {
   await page.waitForTimeout(150);
   assert(await page.locator('.request-wizard').count(), `Direct request did not open: ${(await page.locator('#toast').textContent().catch(() => '')) || errors.join(' | ') || 'no visible message'}`);
   await capture(page, '01c-direct-service');
+  const requestCategoryColumns = await page.locator('.category-availability-grid').evaluate(grid => getComputedStyle(grid).gridTemplateColumns.split(' ').length);
+  assert(requestCategoryColumns === 3, 'Direct-request categories should use three compact cards per row on phone.');
   await page.locator('[data-action="requestSelectCategory"].available').first().click();
   await page.waitForSelector('[data-action="requestSelectService"]');
+  const requestServiceColumns = await page.locator('.service-availability-grid').evaluate(grid => getComputedStyle(grid).gridTemplateColumns.split(' ').length);
+  assert(requestServiceColumns === 3, 'Direct-request services should use three compact cards per row on phone.');
   await page.locator('[data-action="requestSelectService"].available').first().click();
+  await page.waitForSelector('.request-wizard[data-step="2"]');
   assert(Boolean(await page.locator('#qrCategory').inputValue()), 'Available category was not selected.');
   assert(Boolean(await page.locator('#qrService').inputValue()), 'Available service was not selected.');
+  assert(await page.locator('.request-selection-strip').count(), 'The location step is missing the selected service summary.');
   const requestReachability = await page.locator('.request-modal-v36').evaluate(modal => {
     const body = modal.querySelector('.modal-body');
-    const next = modal.querySelector('.request-wizard-step.active .request-step-next');
-    const bodyRect = body.getBoundingClientRect();
-    const nextRect = next.getBoundingClientRect();
+    const actions = modal.querySelector('.request-wizard-step.active .wizard-actions');
     return {
       overflowY: getComputedStyle(body).overflowY,
-      nextVisible: nextRect.bottom <= bodyRect.bottom + 2 && nextRect.top >= bodyRect.top - 2,
+      actionsPosition: getComputedStyle(actions).position,
       modalFits: modal.getBoundingClientRect().height <= window.innerHeight + 1,
     };
   });
   assert(['auto', 'scroll'].includes(requestReachability.overflowY), 'Direct request content cannot scroll on a small phone.');
-  assert(requestReachability.nextVisible, 'The direct-request Next button is not reachable after choosing a service.');
+  assert(!['fixed', 'sticky'].includes(requestReachability.actionsPosition), `Direct-request actions should not float over form content (${requestReachability.actionsPosition}).`);
   assert(requestReachability.modalFits, 'Direct request exceeds the phone viewport.');
-  await page.locator('[data-action="requestWizardNext"][data-step="2"]:visible').click();
+  const selectedServiceBeforeBack = await page.locator('#qrService').inputValue();
+  await page.locator('.request-selection-strip [data-action="requestWizardBack"]').click();
+  assert(await page.locator('.request-wizard[data-step="1"]').count(), 'Selected-service back control did not return to service choice.');
+  assert(await page.locator('#qrService').inputValue() === selectedServiceBeforeBack, 'Returning to service choice lost the selected service.');
+  await page.locator(`[data-action="requestSelectService"][data-value="${selectedServiceBeforeBack}"]`).click();
+  await page.waitForSelector('.request-wizard[data-step="2"]');
   assert(await page.locator('.request-location-stage').count(), 'Location step is missing from direct request.');
   await capture(page, '01d-direct-location');
   const selectedServiceBeforeMap = await page.locator('#qrService').inputValue();
@@ -329,6 +342,8 @@ async function clickAdminTab(page, tab) {
   await page.locator('#qrNote').fill('أحتاج تنفيذ هذه الخدمة في المنزل خلال هذا الأسبوع');
   await page.locator('[data-action="requestWizardNext"][data-step="4"]:visible').click();
   assert(await page.locator('.match-summary').count(), 'Request matching summary is missing.');
+  assert(await page.locator('.request-preview .preview-grid > div').count() === 4, 'Request review summary should fill its four-card grid.');
+  await capture(page, '01g-direct-review');
   await page.locator('[data-action="saveQuickRequest"]').click();
   await page.waitForSelector('.active-request-home');
   await clickFirstAction(page, 'openRequestBoard');
@@ -360,10 +375,19 @@ async function clickAdminTab(page, tab) {
   await page.locator('[data-action="enterProvider"]').click();
   await page.locator('[data-action="openProviderAccess"][data-mode="register"]').click();
   assert(await page.locator('#providerRegisterForm').count(), 'Register provider must open the registration form directly.');
+  assert(await page.locator('#regCredentialExpiry').count(), 'Provider registration must collect the licence or registration expiry date.');
   assert(await page.locator('#providerRegisterForm .registration-subservice.show').count() === 0, 'Optional sub-services should start collapsed.');
   const progressDirection = await page.locator('.provider-reg-progress').evaluate(element => getComputedStyle(element).direction);
   assert(progressDirection === 'rtl', 'Arabic provider registration progress must run right to left.');
   assert(!(await page.locator('[data-action="addRegistrationSubservice"]').isVisible()), 'Individual registration must not offer extra services.');
+  await page.locator('#regAvatar').setInputFiles(path.join(__dirname, '..', 'app-icon-512.png'));
+  await page.waitForSelector('.image-editor-v57');
+  assert(await page.locator('.image-editor-v57 [data-action="cropZoomDelta"]').count() === 2, 'The modern image editor must provide zoom-in and zoom-out controls.');
+  assert(await page.locator('.image-editor-v57 [data-action="rotateCrop"]').count(), 'The modern image editor is missing rotation controls.');
+  await capture(page, '01f-image-editor');
+  await page.locator('.image-editor-v57 [data-action="closeImageEditor"]').click();
+  assert(await page.locator('.image-input-previews[data-for="regAvatar"] [data-action="editSelectedImage"]').count(), 'Uploaded image preview is missing its edit action.');
+  assert(await page.locator('.image-input-previews[data-for="regAvatar"] [data-action="removeSelectedImage"]').count(), 'Uploaded image preview is missing its delete action.');
   await page.locator('#regProviderType').selectOption('company');
   assert(await page.locator('[data-action="addRegistrationSubservice"]').isVisible(), 'Company registration must offer plan-limited services.');
   await page.locator('[data-action="addRegistrationSubservice"]').click();
@@ -616,6 +640,28 @@ async function clickAdminTab(page, tab) {
   await page.locator('#adminCode').fill('0000');
   await page.locator('[data-action="adminLogin"]').click();
   await page.waitForSelector('.admin-shell');
+  await clickAdminTab(page, 'notifications');
+  assert(await page.locator('.admin-mark-all').isVisible(), 'The mark-all action is hidden in the administration notification center.');
+  const adminNotificationFit = await page.locator('.admin-mark-all').evaluate(element => {
+    const box = element.getBoundingClientRect();
+    return box.left >= 0 && box.right <= window.innerWidth && box.width > 0;
+  });
+  assert(adminNotificationFit, 'The administration notification action leaves the mobile viewport.');
+  assert(await page.locator('.admin-notification-list .notification-disclosure').count(), 'Administration notifications are missing.');
+  const firstAdminNotification = page.locator('.admin-notification-list .notification-disclosure').first();
+  await firstAdminNotification.locator('summary').click();
+  const adminNotificationActionsFit = await firstAdminNotification.locator('.notification-actions').evaluate(element => {
+    const box = element.getBoundingClientRect();
+    const parent = element.closest('.notification-disclosure').getBoundingClientRect();
+    return box.left >= parent.left - 1 && box.right <= parent.right + 1 && box.width > 0;
+  });
+  assert(adminNotificationActionsFit, 'Expanded administration notification actions are clipped or hidden.');
+  const adminDeleteAction = await firstAdminNotification.locator('.notification-actions .danger').evaluate(element => {
+    const style = getComputedStyle(element);
+    return { text: element.textContent.trim(), color: style.color, background: style.backgroundColor };
+  });
+  assert(adminDeleteAction.text === '×' && adminDeleteAction.color !== adminDeleteAction.background, 'Administration notification delete action is visually blank.');
+  await capture(page, '03a-admin-notifications');
   await clickAdminTab(page, 'subscriptions');
   assert(await page.locator('.subscription-command').count(), 'Subscription control center is missing.');
   assert(await page.locator('.package-admin-grid .package-admin-card').count() === 5, 'The production plan catalog must contain exactly five plans.');

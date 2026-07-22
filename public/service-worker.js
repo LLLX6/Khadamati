@@ -1,4 +1,4 @@
-const CACHE_NAME = 'khadamati-app-shell-v56-semantic-visuals-reports';
+const CACHE_NAME = 'khadamati-app-shell-v57-mobile-request-media';
 const SHELL = [
   './',
   './index.html',
@@ -6,6 +6,7 @@ const SHELL = [
   './assets/styles/khadamati-v54.css',
   './assets/styles/khadamati-v55.css',
   './assets/styles/khadamati-v56.css',
+  './assets/styles/khadamati-v57.css',
   './assets/scripts/khadamati-visuals-v56.js',
   './app-icon-192.png',
   './app-icon-512.png',
