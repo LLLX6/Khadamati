@@ -258,7 +258,13 @@ async function clickAdminTab(page, tab) {
   assert(await page.locator('.search-results-grid .provider-card-title-row .status.off').count() === 0, 'Unavailable providers must stay hidden from public search.');
   const firstProviderImage = page.locator('.search-results-grid .provider-listing .listing-media img').first();
   assert(/assets\/providers\/omani-electrician-v53\.webp/.test(await firstProviderImage.getAttribute('src')), 'The launch provider card is still using a generated placeholder.');
-  assert(await firstProviderImage.evaluate(image => image.complete && image.naturalWidth >= 800), 'The launch provider image did not load at production quality.');
+  const providerImageLoaded = await firstProviderImage.evaluate(image => image.complete
+    ? image.naturalWidth >= 800
+    : new Promise(resolve => {
+      image.addEventListener('load', () => resolve(image.naturalWidth >= 800), { once: true });
+      image.addEventListener('error', () => resolve(false), { once: true });
+    }));
+  assert(providerImageLoaded, 'The launch provider image did not load at production quality.');
   await capture(page, '01b-progressive-search');
   await clickUserNav(page, 'home');
 
