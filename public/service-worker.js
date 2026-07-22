@@ -1,10 +1,12 @@
-const CACHE_NAME = 'khadamati-app-shell-v55-experience-release';
+const CACHE_NAME = 'khadamati-app-shell-v56-semantic-visuals-reports';
 const SHELL = [
   './',
   './index.html',
   './assets/styles/khadamati-v53.css',
   './assets/styles/khadamati-v54.css',
   './assets/styles/khadamati-v55.css',
+  './assets/styles/khadamati-v56.css',
+  './assets/scripts/khadamati-visuals-v56.js',
   './app-icon-192.png',
   './app-icon-512.png',
   './assets/providers/omani-electrician-v53.webp',

@@ -208,6 +208,9 @@ async function clickAdminTab(page, tab) {
   await page.locator('[data-action="servicesCategory"][data-cat="cleaning"]').click();
   assert(await page.locator('[data-action="servicesCategory"][data-cat="cleaning"][aria-selected="true"]').count(), 'Selecting a services category did not update the active tab.');
   assert(await page.locator('.services-category-panel').count() === 1, 'Services should render one selected category rather than every category at once.');
+  const servicePictograms = await page.locator('.services-service-grid .service-tile .kh-subject-art').evaluateAll(items => items.map(item => item.dataset.pictogram));
+  assert(servicePictograms.length >= 10, 'Semantic service artwork is missing from the services grid.');
+  assert(new Set(servicePictograms).size >= 7, 'Service artwork is still repeating one generic symbol across unrelated services.');
   const serviceCardMetrics = await page.locator('.services-service-grid .service-tile').evaluateAll(cards => cards.every(card => {
     const rect = card.getBoundingClientRect();
     const label = card.querySelector('strong');
@@ -289,6 +292,20 @@ async function clickAdminTab(page, tab) {
   await page.locator('[data-action="requestSelectService"].available').first().click();
   assert(Boolean(await page.locator('#qrCategory').inputValue()), 'Available category was not selected.');
   assert(Boolean(await page.locator('#qrService').inputValue()), 'Available service was not selected.');
+  const requestReachability = await page.locator('.request-modal-v36').evaluate(modal => {
+    const body = modal.querySelector('.modal-body');
+    const next = modal.querySelector('.request-wizard-step.active .request-step-next');
+    const bodyRect = body.getBoundingClientRect();
+    const nextRect = next.getBoundingClientRect();
+    return {
+      overflowY: getComputedStyle(body).overflowY,
+      nextVisible: nextRect.bottom <= bodyRect.bottom + 2 && nextRect.top >= bodyRect.top - 2,
+      modalFits: modal.getBoundingClientRect().height <= window.innerHeight + 1,
+    };
+  });
+  assert(['auto', 'scroll'].includes(requestReachability.overflowY), 'Direct request content cannot scroll on a small phone.');
+  assert(requestReachability.nextVisible, 'The direct-request Next button is not reachable after choosing a service.');
+  assert(requestReachability.modalFits, 'Direct request exceeds the phone viewport.');
   await page.locator('[data-action="requestWizardNext"][data-step="2"]:visible').click();
   assert(await page.locator('.request-location-stage').count(), 'Location step is missing from direct request.');
   await capture(page, '01d-direct-location');
@@ -621,6 +638,24 @@ async function clickAdminTab(page, tab) {
   await page.waitForSelector('.ad-preview-device');
   assert(await page.locator('.ad-preview-device').count() === 2, 'Phone and desktop ad previews are missing.');
   await page.locator('[data-action="closeModal"]').click();
+  await clickAdminTab(page, 'categoryAdmin');
+  assert(await page.locator('.admin-category-visual .kh-subject-art').count() >= 9, 'Management does not show the semantic category artwork.');
+  const managedPictograms = await page.locator('.admin-category-visual .kh-subject-art').evaluateAll(items => items.map(item => item.dataset.pictogram));
+  assert(managedPictograms.length >= 100 && managedPictograms.every(Boolean), 'Some managed categories or services do not have subject artwork.');
+  await page.locator('[data-action="catForm"]').first().click();
+  assert(await page.locator('.pictogram-picker .pictogram-option').count() >= 50, 'Category artwork picker is incomplete.');
+  const firstArtwork = await page.locator('#catIconKey').inputValue();
+  const alternativeArtwork = page.locator('.pictogram-option:not(.active)').first();
+  await alternativeArtwork.click();
+  assert(await page.locator('#catIconKey').inputValue() !== firstArtwork, 'Selecting category artwork did not update the managed value.');
+  await page.locator('[data-action="closeModal"]').click();
+  await clickAdminTab(page, 'reports');
+  assert(await page.locator('.report-command-bar').count(), 'The production reports command bar is missing.');
+  assert(await page.locator('.report-summary-grid .report-summary-card').count() === 4, 'Report decision summaries are incomplete.');
+  assert(await page.locator('[data-action="exportReportsCsv"]').count(), 'CSV export is missing from reports.');
+  assert(await page.locator('[data-action="exportReportsWord"]').count(), 'Word export is missing from reports.');
+  assert(await page.locator('[data-action="printReports"]').count(), 'Print/PDF export is missing from reports.');
+  await capture(page, '03-admin-reports');
   await clickAdminTab(page, 'quality');
   assert(await page.locator('.system-health').count(), 'System health monitoring panel is missing.');
   await capture(page, '03-admin-quality');

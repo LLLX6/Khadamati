@@ -2978,17 +2978,66 @@ class Handler(SimpleHTTPRequestHandler):
         return super().do_GET()
 
     def download_report(self, path):
+        lang = parse_qs(urlparse(self.path).query).get("lang", ["ar"])[0]
+        lang = "en" if lang == "en" else "ar"
+        is_ar = lang == "ar"
+        labels = {
+            "title": "تقرير خدماتي التشغيلي" if is_ar else "Khadamati operational report",
+            "section": "القسم" if is_ar else "Section",
+            "metric": "المؤشر" if is_ar else "Metric",
+            "value": "القيمة" if is_ar else "Value",
+            "note": "ملاحظة" if is_ar else "Note",
+            "operations": "التشغيل" if is_ar else "Operations",
+            "audience": "الجمهور" if is_ar else "Audience",
+            "subscriptions": "الاشتراكات" if is_ar else "Subscriptions",
+            "finance": "المال" if is_ar else "Finance",
+            "quality": "الجودة" if is_ar else "Quality",
+            "demand": "الطلب حسب المحافظة" if is_ar else "Demand by governorate",
+            "status": "الطلبات حسب الحالة" if is_ar else "Requests by status",
+            "providers": "أداء المزودين" if is_ar else "Provider performance",
+            "generated": "تاريخ الإنشاء" if is_ar else "Generated",
+            "privacy": (
+                "هذا التقرير تشغيلي ولا يتضمن كلمات مرور أو وثائق سرية أو مواقع دقيقة."
+                if is_ar else
+                "This operational report excludes passwords, confidential documents, and precise locations."
+            ),
+        }
         with db() as con:
-            rows = [
-                ["المؤشر", "القيمة"],
-                ["المستخدمون", con.execute("SELECT COUNT(*) n FROM app_users WHERE status='active'").fetchone()["n"]],
-                ["المزودون", con.execute("SELECT COUNT(*) n FROM providers").fetchone()["n"]],
-                ["الشركات", con.execute("SELECT COUNT(*) n FROM providers WHERE provider_type='company'").fetchone()["n"]],
-                ["طلبات العملاء", con.execute("SELECT COUNT(*) n FROM customer_requests").fetchone()["n"]],
-                ["طلبات غير متاحة", con.execute("SELECT COUNT(*) n FROM customer_requests WHERE status='unavailable'").fetchone()["n"]],
-                ["اشتراكات نشطة", con.execute("SELECT COUNT(*) n FROM subscriptions WHERE status='active'").fetchone()["n"]],
-                ["إيرادات مسجلة", con.execute("SELECT COALESCE(SUM(amount),0) n FROM payments WHERE kind='revenue' AND status='paid'").fetchone()["n"]],
+            scalar = lambda query, params=(): con.execute(query, params).fetchone()["n"]
+            rows = [[labels["section"], labels["metric"], labels["value"], labels["note"]]]
+            metrics = [
+                (labels["audience"], "المستخدمون المسجلون" if is_ar else "Registered users", scalar("SELECT COUNT(*) n FROM app_users WHERE status='active'"), ""),
+                (labels["audience"], "كل المزودين" if is_ar else "All providers", scalar("SELECT COUNT(*) n FROM providers"), ""),
+                (labels["audience"], "المزودون الظاهرون" if is_ar else "Visible providers", scalar("SELECT COUNT(*) n FROM providers WHERE active=1 AND status!='unavailable'"), ""),
+                (labels["audience"], "الشركات" if is_ar else "Companies", scalar("SELECT COUNT(*) n FROM providers WHERE provider_type='company'"), ""),
+                (labels["operations"], "طلبات العملاء" if is_ar else "Customer requests", scalar("SELECT COUNT(*) n FROM customer_requests"), ""),
+                (labels["operations"], "الطلبات المكتملة" if is_ar else "Completed requests", scalar("SELECT COUNT(*) n FROM customer_requests WHERE status IN ('closed','archived','completed')"), ""),
+                (labels["operations"], "طلبات غير متاحة" if is_ar else "Unavailable requests", scalar("SELECT COUNT(*) n FROM customer_requests WHERE status='unavailable' OR waitlisted=1"), ""),
+                (labels["operations"], "طلبات مزودين للمراجعة" if is_ar else "Provider applications pending", scalar("SELECT COUNT(*) n FROM provider_requests"), ""),
+                (labels["subscriptions"], "اشتراكات نشطة" if is_ar else "Active subscriptions", scalar("SELECT COUNT(*) n FROM subscriptions WHERE status='active'"), ""),
+                (labels["subscriptions"], "اشتراكات بانتظار الإجراء" if is_ar else "Subscriptions pending action", scalar("SELECT COUNT(*) n FROM subscriptions WHERE status IN ('pending','pending_payment','pending_approval')"), ""),
+                (labels["subscriptions"], "اشتراكات منتهية" if is_ar else "Expired subscriptions", scalar("SELECT COUNT(*) n FROM subscriptions WHERE status='expired'"), ""),
+                (labels["finance"], "الإيرادات المؤكدة" if is_ar else "Confirmed revenue", scalar("SELECT COALESCE(SUM(amount),0) n FROM payments WHERE kind IN ('revenue','subscription','promotion') AND status='paid'"), "OMR"),
+                (labels["quality"], "متوسط تقييم المزودين" if is_ar else "Average provider rating", round(float(scalar("SELECT COALESCE(AVG(rating),0) n FROM providers")), 2), "5"),
+                (labels["quality"], "شكاوى مفتوحة" if is_ar else "Open complaints", scalar("SELECT COUNT(*) n FROM complaints WHERE status!='closed'"), ""),
             ]
+            rows.extend([list(item) for item in metrics])
+            for item in con.execute(
+                "SELECT COALESCE(NULLIF(gov,''), ?) name, COUNT(*) n FROM customer_requests GROUP BY COALESCE(NULLIF(gov,''), ?) ORDER BY n DESC LIMIT 20",
+                (("غير محدد" if is_ar else "Not specified"),) * 2,
+            ).fetchall():
+                rows.append([labels["demand"], item["name"], item["n"], ""])
+            for item in con.execute("SELECT status name, COUNT(*) n FROM customer_requests GROUP BY status ORDER BY n DESC").fetchall():
+                rows.append([labels["status"], item["name"] or ("غير محدد" if is_ar else "Not specified"), item["n"], ""])
+            for item in con.execute(
+                "SELECT name, rating, reviews, quality_score FROM providers ORDER BY rating DESC, reviews DESC LIMIT 15"
+            ).fetchall():
+                detail = (
+                    f"التقييم {float(item['rating'] or 0):.1f}/5 | المراجعات {item['reviews'] or 0} | الجودة {item['quality_score'] or 0}%"
+                    if is_ar else
+                    f"Rating {float(item['rating'] or 0):.1f}/5 | Reviews {item['reviews'] or 0} | Quality {item['quality_score'] or 0}%"
+                )
+                rows.append([labels["providers"], item["name"], item["reviews"] or 0, detail])
         stamp = datetime.now().strftime("%Y-%m-%d")
         if path.endswith(".csv"):
             output = io.StringIO()
@@ -2997,14 +3046,22 @@ class Handler(SimpleHTTPRequestHandler):
             raw = ("\ufeff" + output.getvalue()).encode("utf-8")
             return self.send_bytes(raw, "text/csv; charset=utf-8", f"khadamati-report-{stamp}.csv")
         if path.endswith(".docx"):
-            paragraphs = "".join(
-                f'<w:p><w:pPr><w:bidi/></w:pPr><w:r><w:rPr><w:rtl/></w:rPr><w:t>{html.escape(str(label))}: {html.escape(str(value))}</w:t></w:r></w:p>'
-                for label, value in rows
+            rtl_props = "<w:rtl/>" if is_ar else ""
+            bidi_props = "<w:bidi/>" if is_ar else ""
+            table_rows = "".join(
+                "<w:tr>" + "".join(
+                    f'<w:tc><w:tcPr><w:tcW w:w="2400" w:type="dxa"/></w:tcPr><w:p><w:pPr>{bidi_props}</w:pPr><w:r><w:rPr>{rtl_props}</w:rPr><w:t>{html.escape(str(cell))}</w:t></w:r></w:p></w:tc>'
+                    for cell in row
+                ) + "</w:tr>"
+                for row in rows
             )
             document = (
                 '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
                 '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
-                f"<w:body>{paragraphs}<w:sectPr/></w:body></w:document>"
+                f'<w:body><w:p><w:pPr>{bidi_props}</w:pPr><w:r><w:rPr><w:b/><w:sz w:val="34"/>{rtl_props}</w:rPr><w:t>{html.escape(labels["title"])}</w:t></w:r></w:p>'
+                f'<w:p><w:pPr>{bidi_props}</w:pPr><w:r><w:rPr>{rtl_props}</w:rPr><w:t>{html.escape(labels["generated"])}: {stamp}</w:t></w:r></w:p>'
+                '<w:tbl><w:tblPr><w:tblW w:w="0" w:type="auto"/><w:tblBorders><w:top w:val="single" w:sz="4" w:color="B8C7D1"/><w:left w:val="single" w:sz="4" w:color="B8C7D1"/><w:bottom w:val="single" w:sz="4" w:color="B8C7D1"/><w:right w:val="single" w:sz="4" w:color="B8C7D1"/><w:insideH w:val="single" w:sz="3" w:color="D9E2EC"/><w:insideV w:val="single" w:sz="3" w:color="D9E2EC"/></w:tblBorders></w:tblPr>'
+                f'{table_rows}</w:tbl><w:p><w:pPr>{bidi_props}</w:pPr><w:r><w:rPr>{rtl_props}</w:rPr><w:t>{html.escape(labels["privacy"])}</w:t></w:r></w:p><w:sectPr/></w:body></w:document>'
             )
             stream = io.BytesIO()
             with zipfile.ZipFile(stream, "w", zipfile.ZIP_DEFLATED) as archive:
@@ -3030,19 +3087,22 @@ class Handler(SimpleHTTPRequestHandler):
                 "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
                 f"khadamati-report-{stamp}.docx",
             )
+        align = "right" if is_ar else "left"
         table_rows = "".join(
-            f"<tr><th>{html.escape(str(label))}</th><td>{html.escape(str(value))}</td></tr>"
-            for label, value in rows
+            "<tr>" + "".join(f"<td>{html.escape(str(cell))}</td>" for cell in row) + "</tr>"
+            for row in rows[1:]
         )
-        page = f"""<!doctype html><html lang="ar" dir="rtl"><meta charset="utf-8">
-        <title>تقرير خدماتي</title><style>
-        body{{font-family:Arial,sans-serif;max-width:760px;margin:40px auto;color:#102a43}}
-        h1{{color:#087f8c}}table{{width:100%;border-collapse:collapse}}
-        th,td{{padding:12px;border:1px solid #d9e2ec;text-align:right}}th{{background:#f0f7f8}}
-        button{{padding:10px 18px;border:0;border-radius:8px;background:#087f8c;color:white}}
-        @media print{{button{{display:none}}}}
-        </style><h1>تقرير منصة خدماتي</h1><p>{stamp}</p>
-        <table>{table_rows}</table><p><button onclick="print()">طباعة / حفظ PDF</button></p></html>"""
+        table_head = "".join(f"<th>{html.escape(str(cell))}</th>" for cell in rows[0])
+        print_label = "طباعة أو حفظ PDF" if is_ar else "Print or save PDF"
+        page = f"""<!doctype html><html lang="{lang}" dir="{'rtl' if is_ar else 'ltr'}"><head><meta charset="utf-8">
+        <meta name="viewport" content="width=device-width,initial-scale=1"><title>{html.escape(labels['title'])}</title><style>
+        @page{{size:A4;margin:16mm}}*{{box-sizing:border-box}}body{{font-family:Tahoma,Arial,sans-serif;max-width:960px;margin:32px auto;color:#102a43;padding:0 14px;line-height:1.55}}
+        header{{display:flex;justify-content:space-between;gap:20px;align-items:center;border-bottom:3px solid #087f78;padding-bottom:16px;margin-bottom:18px}}h1{{margin:0;color:#075b58;font-size:25px}}header p{{color:#627d98;margin:4px 0 0}}
+        table{{width:100%;border-collapse:collapse;font-size:12px}}th,td{{padding:9px;border:1px solid #d9e2ec;text-align:{align};vertical-align:top}}th{{background:#e7f5f2;color:#075b58}}tbody tr:nth-child(even){{background:#f8fafc}}
+        button{{padding:10px 18px;border:0;border-radius:8px;background:#087f78;color:white;font:inherit;font-weight:700}}footer{{margin-top:16px;color:#829ab1;font-size:11px}}
+        @media(max-width:640px){{body{{margin:12px auto}}table{{font-size:10px}}th,td{{padding:6px}}}}@media print{{button{{display:none}}body{{margin:0;padding:0}}}}
+        </style></head><body><header><div><h1>{html.escape(labels['title'])}</h1><p>{html.escape(labels['generated'])}: {stamp}</p></div><button onclick="print()">{print_label}</button></header>
+        <table><thead><tr>{table_head}</tr></thead><tbody>{table_rows}</tbody></table><footer>{html.escape(labels['privacy'])} • Khadamati App</footer></body></html>"""
         return self.send_bytes(page.encode("utf-8"), "text/html; charset=utf-8")
 
     def do_POST(self):

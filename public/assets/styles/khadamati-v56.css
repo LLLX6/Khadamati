@@ -1,0 +1,104 @@
+/* Khadamati v56: semantic service artwork, reachable mobile request flow, and production reports. */
+:root{
+  --v56-teal:#087f78;
+  --v56-blue:#155f86;
+  --v56-gold:#a8771f;
+  --v56-report-bg:color-mix(in srgb,var(--panel2) 78%,var(--panel));
+}
+
+/* Custom subject artwork. These are deliberately separate from familiar action icons. */
+.kh-subject-art{display:block;width:100%;height:100%;overflow:visible;color:var(--v56-teal)}
+.kh-subject-art .kh-pic-fill{fill:currentColor;opacity:.12;stroke:none}
+.kh-subject-art .kh-pic-line{fill:none;stroke:currentColor;stroke-width:1.55;stroke-linecap:round;stroke-linejoin:round}
+.kh-subject-art .kh-pic-accent{fill:var(--kh-pic-accent,#d0a43b);stroke:none;opacity:.92}
+.kh-subject-art.kh-tone-0{color:#087f78;--kh-pic-accent:#d4a83d}
+.kh-subject-art.kh-tone-1{color:#155f86;--kh-pic-accent:#12a696}
+.kh-subject-art.kh-tone-2{color:#876315;--kh-pic-accent:#168e84}
+.kh-subject-art.kh-tone-3{color:#176f63;--kh-pic-accent:#d59a2e}
+.kh-subject-art.kh-tone-4{color:#21658b;--kh-pic-accent:#d1a23a}
+.kh-subject-art.kh-tone-5{color:#0b746f;--kh-pic-accent:#4685a7}
+[data-theme="dark"] .kh-subject-art.kh-tone-0,[data-theme="dark"] .kh-subject-art.kh-tone-3,[data-theme="dark"] .kh-subject-art.kh-tone-5{color:#63d5c8}
+[data-theme="dark"] .kh-subject-art.kh-tone-1,[data-theme="dark"] .kh-subject-art.kh-tone-4{color:#80c5eb}
+[data-theme="dark"] .kh-subject-art.kh-tone-2{color:#e4c26c}
+
+.market-art:has(.kh-subject-art){padding:6px!important;background:color-mix(in srgb,currentColor 8%,var(--panel))!important}
+.market-art>.kh-subject-art{width:100%!important;height:100%!important}
+.category-tile .market-art{width:46px!important;height:46px!important}
+.services-service-grid .service-tile .market-art{width:46px!important;height:46px!important;padding:7px!important}
+.services-service-grid .service-tile .market-art>.kh-subject-art{width:100%!important;height:100%!important}
+.services-category-title>span,.services-category-card>span,.admin-category-visual,.request-availability-icon{display:grid;place-items:center;overflow:hidden}
+.services-category-title>span .kh-subject-art{width:34px;height:34px}
+.services-category-card>span .kh-subject-art{width:30px;height:30px}
+.chip-tab .kh-subject-art,.suggest-chip .kh-subject-art{width:20px!important;height:20px!important;flex:0 0 20px}
+.search-choice .kh-subject-art{width:28px;height:28px}
+.request-availability-icon .kh-subject-art{width:30px!important;height:30px!important}
+.opportunity-service>span .kh-subject-art{width:28px;height:28px}
+.service-detail-head .market-art{width:64px!important;height:64px!important;padding:10px!important}
+.service-detail-head .kh-subject-art{width:100%!important;height:100%!important}
+.admin-category-visual{width:44px!important;height:44px!important;padding:7px!important;border-radius:12px;background:color-mix(in srgb,var(--accent) 7%,var(--panel2))}
+.admin-category-visual .kh-subject-art{width:100%;height:100%}
+
+/* Pictogram picker used by category and service management. */
+.pictogram-field{grid-column:1/-1;display:grid;gap:9px}
+.pictogram-selection{display:grid;grid-template-columns:52px minmax(0,1fr);gap:10px;align-items:center;padding:10px;border:1px solid var(--line);border-radius:12px;background:var(--panel2)}
+.pictogram-selection>span{width:52px;height:52px;padding:8px;border-radius:12px;background:var(--panel);box-shadow:inset 0 0 0 1px var(--line)}
+.pictogram-selection b{font-size:.78rem}.pictogram-selection small{display:block;color:var(--muted);font-size:.66rem;margin-top:3px}
+.pictogram-picker{display:grid;grid-template-columns:repeat(8,minmax(0,1fr));gap:6px;max-height:226px;overflow:auto;padding:4px;scrollbar-width:thin}
+.pictogram-option{aspect-ratio:1;border:1px solid var(--line);border-radius:10px;background:var(--panel);padding:7px;cursor:pointer;transition:.15s ease}
+.pictogram-option:hover{border-color:color-mix(in srgb,var(--accent) 55%,var(--line));transform:translateY(-1px)}
+.pictogram-option.active{border-color:var(--accent);background:color-mix(in srgb,var(--accent) 9%,var(--panel));box-shadow:0 0 0 2px color-mix(in srgb,var(--accent) 12%,transparent)}
+.pictogram-option .kh-subject-art{width:100%;height:100%}
+
+/* Direct-request step 1 remains scrollable and its next action always stays reachable. */
+.request-modal-v36{display:flex!important;flex-direction:column!important;width:min(720px,100%)!important;max-height:min(92dvh,820px)!important;overflow:hidden!important}
+.request-modal-v36>.modal-head{flex:0 0 auto}
+.request-modal-v36>.modal-body{flex:1 1 auto!important;min-height:0!important;overflow-y:auto!important;overscroll-behavior:contain!important;-webkit-overflow-scrolling:touch;padding-bottom:calc(18px + env(safe-area-inset-bottom))!important;scrollbar-gutter:stable}
+.request-wizard-v36 .request-wizard-step.active{min-width:0}
+.request-wizard-v36 .request-step-next{position:sticky;z-index:12;bottom:max(0px,env(safe-area-inset-bottom));min-height:48px;margin-top:12px!important;border:1px solid color-mix(in srgb,var(--accent) 55%,transparent);box-shadow:0 -8px 24px color-mix(in srgb,var(--panel) 88%,transparent)}
+.request-wizard-v36 .request-service-choice{min-width:0}
+.request-wizard-v36 .request-availability-grid{scroll-padding-block:8px}
+.request-wizard-v36 .service-availability-grid{max-height:min(36dvh,320px)}
+.request-wizard-v36 .request-availability-card{overflow:hidden}
+.request-wizard-v36 .request-availability-card b{white-space:normal;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical}
+
+/* Reports become a decision workspace rather than a flat list. */
+.report-command-bar{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:12px;align-items:center;padding:14px;border:1px solid color-mix(in srgb,var(--accent) 22%,var(--line));border-radius:14px;background:linear-gradient(135deg,color-mix(in srgb,var(--accent) 8%,var(--panel)),var(--panel))}
+.report-command-bar h2{margin:0;font-size:1.04rem}.report-command-bar p{margin:4px 0 0;color:var(--muted);font-size:.72rem}
+.report-command-bar .row-actions{justify-content:flex-end}
+.report-command-bar .pill-btn{min-height:42px;gap:6px}.report-command-bar .pill-btn svg{width:18px;height:18px}
+.report-period{display:inline-flex;align-items:center;gap:6px;margin-top:8px;padding:5px 8px;border-radius:8px;background:var(--panel2);color:var(--muted);font-size:.64rem;font-weight:800}
+.report-summary-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px;margin-top:12px}
+.report-summary-card{display:grid;gap:5px;min-height:90px;padding:12px;border:1px solid var(--line);border-radius:12px;background:var(--panel)}
+.report-summary-card>span{font-size:.66rem;color:var(--muted);font-weight:750}.report-summary-card>b{font-size:1.2rem;color:var(--text)}.report-summary-card>small{font-size:.61rem;color:var(--muted)}
+.report-summary-card.accent{border-color:color-mix(in srgb,var(--accent) 32%,var(--line));background:color-mix(in srgb,var(--accent) 5%,var(--panel))}
+.report-section{margin-top:12px!important}.report-section h2{font-size:.9rem}
+.funnel-grid{overflow-x:auto;scroll-snap-type:x proximity;padding-bottom:3px}.funnel-step{scroll-snap-align:start;min-width:112px}
+.report-export-note{display:flex;gap:8px;align-items:flex-start;margin-top:10px;color:var(--muted);font-size:.65rem;line-height:1.5}.report-export-note svg{width:17px;flex:0 0 17px;color:var(--accent)}
+
+@media(max-width:640px){
+  .category-tile .market-art{width:42px!important;height:42px!important}
+  .services-service-grid .service-tile .market-art{width:42px!important;height:42px!important;padding:6px!important}
+  .pictogram-picker{grid-template-columns:repeat(6,minmax(0,1fr));max-height:214px}
+  .report-command-bar{grid-template-columns:1fr}.report-command-bar .row-actions{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));width:100%;gap:6px}.report-command-bar .pill-btn{justify-content:center;padding-inline:7px;font-size:.66rem;min-width:0}
+  .report-summary-grid{grid-template-columns:repeat(2,minmax(0,1fr))}
+}
+
+@media(max-width:390px){
+  .request-modal-v36{height:94dvh!important;max-height:94dvh!important;border-radius:18px 18px 0 0!important}
+  .request-modal-v36>.modal-body{padding-inline:10px!important}
+  .request-wizard-v36 .category-availability-grid{grid-template-columns:repeat(2,minmax(0,1fr))!important;max-height:216px!important}
+  .request-wizard-v36 .service-availability-grid{grid-template-columns:repeat(2,minmax(0,1fr))!important;max-height:32dvh!important}
+  .request-wizard-v36 .request-availability-card{min-height:64px!important;grid-template-columns:30px minmax(0,1fr)!important;gap:6px!important;padding:7px!important}
+  .request-wizard-v36 .request-availability-icon{width:30px!important;height:30px!important}
+  .request-wizard-v36 .request-availability-icon .kh-subject-art{width:26px!important;height:26px!important}
+  .request-wizard-v36 .request-availability-card b{font-size:.65rem!important}.request-wizard-v36 .request-availability-card small{font-size:.53rem!important}
+  .pictogram-picker{grid-template-columns:repeat(5,minmax(0,1fr))}
+}
+
+@media(max-width:340px){
+  .request-wizard-v36 .request-wizard-head b{font-size:.49rem!important}
+  .request-wizard-v36 .category-availability-grid,.request-wizard-v36 .service-availability-grid{grid-template-columns:1fr 1fr!important}
+  .report-command-bar .row-actions{grid-template-columns:1fr}.report-command-bar .pill-btn{min-height:40px}
+}
+
+@media(prefers-reduced-motion:reduce){.pictogram-option{transition:none}.request-modal-v36>.modal-body{scroll-behavior:auto}}

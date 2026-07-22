@@ -1,8 +1,10 @@
 import json
+import io
 import os
 import sys
 import urllib.error
 import urllib.request
+import zipfile
 
 
 BASE_URL = os.environ.get("KHADAMATI_TEST_URL", "http://127.0.0.1:8080").rstrip("/")
@@ -33,6 +35,15 @@ def request(path, payload=None, token=""):
         return error.code, json.loads(raw or "{}")
 
 
+def raw_request(path, token=""):
+    headers = {"Origin": "http://127.0.0.1:8080"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    req = urllib.request.Request(f"{BASE_URL}{path}", headers=headers, method="GET")
+    with urllib.request.urlopen(req, timeout=20) as response:
+        return response.status, dict(response.headers.items()), response.read()
+
+
 def expect(status, data, expected, message):
     assert status in expected, f"{message}: HTTP {status} {data}"
     return data
@@ -53,6 +64,22 @@ def main():
     status, admin = request("/api/admin/login", {"code": ADMIN_CODE})
     expect(status, admin, {200}, "Admin login failed")
     admin_token = admin["token"]
+
+    status, headers, report_csv = raw_request("/api/reports/summary.csv?lang=ar", admin_token)
+    assert status == 200 and report_csv.startswith(b"\xef\xbb\xbf"), "Arabic CSV report is not UTF-8 BOM encoded"
+    decoded_report = report_csv.decode("utf-8-sig")
+    assert "التشغيل" in decoded_report and "الاشتراكات" in decoded_report and "المال" in decoded_report, "Arabic CSV report is incomplete"
+    assert "text/csv" in headers.get("Content-Type", ""), "CSV report content type is incorrect"
+
+    status, headers, report_docx = raw_request("/api/reports/summary.docx?lang=en", admin_token)
+    assert status == 200 and report_docx.startswith(b"PK"), "Word report is not a valid DOCX package"
+    with zipfile.ZipFile(io.BytesIO(report_docx)) as archive:
+        document_xml = archive.read("word/document.xml").decode("utf-8")
+    assert "Khadamati operational report" in document_xml and "Provider performance" in document_xml, "English Word report is incomplete"
+
+    status, headers, report_html = raw_request("/api/reports/summary.print?lang=en", admin_token)
+    decoded_html = report_html.decode("utf-8")
+    assert status == 200 and 'dir="ltr"' in decoded_html and "Print or save PDF" in decoded_html, "English print report is not LTR or readable"
 
     provider_phone = "96895550991"
     provider_pin = "7319"
