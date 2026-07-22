@@ -60,6 +60,16 @@ async function clickFirstAction(page, action) {
   else await item.evaluate(element => element.click());
 }
 
+async function clickAdminTab(page, tab) {
+  const direct = page.locator(`.side-nav [data-action="adminTab"][data-tab="${tab}"]`).first();
+  if (await direct.isVisible()) {
+    await direct.click();
+    return;
+  }
+  await page.locator('[data-action="openAdminTools"]').click();
+  await page.locator(`[data-action="adminToolTab"][data-tab="${tab}"]`).click();
+}
+
 (async () => {
   const testUrl = BASE_URL || await startStaticServer();
   const browser = await chromium.launch({
@@ -192,7 +202,7 @@ async function clickFirstAction(page, action) {
   });
   assert(['auto', 'scroll'].includes(railMetrics.overflow), 'Services categories are not horizontally scrollable.');
   assert(railMetrics.scrollWidth > railMetrics.clientWidth, 'Services rail should overflow instead of shrinking every category.');
-  assert(Math.abs(railMetrics.after - railMetrics.before) > 20, 'Services category rail did not respond to horizontal scrolling.');
+  assert(Math.abs(railMetrics.after - railMetrics.before) > 20, `Services category rail did not respond to horizontal scrolling: ${JSON.stringify(railMetrics)}`);
   assert(/pan-x|auto/.test(railMetrics.touchAction), 'Services rail does not allow a horizontal touch gesture.');
   assert(railMetrics.chipsFit, 'A services category label is clipped or its chip is being compressed.');
   await page.locator('[data-action="servicesCategory"][data-cat="cleaning"]').click();
@@ -583,7 +593,7 @@ async function clickFirstAction(page, action) {
   await page.locator('#adminCode').fill('0000');
   await page.locator('[data-action="adminLogin"]').click();
   await page.waitForSelector('.admin-shell');
-  await page.locator('.side-nav [data-action="adminTab"][data-tab="subscriptions"]').click();
+  await clickAdminTab(page, 'subscriptions');
   assert(await page.locator('.subscription-command').count(), 'Subscription control center is missing.');
   assert(await page.locator('.package-admin-grid .package-admin-card').count() === 5, 'The production plan catalog must contain exactly five plans.');
   await page.locator('.package-admin-grid [data-action="packageForm"]').first().click();
@@ -592,20 +602,20 @@ async function clickFirstAction(page, action) {
   assert(await page.locator('#pkgMonthlyResponses').count(), 'Plan monthly-response entitlement is missing.');
   assert(await page.locator('#pkgSharedInbox').count(), 'Plan shared-inbox entitlement is missing.');
   await page.locator('[data-action="closeModal"]').click();
-  await page.locator('.side-nav [data-action="adminTab"][data-tab="finance"]').click();
+  await clickAdminTab(page, 'finance');
   assert(await page.locator('.finance-command-grid').count(), 'Financial control center is missing.');
-  await page.locator('.side-nav [data-action="adminTab"][data-tab="assistant"]').click();
+  await clickAdminTab(page, 'assistant');
   assert(await page.locator('.subscription-command h2').filter({ hasText: /ساحة الطلبات|Request marketplace/i }).count(), 'The obsolete assistant health page was not replaced by the request marketplace.');
   assert(await page.locator('[data-action="openAssistant"]').count() === 0, 'The obsolete assistant test control is still visible in administration.');
-  await page.locator('.side-nav [data-action="adminTab"][data-tab="settings"]').click();
+  await clickAdminTab(page, 'settings');
   assert(await page.locator('.operations-settings').count(), 'Platform operations settings are missing.');
-  await page.locator('[data-action="adminTab"][data-tab="ads"]').click();
+  await clickAdminTab(page, 'ads');
   await page.locator('#adImages').setInputFiles(path.join(__dirname, '..', 'app-icon-512.png'));
   await page.locator('[data-action="previewAdDraft"]').click();
   await page.waitForSelector('.ad-preview-device');
   assert(await page.locator('.ad-preview-device').count() === 2, 'Phone and desktop ad previews are missing.');
   await page.locator('[data-action="closeModal"]').click();
-  await page.locator('[data-action="adminTab"][data-tab="quality"]').click();
+  await clickAdminTab(page, 'quality');
   assert(await page.locator('.system-health').count(), 'System health monitoring panel is missing.');
   await capture(page, '03-admin-quality');
 
