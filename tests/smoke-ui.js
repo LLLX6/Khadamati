@@ -107,6 +107,11 @@ async function clickAdminTab(page, tab) {
       return json({ token: 'ui-provider-token', provider: { id: 'p1', name: 'سالم البلوشي', phone: '96891234567', gov: 'مسقط', wilayah: 'السيب', areas: ['السيب'], bio: 'كهربائي منازل بخبرة وعناية', hours: 'الأحد - الخميس: 8:00 ص - 8:00 م', status: 'available', active: true, verified: true, featured: true, mapVisible: true, location: { lat: 23.61, lng: 58.24, updatedAt: '2026-07-18T08:00:00Z' }, packageId: 'professional_12m', subscriptionState: 'active', services: [{ id: 'p1s1', catId: 'homecare', serviceId: 'electrician', priceFrom: 8, active: true, areas: ['السيب'] }], workImages: ['app-icon-512.png', 'app-icon-192.png'], documents: [], rating: 4.9, reviews: 12, qualityScore: 94, pinConfigured: true } });
     }
     if (url.pathname === '/api/provider/profile') return json({});
+    if (url.pathname === '/api/provider/quote-templates') {
+      const payload = route.request().postDataJSON();
+      return json({ ok: true, templates: payload.templates || [] });
+    }
+    if (url.pathname === '/api/provider/support') return json({ ok: true, notificationId: 'ui-provider-support' });
     if (url.pathname === '/api/admin/login') return json({ token: 'ui-admin-token', user: { id: 'ui-admin', name: 'إدارة خدماتي', role: 'super_admin' } });
     if (url.pathname === '/api/bootstrap' || url.pathname === '/api/admin/session') return json({});
     if (url.pathname === '/api/push/public-key') return json({ publicKey: '' });
@@ -479,8 +484,17 @@ async function clickAdminTab(page, tab) {
   await page.locator('.provider-top-actions [data-action="toggleLang"]').click();
   await page.waitForTimeout(100);
   assert(await page.locator('html').getAttribute('dir') === 'rtl', 'Provider Arabic mode was not restored to RTL.');
-  await page.locator('[data-action="openQuoteLibrary"]').first().click();
+  await clickFirstAction(page, 'openQuoteLibrary');
   assert(await page.locator('.modal-title').filter({ hasText: /عرض السعر|price and duration/i }).count(), 'Quote template sheet did not open.');
+  await page.locator('[data-action="closeModal"]').click();
+  await clickFirstAction(page, 'manageQuoteTemplates');
+  assert(await page.locator('.quote-manager-list article').count() >= 1, 'Editable provider quote templates are missing.');
+  await page.locator('[data-action="editQuoteTemplate"]').first().click();
+  await page.locator('#quoteEditAr').fill('عرض فحص مخصص');
+  await page.locator('#quoteEditEn').fill('Custom inspection offer');
+  await page.locator('[data-action="saveQuoteTemplate"]').click();
+  await page.waitForFunction(() => document.querySelector('.quote-manager-list')?.textContent?.includes('عرض فحص مخصص'));
+  assert(await page.locator('.quote-manager-list').getByText('عرض فحص مخصص').count(), 'Provider quote template edit was not retained.');
   await page.locator('[data-action="closeModal"]').click();
 
   await page.locator('.side-nav [data-action="providerTab"][data-tab="leads"]').click();
@@ -511,18 +525,20 @@ async function clickAdminTab(page, tab) {
   await capture(page, '04-offer-comparison');
   await page.locator('[data-action="acceptRequestOffer"]').first().click();
 
-  await page.waitForSelector('#contactAllowChat');
-  assert(!(await page.locator('#contactAllowChat').isChecked()), 'Chat consent must start disabled.');
-  assert(!(await page.locator('#contactAllowWhatsapp').isChecked()), 'WhatsApp consent must start disabled.');
-  assert(!(await page.locator('#contactAllowCall').isChecked()), 'Call consent must start disabled.');
+  await page.waitForSelector('.chat-sheet #chatThread');
+  assert(await page.locator('.chat-profile-identity b').filter({ hasText: /سالم البلوشي/i }).count(), 'Accepted offer did not open the selected provider chat.');
+  assert(await page.locator('.chat-message.theirs').filter({ hasText: /شكراً لاختيار عرضي|Thank you for choosing my offer/i }).count(), 'Automatic provider welcome message is missing.');
   await page.locator('[data-action="closeModal"]').click();
 
   await page.locator('.requests-disclosure').first().locator('summary').click();
+  assert(await page.locator('.request-offer-summary').count() === 0, 'Offer comparison remained visible after selecting a provider.');
+  assert(await page.locator('[data-action="compareRequestOffers"]').count() === 0, 'Compare action remained available after offer selection.');
   assert(await page.locator('[data-action="manageRequestContact"]').count(), 'Contact privacy control is missing after provider selection.');
+  assert(await page.locator('[data-action="openRequestChat"]').count(), 'In-app chat did not remain available after provider selection.');
   assert(await page.locator('[data-action="requestWhatsapp"]').count() === 0, 'WhatsApp must stay hidden before customer consent.');
   assert(await page.locator('[data-action="requestCall"]').count() === 0, 'Phone calls must stay hidden before customer consent.');
   await page.locator('[data-action="manageRequestContact"]').first().click();
-  await page.locator('#contactAllowChat').check();
+  assert(await page.locator('#contactAllowChat').isChecked(), 'In-app chat consent was not enabled by offer selection.');
   await page.locator('#contactAllowWhatsapp').check();
   await page.locator('#contactAllowCall').check();
   await page.locator('[data-action="saveRequestContactConsent"]').click();
@@ -579,6 +595,11 @@ async function clickAdminTab(page, tab) {
   await page.locator('[data-action="closeModal"]').click();
   assert(await page.evaluate(() => !window.__khadamatiChatPoll), 'Chat automatic refresh continued after closing the conversation.');
 
+  await page.locator('[data-action="startCustomerRequest"]').first().click();
+  await page.waitForSelector('[data-action="completeCustomerRequest"]');
+  assert(await page.locator('[data-request-card]').count(), 'Starting work removed the user from active requests.');
+  assert(await page.locator('[data-action="completeCustomerRequest"]').count(), 'Request did not move to in-progress after work started.');
+
   const downloadPromise = page.waitForEvent('download');
   await page.locator('[data-action="addRequestCalendar"]').first().click();
   const calendarDownload = await downloadPromise;
@@ -594,10 +615,11 @@ async function clickAdminTab(page, tab) {
   await providerChatNotice.locator('xpath=ancestor::details').locator('summary').click();
   await providerChatNotice.click();
   await page.waitForSelector('.chat-sheet #chatThread');
-  assert(await page.locator('.chat-sheet .modal-title').filter({ hasText: /مستخدم الاختبار|الخدمة|صيانة/i }).count(), 'Provider notification did not open the correct chat directly.');
+  assert(await page.locator('.chat-profile-identity b').filter({ hasText: /مستخدم الاختبار/i }).count(), 'Provider notification did not open the correct chat directly.');
   await page.locator('[data-action="closeModal"]').click();
-  await page.locator('.side-nav [data-action="providerTab"][data-tab="leads"]').click();
-  await page.locator('[data-action="providerLeadFilter"][data-value="mine"]').click();
+  await page.locator('.side-nav [data-action="providerTab"][data-tab="tasks"]').click();
+  assert(await page.locator('.provider-active-jobs .provider-task-card').count(), 'Accepted request is missing from provider active jobs.');
+  assert(await page.locator('.provider-active-jobs [data-action="providerAcceptRequest"]').count() === 0, 'Provider can still submit an offer after being selected.');
   await page.locator('[data-action="openRequestChat"]').first().click();
   assert(await page.locator('[data-action="providerCustomerWhatsapp"]').count(), 'Selected provider cannot use customer-approved WhatsApp.');
   assert(await page.locator('[data-action="providerCustomerCall"]').count(), 'Selected provider cannot use customer-approved calls.');
@@ -631,7 +653,7 @@ async function clickAdminTab(page, tab) {
   await userChatNotice.locator('xpath=ancestor::details').locator('summary').click();
   await userChatNotice.click();
   await page.waitForSelector('.chat-sheet #chatThread');
-  assert(await page.locator('.chat-sheet .modal-title').filter({ hasText: /سالم البلوشي/i }).count(), 'User notification did not open the correct chat directly.');
+  assert(await page.locator('.chat-profile-identity b').filter({ hasText: /سالم البلوشي/i }).count(), 'User notification did not open the correct chat directly.');
   await page.locator('[data-action="closeModal"]').click();
   await clickUserNav(page, 'search');
   await page.waitForTimeout(600);
@@ -695,11 +717,12 @@ async function clickAdminTab(page, tab) {
     return box.left >= parent.left - 1 && box.right <= parent.right + 1 && box.width > 0;
   });
   assert(adminNotificationActionsFit, 'Expanded administration notification actions are clipped or hidden.');
-  const adminDeleteAction = await firstAdminNotification.locator('.notification-actions .danger').evaluate(element => {
+  const adminDeleteAction = await firstAdminNotification.locator('.notification-delete-action').evaluate(element => {
     const style = getComputedStyle(element);
-    return { text: element.textContent.trim(), color: style.color, background: style.backgroundColor };
+    const box = element.getBoundingClientRect();
+    return { visible: box.width >= 32 && box.height >= 32 && style.display !== 'none' && style.visibility !== 'hidden', icon: Boolean(element.querySelector('svg')) };
   });
-  assert(adminDeleteAction.text === '×' && adminDeleteAction.color !== adminDeleteAction.background, 'Administration notification delete action is visually blank.');
+  assert(adminDeleteAction.visible && adminDeleteAction.icon, 'Administration notification delete action is visually blank.');
   await capture(page, '03a-admin-notifications');
   await clickAdminTab(page, 'subscriptions');
   assert(await page.locator('.subscription-command').count(), 'Subscription control center is missing.');

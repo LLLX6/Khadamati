@@ -1,0 +1,217 @@
+/* Khadamati v60: accepted-job lifecycle, compact chat, editable quotes, and visible controls. */
+.notification-delete-action{
+  width:34px;
+  height:34px;
+  min-width:34px;
+  display:inline-grid;
+  place-items:center;
+  border:1px solid color-mix(in srgb,#c9474f 22%,var(--line));
+  border-radius:10px;
+  background:color-mix(in srgb,#c9474f 7%,var(--panel));
+  color:#b4232d;
+  cursor:pointer;
+}
+.notification-delete-action svg{width:17px;height:17px;stroke:currentColor}
+.notification-actions{align-items:center;flex-wrap:wrap}
+
+.chat-sheet{overflow:hidden}
+.chat-profile-head{
+  min-height:64px;
+  padding:9px 12px;
+  display:grid;
+  grid-template-columns:40px minmax(0,1fr) 40px;
+  align-items:center;
+  gap:9px;
+}
+.chat-profile-identity{
+  min-width:0;
+  display:grid;
+  grid-template-columns:38px minmax(0,1fr);
+  align-items:center;
+  gap:9px;
+}
+.chat-profile-identity .avatar,
+.chat-partner-avatar{
+  width:38px;
+  height:38px;
+  border-radius:12px;
+  display:grid;
+  place-items:center;
+  overflow:hidden;
+  background:color-mix(in srgb,var(--brand2) 9%,var(--panel));
+  color:var(--brand2);
+}
+.chat-profile-identity .avatar img{width:100%;height:100%;object-fit:cover}
+.chat-profile-identity>div{min-width:0;display:grid;gap:2px}
+.chat-profile-identity b,
+.chat-profile-identity small{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.chat-profile-identity b{font-size:.86rem}
+.chat-profile-identity small{font-size:.64rem;color:var(--muted)}
+.chat-back,.chat-header-action{
+  width:40px;
+  height:40px;
+  min-width:40px;
+  border:1px solid var(--line);
+  border-radius:12px;
+  background:var(--panel);
+  color:var(--ink);
+  display:grid;
+  place-items:center;
+  cursor:pointer;
+}
+.chat-header-action svg{width:19px}
+.chat-request-head{
+  padding:8px 13px;
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  gap:8px;
+}
+.chat-request-head b,.chat-request-head small{font-size:.68rem}
+.chat-sheet .chat-thread{min-height:280px;max-height:calc(100dvh - 310px);padding:12px}
+.chat-sheet .chat-composer{
+  grid-template-columns:40px minmax(0,1fr) 40px 44px;
+  gap:6px;
+  padding:8px max(8px,env(safe-area-inset-right)) calc(8px + env(safe-area-inset-bottom,0px)) max(8px,env(safe-area-inset-left));
+}
+.chat-sheet .chat-icon-btn{width:40px;height:40px;border-radius:12px}
+.chat-sheet .chat-composer textarea{min-height:40px;padding-block:9px;border-radius:18px}
+.chat-sheet .chat-composer>.pill-btn{width:44px;height:40px;min-height:40px;padding:0;border-radius:13px}
+.chat-record-state{
+  grid-column:2/4;
+  min-height:0;
+  display:flex;
+  align-items:center;
+  gap:6px;
+}
+.chat-record-state:has(.voice-ready:empty) .voice-ready{display:none}
+.chat-quick-replies{scrollbar-width:none}
+.chat-quick-replies::-webkit-scrollbar{display:none}
+
+.offer-template-shortcuts{
+  display:grid;
+  grid-template-columns:repeat(3,minmax(0,1fr));
+  gap:8px;
+  margin-top:12px;
+}
+.offer-template-shortcuts button{
+  min-width:0;
+  min-height:68px;
+  display:grid;
+  align-content:center;
+  gap:3px;
+  padding:9px;
+  border:1px solid var(--line);
+  border-radius:13px;
+  background:var(--panel2);
+  color:var(--ink);
+  text-align:start;
+  font:inherit;
+  cursor:pointer;
+}
+.offer-template-shortcuts button.active{
+  border-color:var(--accent);
+  background:color-mix(in srgb,var(--accent) 9%,var(--panel));
+  box-shadow:0 0 0 2px color-mix(in srgb,var(--accent) 10%,transparent);
+}
+.offer-template-shortcuts b,
+.offer-template-shortcuts small{overflow:hidden;text-overflow:ellipsis}
+.offer-template-shortcuts b{font-size:.72rem;white-space:nowrap}
+.offer-template-shortcuts small{font-size:.62rem;color:var(--muted)}
+.quote-manager-list{display:grid;gap:8px;margin-top:12px}
+.quote-manager-list article{
+  min-width:0;
+  display:grid;
+  grid-template-columns:minmax(0,1fr) auto;
+  gap:8px;
+  align-items:center;
+  padding:10px;
+  border:1px solid var(--line);
+  border-radius:13px;
+  background:var(--panel);
+}
+.quote-manager-list article>div:first-child{min-width:0;display:grid;gap:3px}
+.quote-manager-list b,.quote-manager-list small{overflow:hidden;text-overflow:ellipsis}
+.quote-manager-list b{font-size:.78rem;white-space:nowrap}
+.quote-manager-list small{font-size:.65rem;color:var(--muted)}
+
+.provider-active-jobs{display:grid;gap:12px}
+.provider-task-summary{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}
+.provider-task-summary>div{
+  padding:11px;
+  border:1px solid var(--line);
+  border-radius:13px;
+  background:linear-gradient(145deg,var(--panel),color-mix(in srgb,var(--accent) 5%,var(--panel)));
+  display:grid;
+  gap:3px;
+}
+.provider-task-summary small{font-size:.67rem;color:var(--muted)}
+.provider-task-summary b{font-size:1.2rem;color:var(--brand2)}
+.provider-task-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}
+.provider-task-card{
+  min-width:0;
+  display:grid;
+  gap:10px;
+  padding:12px;
+  border:1px solid var(--line);
+  border-inline-start:4px solid var(--brand2);
+  border-radius:15px;
+  background:var(--panel);
+  box-shadow:0 7px 22px rgba(7,26,43,.055);
+}
+.provider-task-card.working{border-inline-start-color:var(--accent)}
+.provider-task-head{
+  display:grid;
+  grid-template-columns:40px minmax(0,1fr) auto;
+  gap:9px;
+  align-items:center;
+}
+.provider-task-head>span:first-child{
+  width:40px;
+  height:40px;
+  display:grid;
+  place-items:center;
+  border-radius:11px;
+  background:color-mix(in srgb,var(--brand2) 9%,var(--panel));
+  color:var(--brand2);
+}
+.provider-task-head>div{min-width:0}
+.provider-task-head h3{margin:2px 0;font-size:.86rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.provider-task-head small{font-size:.63rem;color:var(--muted)}
+.provider-task-customer{
+  display:grid;
+  grid-template-columns:28px minmax(0,1fr);
+  align-items:center;
+  gap:7px;
+  padding:8px;
+  border-radius:11px;
+  background:var(--panel2);
+}
+.provider-task-customer>svg{width:19px;color:var(--brand2)}
+.provider-task-customer>div{min-width:0;display:grid}
+.provider-task-customer b,.provider-task-customer small{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.provider-task-customer b{font-size:.72rem}
+.provider-task-customer small{font-size:.61rem;color:var(--muted)}
+.provider-task-actions{display:flex;gap:6px;align-items:center;flex-wrap:wrap}
+.provider-task-actions .pill-btn{flex:1 1 150px}
+.provider-task-actions .ghost-btn{flex:0 1 auto}
+
+@media(max-width:700px){
+  .provider-task-grid{grid-template-columns:1fr}
+}
+@media(max-width:420px){
+  .offer-template-shortcuts{grid-template-columns:repeat(3,minmax(0,1fr));gap:6px}
+  .offer-template-shortcuts button{min-height:60px;padding:7px}
+  .offer-template-shortcuts b{font-size:.66rem}
+  .chat-profile-head{min-height:58px;padding:7px 9px;grid-template-columns:36px minmax(0,1fr) 36px}
+  .chat-back,.chat-header-action{width:36px;height:36px;min-width:36px}
+  .chat-profile-identity{grid-template-columns:34px minmax(0,1fr);gap:7px}
+  .chat-profile-identity .avatar,.chat-partner-avatar{width:34px;height:34px;border-radius:10px}
+  .chat-sheet .chat-thread{max-height:calc(100dvh - 284px)}
+  .provider-task-actions .ghost-btn{flex:1 1 auto}
+}
+@media(max-width:340px){
+  .offer-template-shortcuts{grid-template-columns:1fr}
+  .offer-template-shortcuts button{min-height:48px}
+  .quote-manager-list article{grid-template-columns:1fr}
+}

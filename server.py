@@ -135,8 +135,12 @@ CHAT_MIMES = {
     **IMAGE_MIMES,
     "audio/webm": "webm",
     "audio/mp4": "m4a",
+    "audio/x-m4a": "m4a",
+    "audio/aac": "aac",
     "audio/mpeg": "mp3",
     "audio/ogg": "ogg",
+    "audio/wav": "wav",
+    "audio/x-wav": "wav",
 }
 VIDEO_MIMES = {"video/mp4": "mp4", "video/webm": "webm", "video/quicktime": "mov"}
 
@@ -862,6 +866,7 @@ def init_db():
         ensure_column(con, "providers", "availability", "TEXT DEFAULT '{}'")
         ensure_column(con, "providers", "response_minutes", "INTEGER NOT NULL DEFAULT 30")
         ensure_column(con, "providers", "completed_jobs", "INTEGER NOT NULL DEFAULT 0")
+        ensure_column(con, "providers", "quote_templates", "TEXT DEFAULT '[]'")
         ensure_column(con, "providers", "updated_at", "TEXT DEFAULT ''")
         ensure_column(con, "app_users", "location_updated_at", "TEXT DEFAULT ''")
         ensure_column(con, "app_users", "updated_at", "TEXT DEFAULT ''")
@@ -1120,12 +1125,16 @@ def upload_signature_matches(mime, blob):
         return blob.startswith(b"%PDF-")
     if mime in {"audio/webm", "video/webm"}:
         return blob.startswith(b"\x1aE\xdf\xa3")
-    if mime in {"audio/mp4", "video/mp4", "video/quicktime"}:
+    if mime in {"audio/mp4", "audio/x-m4a", "video/mp4", "video/quicktime"}:
         return len(blob) >= 12 and blob[4:8] == b"ftyp"
+    if mime == "audio/aac":
+        return len(blob) > 1 and blob[0] == 0xFF and blob[1] & 0xF0 == 0xF0
     if mime == "audio/mpeg":
         return blob.startswith(b"ID3") or (len(blob) > 1 and blob[0] == 0xFF and blob[1] & 0xE0 == 0xE0)
     if mime == "audio/ogg":
         return blob.startswith(b"OggS")
+    if mime in {"audio/wav", "audio/x-wav"}:
+        return len(blob) >= 12 and blob[:4] == b"RIFF" and blob[8:12] == b"WAVE"
     return False
 
 
@@ -1164,6 +1173,9 @@ def row_provider(r, private=False, sign_private=False):
     d["availability"] = jload(d.pop("availability", "{}"), {})
     d["responseMinutes"] = int(d.pop("response_minutes", 30) or 30)
     d["completedJobs"] = int(d.pop("completed_jobs", 0) or 0)
+    quote_templates = jload(d.pop("quote_templates", "[]"), [])
+    if private:
+        d["quoteTemplates"] = quote_templates if isinstance(quote_templates, list) else []
     d["packageId"] = d.pop("package_id", "")
     d["adminNote"] = d.pop("admin_note", "")
     d["imagePath"] = d.pop("image_path", "")
@@ -2579,7 +2591,8 @@ def save_upload_data(owner_id, data_url, slot, allowed_mimes, max_bytes):
     if not data_url.startswith("data:") or ";base64," not in data_url:
         raise ValueError("invalid_upload")
     head, raw = data_url.split(";base64,", 1)
-    mime = head.replace("data:", "")
+    # Safari may include codec parameters in MediaRecorder data URLs.
+    mime = head.replace("data:", "").split(";", 1)[0].strip().lower()
     ext = allowed_mimes.get(mime)
     if not ext:
         raise ValueError("unsupported_upload_type")
@@ -4205,7 +4218,8 @@ class Handler(SimpleHTTPRequestHandler):
         request_id = str(data.get("id", "") or "")
         action = str(data.get("action", "") or "")
         if not request_id or action not in (
-            "offer", "choose_offer", "contact_consent", "message", "arrival", "waitlist"
+            "offer", "choose_offer", "contact_consent", "message", "arrival",
+            "waitlist", "start_work"
         ):
             return self.send_json({"error": "invalid_request_action"}, 400)
         with db() as con:
@@ -4277,16 +4291,50 @@ class Handler(SimpleHTTPRequestHandler):
                 if not selected:
                     return self.send_json({"error": "offer_not_found"}, 404)
                 selected_provider = selected.get("providerId", "")
-                chat_granted = bool(data.get("chat", False))
+                # In-app chat opens after the customer deliberately selects an offer.
+                # Phone and WhatsApp remain separately consent-gated.
+                chat_granted = True
                 for offer in offers:
                     offer["status"] = "accepted" if offer.get("id") == offer_id else "declined"
+                provider_row = con.execute(
+                    "SELECT name FROM providers WHERE id=?", (selected_provider,)
+                ).fetchone()
+                provider_name = provider_row["name"] if provider_row else "مزود الخدمة"
+                service_name = item["serviceName"] or item["serviceValue"] or "الخدمة"
+                customer_name = item.get("customerName") or "عميل خدماتي"
+                if str(data.get("language", "ar")).lower() == "en":
+                    welcome_text = (
+                        f"Hello {customer_name}, this is {provider_name}. "
+                        f"Thank you for choosing my offer for {service_name}. "
+                        "We can confirm the details and appointment here."
+                    )
+                else:
+                    welcome_text = (
+                        f"مرحباً {customer_name}، معك {provider_name}. "
+                        f"شكراً لاختيار عرضي لخدمة {service_name}. "
+                        "يمكننا الآن تأكيد التفاصيل والموعد هنا."
+                    )
+                messages = list(item.get("messages") or [])
+                welcome_message = {
+                    "id": slug("msg"),
+                    "sender": "provider",
+                    "senderId": selected_provider,
+                    "text": welcome_text,
+                    "image": "",
+                    "audio": "",
+                    "location": None,
+                    "systemGenerated": True,
+                    "createdAt": datetime.now(UTC).isoformat(),
+                }
+                messages.append(welcome_message)
                 con.execute(
                     """UPDATE customer_requests SET offers=?,accepted_provider_id=?,
-                    status='accepted',offers_open=0,waitlisted=0,contact_consent=?,
+                    status='accepted',offers_open=0,waitlisted=0,contact_consent=?,messages=?,
                     updated_at=CURRENT_TIMESTAMP WHERE id=?""",
                     (
                         jdump(offers), selected_provider,
                         jdump({"chat": chat_granted, "whatsapp": False, "call": False}),
+                        jdump(messages[-120:]),
                         request_id,
                     ),
                 )
@@ -4306,17 +4354,51 @@ class Handler(SimpleHTTPRequestHandler):
                     ELSE accepted_at END,updated_at=CURRENT_TIMESTAMP WHERE request_id=?""",
                     (selected_provider, selected_provider, request_id),
                 )
+                con.execute(
+                    "DELETE FROM app_notifications WHERE related_id=? AND target_kind='provider' AND type='request'",
+                    (request_id,),
+                )
+                con.execute(
+                    "DELETE FROM app_notifications WHERE related_id=? AND target_kind='user' AND target_id=? AND type='request'",
+                    (request_id, item["userId"]),
+                )
                 create_notification(
                     con, "provider", selected_provider, "اختار العميل عرضك",
                     f"تم اختيار عرضك لخدمة {item['serviceName'] or item['serviceValue']}.",
                     type_="request", related_id=request_id, priority="high",
-                    action_text="فتح الطلب", action_route=f"provider:request:{request_id}",
+                    action_text="فتح المهمة", action_route=f"provider:tasks:{request_id}",
+                )
+                create_notification(
+                    con, "user", item["userId"], f"رسالة جديدة من {provider_name}",
+                    f"{service_name} • {welcome_text[:105]}",
+                    type_="chat", related_id=request_id, priority="high",
+                    action_text="فتح المحادثة", action_route=f"user:chat:{request_id}",
                 )
                 create_notification(
                     con, "admin", "", "تم اختيار عرض",
                     f"{request_id} - المزود {selected_provider}",
                     type_="request", related_id=request_id,
                     action_text="فتح الطلب", action_route=f"admin:request:{request_id}",
+                )
+
+            elif action == "start_work":
+                if not is_user or not item["acceptedProviderId"]:
+                    return self.send_json({"error": "start_work_not_allowed"}, 403)
+                if item["status"] not in ("accepted", "inProgress"):
+                    return self.send_json({"error": "request_stage_not_allowed"}, 409)
+                con.execute(
+                    "UPDATE customer_requests SET status='inProgress',updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                    (request_id,),
+                )
+                con.execute(
+                    "UPDATE app_notifications SET is_read=1 WHERE related_id=? AND type='request'",
+                    (request_id,),
+                )
+                create_notification(
+                    con, "provider", item["acceptedProviderId"], "بدأ تنفيذ الطلب",
+                    f"أكد العميل بدء تنفيذ {item['serviceName'] or item['serviceValue']}.",
+                    type_="request", related_id=request_id, priority="high",
+                    action_text="فتح المهمة", action_route=f"provider:tasks:{request_id}",
                 )
 
             elif action == "contact_consent":
@@ -4743,6 +4825,8 @@ class Handler(SimpleHTTPRequestHandler):
             "/api/provider/media": "media",
             "/api/provider/documents": "documents",
             "/api/provider/pin": "profile",
+            "/api/provider/quote-templates": "profile",
+            "/api/provider/support": "requests",
             "/api/provider/subscription-request": "subscription",
             "/api/provider/payment-intent": "subscription",
             "/api/provider/team": "team",
@@ -4756,6 +4840,48 @@ class Handler(SimpleHTTPRequestHandler):
             if not row:
                 return self.send_json({"error": "not_found"}, 404)
             provider = row_provider(row, private=True)
+            if path == "/api/provider/quote-templates":
+                raw_templates = data.get("templates")
+                if not isinstance(raw_templates, list) or not 1 <= len(raw_templates) <= 10:
+                    return self.send_json({"error": "invalid_quote_templates"}, 400)
+                templates = []
+                for raw in raw_templates:
+                    if not isinstance(raw, dict):
+                        return self.send_json({"error": "invalid_quote_template"}, 400)
+                    title_ar = safe_text(raw.get("ar"), 120)
+                    title_en = safe_text(raw.get("en"), 120)
+                    if not title_ar or not title_en:
+                        return self.send_json({"error": "quote_template_title_required"}, 400)
+                    try:
+                        price = finite_number(raw.get("price", 0) or 0, minimum=0, maximum=1_000_000)
+                    except DomainError:
+                        return self.send_json({"error": "invalid_offer_price"}, 400)
+                    templates.append({
+                        "id": safe_text(raw.get("id"), 80) or slug("quote"),
+                        "ar": title_ar,
+                        "en": title_en,
+                        "durationAr": safe_text(raw.get("durationAr"), 100),
+                        "durationEn": safe_text(raw.get("durationEn"), 100),
+                        "price": price,
+                    })
+                con.execute(
+                    "UPDATE providers SET quote_templates=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                    (jdump(templates), provider["id"]),
+                )
+                log_audit(con, session, "provider.quote_templates.updated", provider["id"], str(len(templates)))
+                return self.send_json({"ok": True, "templates": templates})
+            if path == "/api/provider/support":
+                note = safe_text(data.get("note"), 1200)
+                if len(note) < 3:
+                    return self.send_json({"error": "support_note_required"}, 400)
+                notification_id = create_notification(
+                    con, "admin", "", "رسالة دعم من مزود",
+                    f"{provider['name']}: {note}", type_="provider",
+                    related_id=provider["id"], priority="high",
+                    action_text="فتح المزود", action_route=f"admin:provider:{provider['id']}",
+                )
+                log_audit(con, session, "provider.support.sent", provider["id"], notification_id)
+                return self.send_json({"ok": True, "notificationId": notification_id}, 201)
             if path == "/api/provider/profile":
                 entitlements = EntitlementService(con).profile_limits(
                     provider["id"], preserve_existing=True

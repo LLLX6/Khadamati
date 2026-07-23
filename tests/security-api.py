@@ -316,7 +316,8 @@ def run():
                 assert error.code == 413, f"oversized body returned HTTP {error.code}"
 
             sw = (ROOT / "service-worker.js").read_text(encoding="utf-8")
-            assert "khadamati-app-shell-v59-final-session-delivery" in sw
+            assert "khadamati-app-shell-v60-request-lifecycle" in sw
+            assert "./assets/styles/khadamati-v60.css" in sw
             assert "api|media|uploads" in sw and "cache: 'no-store'" in sw
 
             return {

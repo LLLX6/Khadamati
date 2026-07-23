@@ -2,6 +2,7 @@ import json
 import io
 import os
 import sys
+import base64
 import urllib.error
 import urllib.request
 import zipfile
@@ -14,6 +15,20 @@ TEST_PNG = (
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9W"
     "lqAAAAAASUVORK5CYII="
 )
+TEST_WAV = "data:audio/wav;codecs=1;base64," + base64.b64encode(
+    b"RIFF"
+    + (36).to_bytes(4, "little")
+    + b"WAVEfmt "
+    + (16).to_bytes(4, "little")
+    + (1).to_bytes(2, "little")
+    + (1).to_bytes(2, "little")
+    + (8000).to_bytes(4, "little")
+    + (16000).to_bytes(4, "little")
+    + (2).to_bytes(2, "little")
+    + (16).to_bytes(2, "little")
+    + b"data"
+    + (0).to_bytes(4, "little")
+).decode("ascii")
 
 
 def request(path, payload=None, token=""):
@@ -499,6 +514,43 @@ def main():
     assigned = next(item for item in provider_state["customerRequests"] if item["id"] == request_id)
     assert not assigned.get("phone"), "Customer phone leaked before contact consent"
 
+    templates_payload = [
+        {
+            "id": "inspection",
+            "ar": "فحص وتنفيذ",
+            "en": "Inspection and service",
+            "durationAr": "خلال ساعتين",
+            "durationEn": "Within two hours",
+            "price": 12,
+        },
+        {
+            "id": "scheduled",
+            "ar": "موعد مجدول",
+            "en": "Scheduled visit",
+            "durationAr": "غداً",
+            "durationEn": "Tomorrow",
+            "price": 10,
+        },
+    ]
+    status, saved_templates = request(
+        "/api/provider/quote-templates", {"templates": templates_payload}, provider_token
+    )
+    expect(status, saved_templates, {200}, "Provider quote templates could not be saved")
+    assert saved_templates.get("templates", [])[0].get("ar") == "فحص وتنفيذ", (
+        "Quote template content was not persisted"
+    )
+
+    status, support_message = request(
+        "/api/provider/support", {"note": "أحتاج متابعة من الإدارة لهذا الطلب"}, provider_token
+    )
+    expect(status, support_message, {201}, "Provider support message did not reach management")
+    status, admin_support_state = request("/api/admin/session", token=admin_token)
+    expect(status, admin_support_state, {200}, "Admin state after provider support failed")
+    assert any(
+        item.get("id") == support_message.get("notificationId")
+        for item in admin_support_state.get("notifications", [])
+    ), "Provider support notification is missing from management"
+
     status, offered = request(
         "/api/request/collaboration",
         {
@@ -515,7 +567,7 @@ def main():
 
     status, selected = request(
         "/api/request/collaboration",
-        {"id": request_id, "action": "choose_offer", "offerId": offer["id"]},
+        {"id": request_id, "action": "choose_offer", "offerId": offer["id"], "language": "ar"},
         user_token,
     )
     expect(status, selected, {200}, "Offer selection failed")
@@ -523,23 +575,31 @@ def main():
         f"Selected the wrong provider: {selected['request'].get('acceptedProviderId')} != {provider_id}"
     )
     consent = selected["request"].get("contactConsent", {})
-    assert not any(consent.get(channel) for channel in ("chat", "whatsapp", "call")), "Contact consent must start disabled"
+    assert consent.get("chat") is True, "In-app chat did not open after deliberate offer selection"
+    assert not consent.get("whatsapp") and not consent.get("call"), (
+        "Phone channels opened without separate customer consent"
+    )
+    welcome = selected["request"].get("messages", [])[-1]
+    assert welcome.get("sender") == "provider" and welcome.get("systemGenerated"), (
+        "Provider welcome message was not created"
+    )
+    assert provider.get("name", "") in welcome.get("text", ""), (
+        "Provider welcome message does not identify the selected provider"
+    )
 
-    status, blocked_message = request(
+    status, blocked_offer = request(
         "/api/request/collaboration",
-        {"id": request_id, "action": "message", "text": "رسالة قبل الموافقة"},
+        {
+            "id": request_id,
+            "action": "offer",
+            "price": 15,
+            "duration": "عرض ثانٍ غير مسموح",
+        },
         provider_token,
     )
-    assert status == 403 and blocked_message.get("error") == "chat_consent_required", (
-        f"Chat opened before consent: HTTP {status} {blocked_message}"
+    assert status == 403 and blocked_offer.get("error") == "offer_not_allowed", (
+        f"A second offer was accepted after provider selection: HTTP {status} {blocked_offer}"
     )
-
-    status, chat_consent = request(
-        "/api/request/collaboration",
-        {"id": request_id, "action": "contact_consent", "chat": True, "whatsapp": False, "call": False},
-        user_token,
-    )
-    expect(status, chat_consent, {200}, "Chat consent failed")
 
     status, message = request(
         "/api/request/collaboration",
@@ -548,6 +608,16 @@ def main():
     )
     expect(status, message, {200}, "Request chat failed")
     assert not message["request"].get("phone"), "Chat consent exposed the phone"
+
+    status, voice_message = request(
+        "/api/request/collaboration",
+        {"id": request_id, "action": "message", "audioData": TEST_WAV},
+        provider_token,
+    )
+    expect(status, voice_message, {200}, "Voice message upload failed")
+    assert voice_message["request"]["messages"][-1].get("audio"), (
+        "Voice message media path was not saved"
+    )
 
     status, location_message = request(
         "/api/request/collaboration",
@@ -578,6 +648,16 @@ def main():
         user_token,
     )
     expect(status, contact, {200}, "WhatsApp consent failed")
+
+    status, started = request(
+        "/api/request/collaboration",
+        {"id": request_id, "action": "start_work"},
+        user_token,
+    )
+    expect(status, started, {200}, "Starting accepted work failed")
+    assert started["request"].get("status") == "inProgress", (
+        "Accepted request did not move to the active-work stage"
+    )
 
     status, provider_allowed = request("/api/bootstrap", token=provider_token)
     allowed = next(item for item in provider_allowed["customerRequests"] if item["id"] == request_id)
@@ -622,6 +702,10 @@ def main():
                 "payment_integrity": True,
                 "contact_consent": True,
                 "request_chat": True,
+                "voice_messages": True,
+                "provider_quote_templates": True,
+                "provider_support_delivery": True,
+                "accepted_job_lifecycle": True,
                 "verified_review": True,
                 "visitor_isolation": True,
             },
