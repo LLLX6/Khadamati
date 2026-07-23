@@ -342,6 +342,20 @@ def main():
     expect(status, created, {201}, "Request creation failed")
     request_id = created["request"]["id"]
     assert created.get("matchedProviders", 0) >= 1, "Exact matching returned no providers"
+    assert created.get("notifiedProviders", 0) >= 1, (
+        "Matching request was saved but not delivered to an eligible provider"
+    )
+
+    status, provider_delivery_state = request("/api/bootstrap", token=provider_token)
+    expect(status, provider_delivery_state, {200}, "Provider delivery bootstrap failed")
+    assert any(
+        item.get("id") == request_id
+        for item in provider_delivery_state.get("customerRequests", [])
+    ), "New matching request is missing from the provider request center"
+    assert any(
+        item.get("relatedId") == request_id
+        for item in provider_delivery_state.get("notifications", [])
+    ), "New matching request did not create a provider notification"
 
     status, owner_state = request("/api/bootstrap", token=user_token)
     expect(status, owner_state, {200}, "Request owner bootstrap failed")

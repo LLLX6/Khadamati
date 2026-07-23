@@ -170,6 +170,18 @@ async function clickAdminTab(page, tab) {
 
   assert((await page.locator('.clean-grid .category-tile').count()) <= 6, 'Home must show no more than six categories.');
   assert(await page.locator('main.view > .home-ad.ad-slider').count(), 'Advertisement slider must be the first home block.');
+  const adCopyFit = await page.locator('.home-ad.ad-slider').evaluate(ad => {
+    const copy = ad.querySelector('.ad-slider-copy');
+    if (!copy || copy.hidden) return true;
+    const adBox = ad.getBoundingClientRect();
+    const copyBox = copy.getBoundingClientRect();
+    const style = getComputedStyle(copy);
+    const alpha = Number(style.backgroundColor.match(/[\d.]+(?=\))/g)?.at(-1) || 1);
+    return copyBox.height <= adBox.height * 0.46
+      && copyBox.width <= adBox.width * 0.8
+      && alpha < 0.8;
+  });
+  assert(adCopyFit, 'Advertisement copy is oversized or hides too much of the image.');
   assert((await page.locator('.popular-rail').count()) === 0, 'Popular services rail should be removed from home.');
   assert((await page.locator('.offline-sync-card').count()) === 0, 'Offline queue banner should not crowd the home page.');
   assert(await page.locator('.direct-request-card').count(), 'Direct request card is missing.');
@@ -357,6 +369,7 @@ async function clickAdminTab(page, tab) {
   assert(await page.locator('.requests-disclosure[open]').count() === 0, 'Request groups should start collapsed.');
   await page.locator('.requests-disclosure summary').first().click();
   assert(await page.locator('.requests-disclosure[open] .request-card').count(), 'Created request is missing from the active request section.');
+  assert(await page.locator('.requests-disclosure[open] .request-created-meta').count(), 'Request date and time are missing from the customer request card.');
   await page.locator('.requests-disclosure summary').first().click();
   assert(await page.locator('.loyalty-card-v40 [role="progressbar"]').count(), 'Clear loyalty progress bar is missing.');
   await page.locator('[data-action="openAppearance"]').click();
@@ -411,6 +424,7 @@ async function clickAdminTab(page, tab) {
   await page.locator('[data-action="skipOnboarding"]').click();
   const dualRoleAuth = await page.evaluate(() => JSON.parse(localStorage.getItem('KHADAMATI_AUTH_V3') || '{}'));
   assert(dualRoleAuth.providerToken === 'ui-provider-token' && dualRoleAuth.userToken === 'ui-user-token', 'Provider sign-in discarded the existing user session on the same device.');
+  assert(dualRoleAuth.activeRole === 'provider', 'Provider sign-in did not activate the provider session context.');
   await page.waitForTimeout(200);
   if (await page.locator('#modalRoot .modal-backdrop.show').count()) {
     assert(await page.locator('#modalRoot .notification-disclosure').count(), 'Provider login notification popup is empty.');
@@ -482,6 +496,8 @@ async function clickAdminTab(page, tab) {
   await page.locator('[data-action="submitProviderOffer"]').click();
   await page.waitForSelector('#modalRoot .modal-backdrop', { state: 'detached' });
   await page.locator('[data-action="providerUserMode"]').click();
+  const customerModeAuth = await page.evaluate(() => JSON.parse(localStorage.getItem('KHADAMATI_AUTH_V3') || '{}'));
+  assert(customerModeAuth.activeRole === 'user' && customerModeAuth.userToken === 'ui-user-token', 'Returning from provider mode did not restore the customer session.');
   await clickUserNav(page, 'myAccount');
   assert(await page.locator('.request-offer-summary').count(), 'Offer comparison summary is missing.');
   await page.waitForTimeout(600);
@@ -568,7 +584,7 @@ async function clickAdminTab(page, tab) {
   const calendarDownload = await downloadPromise;
   assert((await calendarDownload.suggestedFilename()).endsWith('.ics'), 'Calendar export is not an ICS file.');
 
-  await page.locator('.account-menu [data-action="nav"][data-view="provider"]').click();
+  await page.locator('.account-menu [data-action="providerMode"], .account-menu [data-action="nav"][data-view="provider"]').first().click();
   await page.locator('.provider-top-actions [data-action="openNotifications"]').click();
   assert(await page.locator('.notification-center-tab').count() === 3, 'Notification center must have chats, requests, and updates sections.');
   await page.locator('[data-action="notificationCenterTab"][data-value="messages"]').click();
@@ -642,7 +658,7 @@ async function clickAdminTab(page, tab) {
   assert(await page.locator('.provider-detail-sheet').count(), 'Closing the provider map must restore the same provider profile.');
   await page.locator('[data-action="closeModal"]').click();
   await clickUserNav(page, 'myAccount');
-  await page.locator('.account-menu [data-action="nav"][data-view="provider"]').click();
+  await page.locator('.account-menu [data-action="providerMode"], .account-menu [data-action="nav"][data-view="provider"]').first().click();
   await page.locator('[data-action="providerLogout"]').click();
   await page.locator('[data-action="goBack"]').click();
   await page.locator('[data-action="enterGuest"]').click();
@@ -661,7 +677,9 @@ async function clickAdminTab(page, tab) {
   await page.locator('#adminCode').fill('0000');
   await page.locator('[data-action="adminLogin"]').click();
   await page.waitForSelector('.admin-shell');
-  await clickAdminTab(page, 'notifications');
+  await page.locator('.admin-topbar [data-action="openAdminNotifications"]').click();
+  assert(await page.locator('.admin-workspace .admin-notification-list').count(), 'The management bell did not open the independent administration notification center.');
+  assert(await page.locator('.notification-center-sheet').count() === 0, 'The management bell incorrectly opened the customer notification sheet.');
   assert(await page.locator('.admin-mark-all').isVisible(), 'The mark-all action is hidden in the administration notification center.');
   const adminNotificationFit = await page.locator('.admin-mark-all').evaluate(element => {
     const box = element.getBoundingClientRect();

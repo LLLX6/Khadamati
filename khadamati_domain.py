@@ -991,12 +991,27 @@ class RequestMarketplace:
         self.expansion_minutes = max(5, int(expansion_minutes))
         self.min_offers = max(1, int(min_offers))
 
+    def subscription_delays_enabled(self) -> bool:
+        """Apply plan lead delays only after management enables subscriptions."""
+        try:
+            row = self.con.execute(
+                "SELECT value FROM settings WHERE key='platform'"
+            ).fetchone()
+            settings = load(row["value"], {}) if row else {}
+            value = settings.get("subscriptionsEnabled")
+            if isinstance(value, str):
+                return value.strip().lower() in {"1", "true", "yes", "on"}
+            return bool(value)
+        except (TypeError, ValueError, KeyError):
+            return False
+
     def schedule(self, request_id: str) -> list[dict[str, Any]]:
         request_row = self.con.execute("SELECT * FROM customer_requests WHERE id=?", (request_id,)).fetchone()
         if not request_row:
             raise DomainError("request_not_found", 404)
         request = row_dict(request_row)
         entitlements = EntitlementService(self.con, now=self.now)
+        apply_plan_delay = self.subscription_delays_enabled()
         ranked: list[dict[str, Any]] = []
         for provider_row in self.con.execute(
             """SELECT * FROM providers WHERE active=1 AND status!='unavailable'
@@ -1013,7 +1028,7 @@ class RequestMarketplace:
                 "providerId": provider["id"],
                 "score": score,
                 "breakdown": breakdown,
-                "delay": grants["leadDelayMinutes"],
+                "delay": grants["leadDelayMinutes"] if apply_plan_delay else 0,
                 "planId": grants["planId"],
             })
         ranked.sort(key=lambda item: (-item["score"], item["providerId"]))

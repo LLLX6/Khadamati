@@ -208,6 +208,76 @@ class KhadamatiDomainTests(unittest.TestCase):
         ).release_due(request_id)
         self.assertEqual(5, len(expanded))
 
+    def test_plan_delay_starts_only_when_subscriptions_are_enabled(self):
+        now = datetime(2026, 7, 18, 12, tzinfo=UTC)
+        provider_id = self.provider("301")
+        self.activate(provider_id, "foundation_12m", now)
+        user_id = "domain-user-delay"
+        self.con.execute(
+            "INSERT OR REPLACE INTO app_users(id,phone,name,pin_hash) VALUES(?,?,?,?)",
+            (user_id, "96895550301", "مستخدم اختبار التأخير", server.hash_pin("2468")),
+        )
+        settings_row = self.con.execute(
+            "SELECT value FROM settings WHERE key='platform'"
+        ).fetchone()
+        settings = json.loads(settings_row["value"])
+        settings["subscriptionsEnabled"] = False
+        self.con.execute(
+            "UPDATE settings SET value=? WHERE key='platform'",
+            (json.dumps(settings, ensure_ascii=False),),
+        )
+        self.con.execute(
+            """INSERT OR REPLACE INTO customer_requests(
+            id,user_id,customer_name,phone,service_value,service_name,gov,wilayah,status)
+            VALUES(?,?,?,?,?,?,?,?, 'matching')""",
+            (
+                "domain-request-free-launch",
+                user_id,
+                "مستخدم اختبار التأخير",
+                "96895550301",
+                "homecare|electrician",
+                "كهربائي",
+                "مسقط",
+                "السيب",
+            ),
+        )
+        free_marketplace = RequestMarketplace(self.con, now=now)
+        free_marketplace.schedule("domain-request-free-launch")
+        released = free_marketplace.release_due("domain-request-free-launch")
+        self.assertIn(provider_id, [item["providerId"] for item in released])
+
+        settings["subscriptionsEnabled"] = True
+        self.con.execute(
+            "UPDATE settings SET value=? WHERE key='platform'",
+            (json.dumps(settings, ensure_ascii=False),),
+        )
+        self.con.execute(
+            """INSERT OR REPLACE INTO customer_requests(
+            id,user_id,customer_name,phone,service_value,service_name,gov,wilayah,status)
+            VALUES(?,?,?,?,?,?,?,?, 'matching')""",
+            (
+                "domain-request-paid-launch",
+                user_id,
+                "مستخدم اختبار التأخير",
+                "96895550301",
+                "homecare|electrician",
+                "كهربائي",
+                "مسقط",
+                "السيب",
+            ),
+        )
+        paid_marketplace = RequestMarketplace(self.con, now=now)
+        paid_marketplace.schedule("domain-request-paid-launch")
+        immediate_ids = [
+            item["providerId"]
+            for item in paid_marketplace.release_due("domain-request-paid-launch")
+        ]
+        self.assertNotIn(provider_id, immediate_ids)
+        delayed = RequestMarketplace(
+            self.con, now=now + timedelta(minutes=16)
+        ).release_due("domain-request-paid-launch")
+        self.assertIn(provider_id, [item["providerId"] for item in delayed])
+
     def test_contact_consent_is_scoped_and_revocable(self):
         provider_id = self.provider("104")
         user_id = "domain-user-2"

@@ -1,0 +1,98 @@
+/* Khadamati v59: final role, request-delivery, and compact-ad corrections. */
+
+/* Advertisement copy follows its content instead of masking the artwork. */
+.home-ad.ad-slider .ad-slider-copy{
+  inset-inline-start:10px!important;
+  inset-inline-end:auto!important;
+  bottom:9px!important;
+  width:max-content!important;
+  min-width:0!important;
+  max-width:min(76%,420px)!important;
+  display:inline-flex!important;
+  flex-direction:column;
+  align-items:flex-start;
+  gap:1px;
+  box-sizing:border-box;
+  padding:7px 10px!important;
+  border:1px solid rgba(255,255,255,.12);
+  border-radius:11px!important;
+  background:rgba(4,20,31,.48)!important;
+  box-shadow:0 6px 18px rgba(2,12,20,.16);
+  backdrop-filter:blur(8px) saturate(1.08);
+  -webkit-backdrop-filter:blur(8px) saturate(1.08);
+}
+.home-ad.ad-slider .ad-slider-copy[hidden]{display:none!important}
+.home-ad.ad-slider .ad-slider-copy h3,
+.home-ad.ad-slider .ad-slider-copy p{
+  width:auto;
+  max-width:100%;
+  margin:0!important;
+  overflow:hidden;
+  text-align:start;
+  overflow-wrap:anywhere;
+}
+.home-ad.ad-slider .ad-slider-copy h3{
+  display:-webkit-box;
+  -webkit-box-orient:vertical;
+  -webkit-line-clamp:2;
+  font-size:clamp(.78rem,2vw,.98rem)!important;
+  line-height:1.35!important;
+}
+.home-ad.ad-slider .ad-slider-copy p{
+  display:-webkit-box!important;
+  -webkit-box-orient:vertical;
+  -webkit-line-clamp:2;
+  font-size:.68rem!important;
+  line-height:1.35!important;
+}
+
+/* Request creation time is compact but consistently visible to every role. */
+.request-created-meta{
+  display:flex!important;
+  align-items:center;
+  gap:4px;
+  width:max-content;
+  max-width:100%;
+  margin:5px 0 7px;
+  color:var(--muted)!important;
+  font-size:.62rem!important;
+  font-weight:750;
+  line-height:1.35;
+}
+.request-created-meta svg{width:13px!important;height:13px!important;flex:0 0 13px}
+.opportunity-service .request-created-meta{margin:2px 0 0;font-size:.58rem!important}
+
+/* The first authenticated paint is a real loading state, never a broken portal. */
+.provider-loading-topbar .provider-brand{pointer-events:none}
+.provider-loading-state{
+  display:grid;
+  gap:12px;
+  min-height:300px;
+  margin-top:18px;
+  padding:18px;
+  border:1px solid var(--line);
+  border-radius:18px;
+  background:var(--panel);
+}
+.provider-loading-state .skeleton-line{
+  height:54px;
+  border-radius:14px;
+  background:linear-gradient(90deg,var(--panel2),color-mix(in srgb,var(--panel2) 55%,var(--panel)),var(--panel2));
+  background-size:220% 100%;
+  animation:skeletonMove 1.2s linear infinite;
+}
+.provider-loading-state .skeleton-line:nth-child(2){height:86px}
+.provider-loading-state .skeleton-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}
+.provider-loading-state .skeleton-grid i{height:90px;border-radius:14px;background:var(--panel2)}
+.provider-loading-state small{color:var(--muted);text-align:center;font-weight:800}
+
+@media(max-width:560px){
+  .home-ad.ad-slider .ad-slider-copy{max-width:72%!important;padding:6px 9px!important}
+  .home-ad.ad-slider .ad-slider-copy h3{font-size:.79rem!important}
+  .home-ad.ad-slider .ad-slider-copy p{display:none!important}
+  .request-created-meta{font-size:.59rem!important}
+}
+
+@media(prefers-reduced-motion:reduce){
+  .provider-loading-state .skeleton-line{animation:none}
+}
