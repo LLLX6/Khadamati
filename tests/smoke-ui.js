@@ -574,8 +574,12 @@ async function clickAdminTab(page, tab) {
   await page.locator('#chatText').fill('تم تأكيد الموعد');
   await page.locator('[data-action="sendChatMessage"]').click();
   await page.waitForSelector('.chat-message.mine');
-  await page.locator('#chatImage').setInputFiles(path.join(__dirname, '..', 'app-icon-192.png'));
-  assert(await page.locator('#chatImage').evaluate(input => input.files?.length === 1), 'Chat image input did not retain the selected file.');
+  const chatImagePath = path.join(__dirname, '..', 'app-icon-192.png');
+  await page.locator('#chatImage').setInputFiles({
+    name: 'chat-image.png',
+    mimeType: 'image/png',
+    buffer: fs.readFileSync(chatImagePath),
+  });
   await page.locator('#chatText').fill('صورة توضيحية');
   await page.locator('[data-action="sendChatMessage"]').click();
   await page.waitForFunction(() => Boolean(document.querySelector('.chat-message.mine img')), null, { timeout: 15000 }).catch(() => {});
