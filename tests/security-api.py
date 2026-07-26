@@ -316,10 +316,11 @@ def run():
                 assert error.code == 413, f"oversized body returned HTTP {error.code}"
 
             sw = (ROOT / "service-worker.js").read_text(encoding="utf-8")
-            assert "khadamati-app-shell-v62-mobile-workspace" in sw
+            assert "khadamati-app-shell-v63-" in sw
             assert "./assets/styles/khadamati-v60.css" in sw
             assert "./assets/styles/khadamati-v61.css" in sw
             assert "./assets/styles/khadamati-v62.css" in sw
+            assert "./assets/styles/khadamati-v63.css" in sw
             page_source = (ROOT / "index.html").read_text(encoding="utf-8")
             assert 'data-action="openConversations"' in page_source
             assert "notificationGroup(n)===group&&n.read" in page_source

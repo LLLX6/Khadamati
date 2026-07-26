@@ -3,7 +3,7 @@
 Compile and run the domain tests first:
 
 ```powershell
-python -m py_compile server.py khadamati_domain.py
+python -m py_compile server.py khadamati_domain.py khadamati_workflow.py
 python -m unittest discover -s tests -p "test_*.py" -v
 python tests/security-api.py
 ```
@@ -36,6 +36,9 @@ The API/domain flows also verify map privacy, approved-provider availability,
 subscription service/category limits, registration, exact matching, active request visibility,
 the public request marketplace, provider recommendations and abuse controls,
 subscriptions, contact consent, reviews, and cross-account collaboration.
+The workflow checks cover request idempotency, service assets, the two-party
+agreement, guarded work start, completion evidence, customer resolution, the
+event timeline, and provider daily capacity.
 The security flow starts an isolated database and verifies public-data
 minimization, CORS, private signed media, cross-provider IDOR protection, owner
 PIN protection, MIME signatures, session revocation, lockout, inactive-account

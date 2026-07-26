@@ -29,6 +29,13 @@ from khadamati_domain import (  # noqa: E402
     RequestMarketplace,
     SubscriptionService,
 )
+from khadamati_workflow import (  # noqa: E402
+    CompletionEvidenceService,
+    RequestAgreementService,
+    RequestIdempotencyService,
+    RequestLifecycleService,
+    ServiceAssetService,
+)
 
 
 class KhadamatiDomainTests(unittest.TestCase):
@@ -82,6 +89,47 @@ class KhadamatiDomainTests(unittest.TestCase):
         return SubscriptionService(self.con, now=now).request_plan(
             provider_id, plan_id, payment_required=False, actor="test"
         )
+
+    def user(self, suffix):
+        user_id = f"test-user-{suffix}"
+        self.con.execute(
+            """INSERT INTO app_users(id,phone,name,pin_hash,status)
+            VALUES(?,?,?,?, 'active')""",
+            (user_id, f"96895{int(suffix):06d}", f"مستخدم {suffix}", server.hash_pin("7349")),
+        )
+        return user_id
+
+    def customer_request(
+        self,
+        suffix,
+        user_id,
+        *,
+        provider_id="",
+        status="matching",
+        requested_at="2026-08-01T10:00:00+00:00",
+    ):
+        request_id = f"test-request-{suffix}"
+        self.con.execute(
+            """INSERT INTO customer_requests(
+            id,user_id,customer_name,phone,service_value,service_name,gov,wilayah,
+            status,accepted_provider_id,matching_provider_ids,requested_at)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                request_id,
+                user_id,
+                f"مستخدم {suffix}",
+                f"96895{int(suffix):06d}",
+                "homecare|electrician",
+                "كهربائي",
+                "مسقط",
+                "السيب",
+                status,
+                provider_id,
+                json.dumps([provider_id] if provider_id else []),
+                requested_at,
+            ),
+        )
+        return request_id
 
     def test_exactly_five_active_plans(self):
         rows = self.con.execute("SELECT id FROM packages WHERE active=1 ORDER BY id").fetchall()
@@ -506,6 +554,162 @@ class KhadamatiDomainTests(unittest.TestCase):
         finally:
             with server.db() as con:
                 con.execute("DELETE FROM whatsapp_logs WHERE detail=?", (detail,))
+
+    def test_request_lifecycle_rejects_invalid_stage_jump(self):
+        user_id = self.user("701")
+        request_id = self.customer_request("701", user_id)
+        lifecycle = RequestLifecycleService(self.con)
+        lifecycle.transition(
+            request_id,
+            "viewed",
+            actor_kind="user",
+            actor_id=user_id,
+            event_type="test_viewed",
+        )
+        with self.assertRaises(DomainError) as caught:
+            lifecycle.transition(
+                request_id,
+                "closed",
+                actor_kind="user",
+                actor_id=user_id,
+            )
+        self.assertEqual("invalid_request_transition", caught.exception.code)
+        timeline = lifecycle.timeline(request_id)
+        self.assertEqual("test_viewed", timeline[-1]["type"])
+        self.assertEqual("viewed", timeline[-1]["toStatus"])
+
+    def test_agreement_requires_current_version_and_both_parties(self):
+        user_id = self.user("702")
+        provider_id = self.provider("702")
+        request_id = self.customer_request(
+            "702", user_id, provider_id=provider_id, status="accepted"
+        )
+        service = RequestAgreementService(self.con)
+        agreement = service.save(
+            request_id,
+            "user",
+            user_id,
+            {
+                "appointmentAt": "2026-08-01T10:00:00+00:00",
+                "durationMinutes": 90,
+                "priceAmount": 12.5,
+                "notes": "فحص وتنفيذ",
+            },
+        )
+        service.confirm(request_id, "user", user_id, agreement["version"])
+        pending = service.get(request_id)
+        self.assertEqual("pending_confirmation", pending["status"])
+        confirmed = service.confirm(
+            request_id, "provider", provider_id, agreement["version"]
+        )
+        self.assertEqual("confirmed", confirmed["status"])
+        status = self.con.execute(
+            "SELECT status FROM customer_requests WHERE id=?", (request_id,)
+        ).fetchone()["status"]
+        self.assertEqual("appointmentConfirmed", status)
+        with self.assertRaises(DomainError) as caught:
+            service.confirm(request_id, "user", user_id, agreement["version"] - 1)
+        self.assertEqual("agreement_version_changed", caught.exception.code)
+
+    def test_service_asset_is_owned_and_keeps_request_history(self):
+        owner_id = self.user("703")
+        other_id = self.user("704")
+        service = ServiceAssetService(self.con)
+        asset = service.save(
+            owner_id,
+            {
+                "name": "منزل السيب",
+                "type": "home",
+                "brand": "",
+                "model": "",
+                "location": {"lat": 23.59, "lng": 58.20},
+            },
+        )
+        request_id = self.customer_request("703", owner_id)
+        service.attach(request_id, asset["id"], owner_id)
+        history = service.history(asset["id"], owner_id)
+        self.assertEqual(request_id, history[0]["id"])
+        with self.assertRaises(DomainError):
+            service.get_for_user(asset["id"], other_id)
+
+    def test_request_idempotency_blocks_duplicate_and_key_reuse(self):
+        user_id = self.user("705")
+        request_id = self.customer_request("705", user_id)
+        service = RequestIdempotencyService(self.con)
+        payload = {
+            "serviceValue": "homecare|electrician",
+            "gov": "مسقط",
+            "wilayah": "السيب",
+        }
+        key = "request:test:705"
+        service.remember(user_id, key, request_id, payload)
+        self.assertEqual(request_id, service.find(user_id, key, payload))
+        with self.assertRaises(DomainError) as caught:
+            service.find(user_id, key, {**payload, "wilayah": "بوشر"})
+        self.assertEqual("idempotency_key_reused", caught.exception.code)
+
+    def test_completion_evidence_waits_for_customer_decision(self):
+        user_id = self.user("706")
+        provider_id = self.provider("706")
+        request_id = self.customer_request(
+            "706", user_id, provider_id=provider_id, status="inProgress"
+        )
+        service = CompletionEvidenceService(self.con)
+        service.submit(
+            request_id,
+            provider_id,
+            before_images=["uploads/before.webp"],
+            after_images=["uploads/after.webp"],
+            note="اكتمل الإصلاح",
+        )
+        status = self.con.execute(
+            "SELECT status FROM customer_requests WHERE id=?", (request_id,)
+        ).fetchone()["status"]
+        self.assertEqual("awaitingConfirmation", status)
+        service.decide(request_id, user_id, "resolved")
+        status = self.con.execute(
+            "SELECT status FROM customer_requests WHERE id=?", (request_id,)
+        ).fetchone()["status"]
+        completed = self.con.execute(
+            "SELECT completed_jobs FROM providers WHERE id=?", (provider_id,)
+        ).fetchone()["completed_jobs"]
+        self.assertEqual("closed", status)
+        self.assertEqual(1, completed)
+
+    def test_marketplace_respects_provider_daily_capacity(self):
+        user_id = self.user("707")
+        provider_id = self.provider("707")
+        self.activate(provider_id)
+        self.con.execute(
+            "UPDATE providers SET availability=? WHERE id=?",
+            (
+                json.dumps(
+                    {
+                        "days": ["5"],
+                        "start": "00:00",
+                        "end": "23:59",
+                        "dailyCapacity": 1,
+                    }
+                ),
+                provider_id,
+            ),
+        )
+        self.customer_request(
+            "708",
+            user_id,
+            provider_id=provider_id,
+            status="accepted",
+            requested_at="2026-08-01T09:00:00+00:00",
+        )
+        request_id = self.customer_request(
+            "709",
+            user_id,
+            requested_at="2026-08-01T11:00:00+00:00",
+        )
+        ranked = RequestMarketplace(
+            self.con, now=datetime(2026, 8, 1, 8, tzinfo=UTC)
+        ).schedule(request_id)
+        self.assertNotIn(provider_id, {item["providerId"] for item in ranked})
 
 
 if __name__ == "__main__":

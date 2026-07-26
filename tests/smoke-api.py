@@ -380,24 +380,61 @@ def main():
     expect(status, recovered_user, {200}, "User could not sign in with the recovered PIN")
     user_token = recovered_user["token"]
 
+    status, saved_asset = request(
+        "/api/service-assets",
+        {
+            "action": "save",
+            "type": "home",
+            "name": "منزل اختبار الإنتاج",
+            "categoryId": "homecare",
+            "brand": "منزل",
+            "model": "الطابق الأول",
+            "location": {"lat": 23.621, "lng": 58.221},
+            "notes": "لوحة الكهرباء قرب المدخل",
+            "imageData": TEST_PNG,
+        },
+        user_token,
+    )
+    expect(status, saved_asset, {200}, "Service asset creation failed")
+    service_asset = saved_asset["serviceAssets"][0]
+    assert service_asset.get("id") and service_asset.get("imageUrl"), (
+        "Saved service asset is incomplete"
+    )
+
+    request_payload = {
+        "serviceValue": "homecare|electrician",
+        "serviceName": "كهربائي",
+        "customerName": "مستخدم اختبار الإنتاج",
+        "gov": "مسقط",
+        "wilayah": "السيب",
+        "location": {"lat": 23.621, "lng": 58.221},
+        "urgency": "normal",
+        "scheduleType": "specific",
+        "requestedAt": "2026-07-20T09:00",
+        "note": "فحص انقطاع الكهرباء في المنزل",
+        "assetId": service_asset["id"],
+        "idempotencyKey": "smoke-request-electrician-1",
+    }
     status, created = request(
         "/api/user/requests",
-        {
-            "serviceValue": "homecare|electrician",
-            "serviceName": "كهربائي",
-            "customerName": "مستخدم اختبار الإنتاج",
-            "gov": "مسقط",
-            "wilayah": "السيب",
-            "location": {"lat": 23.621, "lng": 58.221},
-            "urgency": "normal",
-            "scheduleType": "specific",
-            "requestedAt": "2026-07-20T09:00",
-            "note": "فحص انقطاع الكهرباء في المنزل",
-        },
+        request_payload,
         user_token,
     )
     expect(status, created, {201}, "Request creation failed")
     request_id = created["request"]["id"]
+    assert created["request"].get("assetId") == service_asset["id"], (
+        "Service asset was not attached to the request"
+    )
+    status, duplicate_create = request(
+        "/api/user/requests", request_payload, user_token
+    )
+    expect(status, duplicate_create, {200}, "Idempotent request retry failed")
+    assert duplicate_create.get("duplicate") is True, (
+        "Repeated request was not recognized as an idempotent retry"
+    )
+    assert duplicate_create["request"]["id"] == request_id, (
+        "Idempotent retry created a different request"
+    )
     assert created.get("matchedProviders", 0) >= 1, "Exact matching returned no providers"
     assert created.get("notifiedProviders", 0) >= 1, (
         "Matching request was saved but not delivered to an eligible provider"
@@ -691,14 +728,67 @@ def main():
     )
     expect(status, contact, {200}, "WhatsApp consent failed")
 
-    status, started = request(
-        "/api/request/collaboration",
-        {"id": request_id, "action": "start_work"},
+    status, agreement_saved = request(
+        "/api/request/workflow",
+        {
+            "id": request_id,
+            "action": "agreement_save",
+            "appointmentAt": "2027-07-20T09:00:00+04:00",
+            "durationMinutes": 90,
+            "priceAmount": 12,
+            "locationText": "مسقط، السيب",
+            "notes": "يشمل الفحص والتنفيذ",
+        },
         user_token,
     )
-    expect(status, started, {200}, "Starting accepted work failed")
+    expect(status, agreement_saved, {200}, "Saving work agreement failed")
+    agreement_version = agreement_saved["request"]["agreement"]["version"]
+
+    status, blocked_start = request(
+        "/api/request/workflow",
+        {"id": request_id, "action": "start_work"},
+        provider_token,
+    )
+    assert (
+        status == 409
+        and blocked_start.get("error") == "agreement_confirmation_required"
+    ), f"Work started before both parties confirmed: HTTP {status} {blocked_start}"
+
+    status, provider_confirmed = request(
+        "/api/request/workflow",
+        {
+            "id": request_id,
+            "action": "agreement_confirm",
+            "version": agreement_version,
+        },
+        provider_token,
+    )
+    expect(status, provider_confirmed, {200}, "Provider agreement confirmation failed")
+    assert provider_confirmed["request"]["agreement"].get("providerConfirmed") is True
+    assert provider_confirmed["request"]["agreement"].get("userConfirmed") is False
+
+    status, both_confirmed = request(
+        "/api/request/workflow",
+        {
+            "id": request_id,
+            "action": "agreement_confirm",
+            "version": agreement_version,
+        },
+        user_token,
+    )
+    expect(status, both_confirmed, {200}, "Customer agreement confirmation failed")
+    assert both_confirmed["request"].get("status") == "appointmentConfirmed", (
+        "Request did not enter the confirmed-appointment stage"
+    )
+
+    status, started = request(
+        "/api/request/workflow",
+        {"id": request_id, "action": "start_work"},
+        provider_token,
+    )
+    expect(status, started, {200}, "Starting confirmed work failed")
     assert started["request"].get("status") == "inProgress", (
-        "Accepted request did not move to the active-work stage"
+        "Confirmed request did not move to the active-work stage"
     )
 
     status, provider_allowed = request("/api/bootstrap", token=provider_token)
@@ -709,10 +799,54 @@ def main():
     own_request = next(item for item in user_allowed["customerRequests"] if item["id"] == request_id)
     assert own_request.get("providerContact", {}).get("phone") == provider_phone, "Approved provider contact was not exposed"
 
-    status, completed = request(
+    status, premature_completion = request(
         "/api/user/requests", {"id": request_id, "action": "complete"}, user_token
     )
-    expect(status, completed, {200}, "Request completion failed")
+    assert (
+        status == 409
+        and premature_completion.get("error") == "completion_evidence_required"
+    ), f"Request closed without provider evidence: HTTP {status} {premature_completion}"
+
+    status, evidence = request(
+        "/api/request/workflow",
+        {
+            "id": request_id,
+            "action": "completion_submit",
+            "beforeImagesData": [TEST_PNG],
+            "afterImagesData": [TEST_PNG],
+            "note": "تم فحص اللوحة وإصلاح التوصيل",
+        },
+        provider_token,
+    )
+    expect(status, evidence, {200}, "Provider completion evidence failed")
+    assert evidence["request"].get("status") == "awaitingConfirmation"
+    assert evidence["request"]["completionEvidence"].get("afterImages"), (
+        "Completion evidence did not preserve the after photo"
+    )
+
+    status, completed = request(
+        "/api/request/workflow",
+        {
+            "id": request_id,
+            "action": "completion_decide",
+            "decision": "resolved",
+            "note": "تم حل المشكلة",
+        },
+        user_token,
+    )
+    expect(status, completed, {200}, "Customer completion confirmation failed")
+    assert completed["request"].get("status") == "closed"
+    assert completed["request"]["completionEvidence"].get("customerDecision") == "resolved"
+    timeline_types = {
+        item.get("type") for item in completed["request"].get("timeline", [])
+    }
+    assert {
+        "request_created",
+        "agreement_confirmed",
+        "work_started",
+        "completion_submitted",
+        "completion_confirmed",
+    }.issubset(timeline_types), f"Request timeline is incomplete: {timeline_types}"
 
     status, review = request(
         "/api/reviews",

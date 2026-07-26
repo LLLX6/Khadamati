@@ -377,7 +377,48 @@ async function clickAdminTab(page, tab) {
   await page.locator('.requests-disclosure summary').first().click();
   assert(await page.locator('.requests-disclosure[open] .request-card').count(), 'Created request is missing from the active request section.');
   assert(await page.locator('.requests-disclosure[open] .request-created-meta').count(), 'Request date and time are missing from the customer request card.');
+  assert(await page.locator('.requests-disclosure[open] [data-action="repeatRequest"]').count() === 0, 'An active request should not offer a duplicate repeat action.');
   await page.locator('.requests-disclosure summary').first().click();
+  const repeatSource = await page.evaluate(() => {
+    const key = 'KHADAMATI_PRIVATE_STATE_V1';
+    const raw = sessionStorage.getItem(key);
+    const state = JSON.parse(raw || '{}');
+    const request = state.customerRequests?.[0];
+    if (!request) return null;
+    sessionStorage.setItem('KHADAMATI_REPEAT_TEST_BACKUP', raw);
+    request.status = 'cancelled';
+    request.offersOpen = false;
+    request.date = '2026-08-18T15:30';
+    request.dateOnly = '2026-08-18';
+    request.idempotencyKey = 'original-request-key';
+    sessionStorage.setItem(key, JSON.stringify(state));
+    return {
+      serviceValue: request.serviceValue,
+      gov: request.gov,
+      wilayah: request.wilayah,
+      idempotencyKey: request.idempotencyKey,
+    };
+  });
+  assert(repeatSource, 'Could not prepare the isolated repeat-request behavior check.');
+  await page.reload({ waitUntil: 'domcontentloaded' });
+  await clickUserNav(page, 'myAccount');
+  const repeatButton = page.locator('[data-action="repeatRequest"]').first();
+  const repeatGroup = repeatButton.locator('xpath=ancestor::details');
+  if (!await repeatButton.isVisible()) await repeatGroup.locator('summary').click();
+  await repeatButton.click();
+  assert(await page.locator('#qrEditId').inputValue() === '', 'Repeat request reused the old request identity.');
+  assert(await page.locator('#qrService').inputValue() === repeatSource.serviceValue, 'Repeat request lost the selected service.');
+  assert(await page.locator('#qrGov').inputValue() === repeatSource.gov && await page.locator('#qrWilayah').inputValue() === repeatSource.wilayah, 'Repeat request lost the selected area.');
+  assert(await page.locator('#qrIdempotencyKey').inputValue() !== repeatSource.idempotencyKey, 'Repeat request reused the old idempotency key.');
+  assert(await page.locator('#qrDate').inputValue() === '', 'Repeat request retained a stale appointment.');
+  await page.locator('[data-action="closeModal"]').click();
+  await page.evaluate(() => {
+    const backup = sessionStorage.getItem('KHADAMATI_REPEAT_TEST_BACKUP');
+    if (backup) sessionStorage.setItem('KHADAMATI_PRIVATE_STATE_V1', backup);
+    sessionStorage.removeItem('KHADAMATI_REPEAT_TEST_BACKUP');
+  });
+  await page.reload({ waitUntil: 'domcontentloaded' });
+  await clickUserNav(page, 'myAccount');
   assert(await page.locator('.loyalty-card-v40 [role="progressbar"]').count(), 'Clear loyalty progress bar is missing.');
   await page.locator('[data-action="openAppearance"]').click();
   await page.locator('[data-action="setTheme"][data-value="dark"]').click();
@@ -448,7 +489,12 @@ async function clickAdminTab(page, tab) {
   assert(await page.locator('.provider-request-dock').count(), 'Fixed provider request dock is missing.');
   assert(await page.locator('.provider-topbar .provider-brand').isVisible(), 'Provider header identity is hidden.');
   assert(await page.locator('.provider-topbar .provider-brand > .brand-mark.image-mark').isVisible(), 'Provider header logo is hidden on a narrow phone.');
-  assert(await page.locator('.provider-topbar .provider-brand > span:last-child').isVisible(), 'Provider name is hidden on a narrow phone.');
+  if (VIEWPORT_WIDTH <= 430) {
+    assert(!await page.locator('.provider-topbar .provider-brand > span:last-child').isVisible(), 'The redundant provider name should not be clipped into the compact phone header.');
+    assert(await page.locator('.provider-dashboard-head h2').filter({ hasText: /سالم البلوشي/ }).isVisible(), 'The full provider name is missing from the phone workspace.');
+  } else {
+    assert(await page.locator('.provider-topbar .provider-brand > span:last-child').isVisible(), 'Provider name is hidden on a wide screen.');
+  }
   const providerTopFits = await page.locator('.provider-topbar').evaluate(() => document.documentElement.scrollWidth <= window.innerWidth + 1);
   assert(providerTopFits, 'Provider top bar overflows the mobile viewport.');
   assert(await page.locator('.provider-top-actions > *').evaluateAll(items => items.every(item => { const box = item.getBoundingClientRect(); return box.left >= -1 && box.right <= window.innerWidth + 1; })), 'A provider header control leaves the mobile viewport.');
@@ -610,9 +656,15 @@ async function clickAdminTab(page, tab) {
   assert(await page.evaluate(() => !window.__khadamatiChatPoll), 'Chat automatic refresh continued after closing the conversation.');
 
   await page.locator('[data-action="startCustomerRequest"]').first().click();
-  await page.waitForSelector('[data-action="completeCustomerRequest"]');
+  await page.waitForFunction(() => {
+    const card = document.querySelector('[data-request-card]');
+    return card && /قيد التنفيذ|In progress/i.test(card.textContent || '');
+  });
   assert(await page.locator('[data-request-card]').count(), 'Starting work removed the user from active requests.');
-  assert(await page.locator('[data-action="completeCustomerRequest"]').count(), 'Request did not move to in-progress after work started.');
+  assert(
+    await page.locator('[data-request-card] .request-status').filter({ hasText: /قيد التنفيذ|In progress/i }).count(),
+    'Request did not move to in-progress after work started.',
+  );
 
   const downloadPromise = page.waitForEvent('download');
   await page.locator('[data-action="addRequestCalendar"]').first().click();

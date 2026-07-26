@@ -1005,6 +1005,26 @@ class RequestMarketplace:
         except (TypeError, ValueError, KeyError):
             return False
 
+    def provider_has_capacity(
+        self, provider: dict[str, Any], requested_at: datetime, request_id: str
+    ) -> bool:
+        """Respect an optional per-day capacity without changing legacy profiles."""
+        availability = load(provider.get("availability"), {})
+        try:
+            daily_capacity = int(availability.get("dailyCapacity") or 0)
+        except (TypeError, ValueError):
+            daily_capacity = 0
+        if daily_capacity <= 0:
+            return True
+        count = self.con.execute(
+            """SELECT COUNT(*) n FROM customer_requests
+            WHERE accepted_provider_id=? AND id!=?
+            AND substr(COALESCE(NULLIF(requested_at,''),created_at),1,10)=?
+            AND status IN ('accepted','appointmentConfirmed','inProgress','awaitingConfirmation')""",
+            (provider["id"], request_id, requested_at.date().isoformat()),
+        ).fetchone()["n"]
+        return int(count or 0) < daily_capacity
+
     def schedule(self, request_id: str) -> list[dict[str, Any]]:
         request_row = self.con.execute("SELECT * FROM customer_requests WHERE id=?", (request_id,)).fetchone()
         if not request_row:
@@ -1012,6 +1032,7 @@ class RequestMarketplace:
         request = row_dict(request_row)
         entitlements = EntitlementService(self.con, now=self.now)
         apply_plan_delay = self.subscription_delays_enabled()
+        requested_at = parse_datetime(request.get("requested_at")) or self.now
         ranked: list[dict[str, Any]] = []
         for provider_row in self.con.execute(
             """SELECT * FROM providers WHERE active=1 AND status!='unavailable'
@@ -1021,7 +1042,11 @@ class RequestMarketplace:
             allowed, reason, grants = entitlements.can_receive(provider["id"])
             if not allowed:
                 continue
-            score, breakdown = RankingService.score(request, provider, grants["planId"], self.now)
+            if not self.provider_has_capacity(provider, requested_at, request_id):
+                continue
+            score, breakdown = RankingService.score(
+                request, provider, grants["planId"], requested_at
+            )
             if score <= 0:
                 continue
             ranked.append({
@@ -1097,7 +1122,11 @@ class RequestMarketplace:
             by_request.setdefault(row["request_id"], []).append(row)
         for rid, candidates in by_request.items():
             request_row = candidates[0]
-            if request_row["request_status"] in {"accepted", "in_progress", "completed", "cancelled", "deleted", "expired"}:
+            if request_row["request_status"] in {
+                "accepted", "appointmentConfirmed", "inProgress",
+                "awaitingConfirmation", "qualityReview", "closed", "archived",
+                "completed", "cancelled", "deleted", "expired",
+            }:
                 continue
             offers = load(request_row["offers"], [])
             current_ids = load(

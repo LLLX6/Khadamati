@@ -39,6 +39,15 @@ from khadamati_domain import (
     SubscriptionService,
     run_subscription_migration_v1,
 )
+from khadamati_workflow import (
+    CompletionEvidenceService,
+    RequestAgreementService,
+    RequestIdempotencyService,
+    RequestLifecycleService,
+    ServiceAssetService,
+    attach_workflow_data,
+    install_workflow_schema,
+)
 
 try:
     from pywebpush import WebPushException, webpush
@@ -61,7 +70,7 @@ def environment_flag(name, default=False):
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
-APP_RELEASE = os.environ.get("KHADAMATI_RELEASE", "v62").strip() or "v62"
+APP_RELEASE = os.environ.get("KHADAMATI_RELEASE", "v63").strip() or "v63"
 DEMO_DATA_ENABLED = environment_flag(
     "KHADAMATI_SEED_DEMO_DATA", APP_ENV in {"development", "test"}
 )
@@ -101,6 +110,8 @@ JSON_LIMITS = {
     "/api/user/profile": 4_000_000,
     "/api/user/requests": 20_000_000,
     "/api/request/collaboration": 10_000_000,
+    "/api/request/workflow": 14_000_000,
+    "/api/service-assets": 4_000_000,
     "/api/admin/ads": 6_000_000,
 }
 
@@ -292,6 +303,42 @@ def normalized_location(value):
     if value.get("label"):
         result["label"] = safe_text(value.get("label"), 80)
     return result
+
+
+def normalized_availability(value, fallback=None):
+    if value in (None, ""):
+        return dict(fallback or {})
+    if not isinstance(value, dict):
+        raise DomainError("invalid_availability", 400)
+    days = value.get("days", [])
+    if not isinstance(days, list):
+        raise DomainError("invalid_availability_days", 400)
+    normalized_days = []
+    for day in days:
+        try:
+            day_number = int(day)
+        except (TypeError, ValueError) as exc:
+            raise DomainError("invalid_availability_days", 400) from exc
+        if day_number < 0 or day_number > 6:
+            raise DomainError("invalid_availability_days", 400)
+        if str(day_number) not in normalized_days:
+            normalized_days.append(str(day_number))
+    start = safe_text(value.get("start"), 5)
+    end = safe_text(value.get("end"), 5)
+    for clock in (start, end):
+        if clock and not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", clock):
+            raise DomainError("invalid_availability_time", 400)
+    if bool(start) != bool(end):
+        raise DomainError("availability_time_range_required", 400)
+    daily_capacity = bounded_int(
+        value.get("dailyCapacity", 0), 0, minimum=0, maximum=100
+    )
+    return {
+        "days": normalized_days,
+        "start": start,
+        "end": end,
+        "dailyCapacity": daily_capacity,
+    }
 
 
 def normalized_provider_services(
@@ -914,6 +961,7 @@ def init_db():
         ensure_column(con, "customer_requests", "dispatch_started_at", "TEXT DEFAULT ''")
         ensure_column(con, "customer_requests", "expansion_at", "TEXT DEFAULT ''")
         ensure_column(con, "customer_requests", "ranking_version", "TEXT DEFAULT ''")
+        install_workflow_schema(con)
         ensure_column(con, "packages", "currency", "TEXT NOT NULL DEFAULT 'OMR'")
         ensure_column(con, "packages", "max_categories", "INTEGER NOT NULL DEFAULT 1")
         ensure_column(con, "packages", "max_wilayats", "INTEGER NOT NULL DEFAULT 5")
@@ -1605,9 +1653,28 @@ def row_customer_request(r, sign_private=False):
     d["dispatchStartedAt"] = d.pop("dispatch_started_at", "")
     d["expansionAt"] = d.pop("expansion_at", "")
     d["rankingVersion"] = d.pop("ranking_version", "")
+    d["assetId"] = d.pop("asset_id", "")
     d["createdAt"] = d.pop("created_at", "")
     d["updatedAt"] = d.pop("updated_at", "")
     return d
+
+
+def request_with_workflow(con, item, *, asset_visible=False):
+    """Attach private workflow details after request-level authorization."""
+    result = attach_workflow_data(con, item, asset_visible=asset_visible)
+    evidence = result.get("completionEvidence")
+    if evidence:
+        evidence["beforeImages"] = [
+            secure_media_url(path) for path in evidence.get("beforeImages", []) if path
+        ]
+        evidence["afterImages"] = [
+            secure_media_url(path) for path in evidence.get("afterImages", []) if path
+        ]
+    asset = result.get("serviceAsset")
+    if asset and asset.get("imagePath"):
+        asset["imageUrl"] = secure_media_url(asset["imagePath"])
+        asset.pop("imagePath", None)
+    return result
 
 
 SUGGESTION_PRESET_KEYS = {
@@ -1931,6 +1998,69 @@ def service_availability_snapshot(con):
     }
 
 
+def provider_operational_insights(con, provider_id):
+    """Return measured funnel counters for one provider workspace."""
+    dispatch = con.execute(
+        """SELECT COUNT(*) dispatched,
+        SUM(CASE WHEN COALESCE(opened_at,'')!='' THEN 1 ELSE 0 END) opened,
+        SUM(CASE WHEN COALESCE(offered_at,'')!='' THEN 1 ELSE 0 END) offered,
+        SUM(CASE WHEN COALESCE(accepted_at,'')!='' THEN 1 ELSE 0 END) accepted,
+        COALESCE(AVG(score),0) average_score
+        FROM request_dispatches WHERE provider_id=?""",
+        (provider_id,),
+    ).fetchone()
+    jobs = con.execute(
+        """SELECT
+        SUM(CASE WHEN status IN ('accepted','appointmentConfirmed','inProgress',
+        'awaitingConfirmation','qualityReview') THEN 1 ELSE 0 END) active_jobs,
+        SUM(CASE WHEN status IN ('closed','archived') THEN 1 ELSE 0 END) completed_jobs
+        FROM customer_requests WHERE accepted_provider_id=?""",
+        (provider_id,),
+    ).fetchone()
+    dispatched = int(dispatch["dispatched"] or 0)
+    opened = int(dispatch["opened"] or 0)
+    offered = int(dispatch["offered"] or 0)
+    accepted = int(dispatch["accepted"] or 0)
+    return {
+        "dispatched": dispatched,
+        "opened": opened,
+        "offered": offered,
+        "accepted": accepted,
+        "activeJobs": int(jobs["active_jobs"] or 0),
+        "completedJobs": int(jobs["completed_jobs"] or 0),
+        "openRate": round(100 * opened / max(1, dispatched), 1),
+        "offerRate": round(100 * offered / max(1, dispatched), 1),
+        "winRate": round(100 * accepted / max(1, offered), 1),
+        "averageMatchScore": round(float(dispatch["average_score"] or 0), 1),
+    }
+
+
+def admin_demand_gaps(con):
+    """Summarize repeatedly unserved demand without exposing customer details."""
+    rows = con.execute(
+        """SELECT service_value,service_name,gov,wilayah,COUNT(*) request_count,
+        MAX(created_at) last_requested_at
+        FROM customer_requests
+        WHERE status='unavailable'
+           OR (status IN ('matching','viewed') AND COALESCE(accepted_provider_id,'')=''
+               AND datetime(created_at)<=datetime('now','-24 hours'))
+        GROUP BY service_value,service_name,gov,wilayah
+        ORDER BY request_count DESC,last_requested_at DESC
+        LIMIT 16"""
+    )
+    return [
+        {
+            "serviceValue": row["service_value"],
+            "serviceName": row["service_name"],
+            "gov": row["gov"],
+            "wilayah": row["wilayah"],
+            "requestCount": int(row["request_count"] or 0),
+            "lastRequestedAt": row["last_requested_at"],
+        }
+        for row in rows
+    ]
+
+
 def login_failure_state(con, account_kind, account_id):
     key = safe_text(account_id, 160) or "unknown"
     row = con.execute(
@@ -2238,7 +2368,10 @@ def get_bootstrap(session=None):
         if is_admin or is_provider:
             marketplace_requests = []
         if is_admin:
-            customer_requests = all_customer_requests
+            customer_requests = [
+                request_with_workflow(con, item, asset_visible=True)
+                for item in all_customer_requests
+            ]
             for item in customer_requests:
                 item["providerSuggestions"] = request_suggestions(con, item["id"], include_hidden=True)
             notifications = [
@@ -2261,6 +2394,14 @@ def get_bootstrap(session=None):
             customer_requests = [
                 item for item in all_customer_requests
                 if pid in item["matchingProviderIds"] or item["acceptedProviderId"] == pid
+            ]
+            customer_requests = [
+                request_with_workflow(
+                    con,
+                    item,
+                    asset_visible=item.get("acceptedProviderId") == pid,
+                )
+                for item in customer_requests
             ]
             consent_service = ContactConsentService(con)
             for item in customer_requests:
@@ -2295,7 +2436,11 @@ def get_bootstrap(session=None):
             ]
         elif is_user:
             uid = session["userId"]
-            customer_requests = [item for item in all_customer_requests if item["userId"] == uid]
+            customer_requests = [
+                request_with_workflow(con, item, asset_visible=True)
+                for item in all_customer_requests
+                if item["userId"] == uid
+            ]
             for item in customer_requests:
                 item["providerSuggestions"] = request_suggestions(con, item["id"])
             marketplace_requests = [item for item in marketplace_requests if item["id"] not in {request["id"] for request in customer_requests}]
@@ -2331,6 +2476,11 @@ def get_bootstrap(session=None):
             ]
             user_row = con.execute("SELECT * FROM app_users WHERE id=?", (uid,)).fetchone()
             users = [row_app_user(user_row, private=True, sign_private=True)] if user_row else []
+            service_assets = ServiceAssetService(con).list_for_user(uid)
+            for asset in service_assets:
+                if asset.get("imagePath"):
+                    asset["imageUrl"] = secure_media_url(asset["imagePath"])
+                    asset.pop("imagePath", None)
             advertisements = [
                 row_advertisement(r)
                 for r in con.execute(
@@ -2339,6 +2489,7 @@ def get_bootstrap(session=None):
             ]
         else:
             customer_requests, notifications, users = [], [], []
+            service_assets = []
             advertisements = [
                 row_advertisement(r)
                 for r in con.execute(
@@ -2508,7 +2659,12 @@ def get_bootstrap(session=None):
             "notifications": notifications,
             "users": users,
             "advertisements": advertisements,
+            "serviceAssets": service_assets if is_user else [],
             "serviceAvailability": service_availability_snapshot(con),
+            "providerInsights": provider_operational_insights(
+                con, session["providerId"]
+            ) if is_provider else {},
+            "demandGaps": admin_demand_gaps(con) if is_admin else [],
             "settings": settings,
             "appConfig": {
                 "nameAr": "خدماتي",
@@ -3772,6 +3928,10 @@ class Handler(SimpleHTTPRequestHandler):
             return self.request_suggestion(data)
         if path == "/api/request/collaboration":
             return self.request_collaboration(data)
+        if path == "/api/request/workflow":
+            return self.request_workflow(data)
+        if path == "/api/service-assets":
+            return self.service_assets(data)
         if path == "/api/notifications/action":
             return self.notification_action(data)
         if path == "/api/recovery/request":
@@ -4031,17 +4191,60 @@ class Handler(SimpleHTTPRequestHandler):
                     ).fetchone()
                     if not current:
                         return self.send_json({"error": "request_not_found"}, 404)
-                    if action in ("cancel", "delete", "pause", "complete", "archive"):
-                        if action in ("complete", "archive") and not current["accepted_provider_id"]:
+                    if action == "complete":
+                        if not current["accepted_provider_id"]:
+                            return self.send_json({"error": "accepted_provider_required"}, 409)
+                        try:
+                            CompletionEvidenceService(con).decide(
+                                request_id, user_id, "resolved"
+                            )
+                        except DomainError as err:
+                            return self.send_domain_error(err)
+                        create_notification(
+                            con,
+                            "provider",
+                            current["accepted_provider_id"],
+                            "أكد العميل اكتمال الخدمة",
+                            current["service_name"] or current["service_value"],
+                            type_="request",
+                            related_id=request_id,
+                            action_text="فتح المهمة",
+                            action_route=f"provider:tasks:{request_id}",
+                        )
+                        updated = con.execute(
+                            "SELECT * FROM customer_requests WHERE id=?",
+                            (request_id,),
+                        ).fetchone()
+                        return self.send_json(
+                            {
+                                "ok": True,
+                                "status": "closed",
+                                "request": request_with_workflow(
+                                    con,
+                                    row_customer_request(updated, sign_private=True),
+                                    asset_visible=True,
+                                ),
+                            }
+                        )
+                    if action in ("cancel", "delete", "pause", "archive"):
+                        if action == "archive" and not current["accepted_provider_id"]:
                             return self.send_json({"error": "accepted_provider_required"}, 409)
                         next_status = {
                             "cancel": "cancelled", "delete": "deleted", "pause": "paused",
-                            "complete": "closed", "archive": "archived",
+                            "archive": "archived",
                         }[action]
                         con.execute(
                             """UPDATE customer_requests SET status=?,offers_open=0,
                             updated_at=CURRENT_TIMESTAMP WHERE id=?""",
                             (next_status, request_id),
+                        )
+                        RequestLifecycleService(con).record(
+                            request_id,
+                            f"request_{action}",
+                            actor_kind="user",
+                            actor_id=user_id,
+                            from_status=current["status"],
+                            to_status=next_status,
                         )
                         create_notification(
                             con, "admin", "", "تم تحديث طلب",
@@ -4052,6 +4255,34 @@ class Handler(SimpleHTTPRequestHandler):
                     if current["accepted_provider_id"]:
                         return self.send_json({"error": "accepted_request_cannot_be_edited"}, 409)
                 else:
+                    idempotency_key = safe_text(
+                        data.get("idempotencyKey")
+                        or self.headers.get("Idempotency-Key", ""),
+                        128,
+                    )
+                    existing_request_id = RequestIdempotencyService(con).find(
+                        user_id, idempotency_key, data
+                    )
+                    if existing_request_id:
+                        existing_request = con.execute(
+                            """SELECT * FROM customer_requests
+                            WHERE id=? AND user_id=?""",
+                            (existing_request_id, user_id),
+                        ).fetchone()
+                        if existing_request:
+                            return self.send_json(
+                                {
+                                    "ok": True,
+                                    "duplicate": True,
+                                    "request": request_with_workflow(
+                                        con,
+                                        row_customer_request(
+                                            existing_request, sign_private=True
+                                        ),
+                                        asset_visible=True,
+                                    ),
+                                }
+                            )
                     request_id = slug("ord")
                 service_value = str(data.get("serviceValue", "") or "").strip()[:120]
                 service_name = str(data.get("serviceName", "") or "").strip()[:120]
@@ -4093,11 +4324,16 @@ class Handler(SimpleHTTPRequestHandler):
                 if budget_max and budget_min > budget_max:
                     return self.send_json({"error": "invalid_budget_range"}, 400)
                 urgency = data.get("urgency", "normal")
-                if urgency not in {"normal", "urgent"}:
+                if urgency not in {"normal", "urgent", "emergency"}:
                     urgency = "normal"
                 schedule_type = data.get("scheduleType", "flexible")
-                if schedule_type not in {"flexible", "scheduled"}:
+                if schedule_type not in {
+                    "flexible", "scheduled", "specific", "agreement"
+                }:
                     schedule_type = "flexible"
+                asset_id = safe_text(data.get("assetId"), 120)
+                if asset_id:
+                    ServiceAssetService(con).get_for_user(asset_id, user_id)
                 if data.get("id"):
                     con.execute("DELETE FROM request_dispatches WHERE request_id=?", (request_id,))
                 con.execute(
@@ -4127,6 +4363,35 @@ class Handler(SimpleHTTPRequestHandler):
                         "[]", "[]", 1,
                     ),
                 )
+                con.execute(
+                    "UPDATE customer_requests SET asset_id=? WHERE id=?",
+                    (asset_id, request_id),
+                )
+                if not data.get("id"):
+                    RequestIdempotencyService(con).remember(
+                        user_id, idempotency_key, request_id, data
+                    )
+                    RequestLifecycleService(con).record(
+                        request_id,
+                        "request_created",
+                        actor_kind="user",
+                        actor_id=user_id,
+                        to_status="matching",
+                        detail={
+                            "serviceValue": service_value,
+                            "gov": request_item["gov"],
+                            "wilayah": request_item["wilayah"],
+                        },
+                    )
+                else:
+                    RequestLifecycleService(con).record(
+                        request_id,
+                        "request_updated",
+                        actor_kind="user",
+                        actor_id=user_id,
+                        from_status=current["status"],
+                        to_status="matching",
+                    )
                 marketplace = RequestMarketplace(con)
                 ranked = marketplace.schedule(request_id)
                 released = marketplace.release_due(request_id)
@@ -4143,7 +4408,11 @@ class Handler(SimpleHTTPRequestHandler):
                 return self.send_json(
                     {
                         "ok": True,
-                        "request": row_customer_request(saved, sign_private=True),
+                        "request": request_with_workflow(
+                            con,
+                            row_customer_request(saved, sign_private=True),
+                            asset_visible=True,
+                        ),
                         "matchedProviders": len(ranked),
                         "notifiedProviders": len(released),
                     },
@@ -4352,6 +4621,14 @@ class Handler(SimpleHTTPRequestHandler):
                 )
                 if result.rowcount != 1:
                     return self.send_json({"error": "request_already_accepted"}, 409)
+                RequestLifecycleService(con).record(
+                    request_id,
+                    "provider_accepted",
+                    actor_kind="provider",
+                    actor_id=provider_id,
+                    from_status=item["status"],
+                    to_status="accepted",
+                )
                 consent_service = ContactConsentService(con)
                 for channel in ("chat", "whatsapp", "call"):
                     consent_service.set_channel(request_id, item["userId"], provider_id, channel, False)
@@ -4456,6 +4733,15 @@ class Handler(SimpleHTTPRequestHandler):
                     "UPDATE customer_requests SET offers=?,status='viewed',updated_at=CURRENT_TIMESTAMP WHERE id=?",
                     (jdump(offers[-12:]), request_id),
                 )
+                RequestLifecycleService(con).record(
+                    request_id,
+                    "offer_submitted",
+                    actor_kind="provider",
+                    actor_id=provider_id,
+                    from_status=item["status"],
+                    to_status="viewed",
+                    detail={"offerId": offer["id"]},
+                )
                 create_notification(
                     con, "user", item["userId"], "وصل عرض جديد لطلبك",
                     f"{session.get('name', 'مزود')} أرسل سعراً ومدة لخدمة {item['serviceName'] or item['serviceValue']}.",
@@ -4519,6 +4805,15 @@ class Handler(SimpleHTTPRequestHandler):
                         request_id,
                     ),
                 )
+                RequestLifecycleService(con).record(
+                    request_id,
+                    "offer_selected",
+                    actor_kind="user",
+                    actor_id=item["userId"],
+                    from_status=item["status"],
+                    to_status="accepted",
+                    detail={"offerId": offer_id, "providerId": selected_provider},
+                )
                 consent_service = ContactConsentService(con)
                 consent_service.set_channel(
                     request_id, item["userId"], selected_provider, "chat", chat_granted
@@ -4565,11 +4860,18 @@ class Handler(SimpleHTTPRequestHandler):
             elif action == "start_work":
                 if not is_user or not item["acceptedProviderId"]:
                     return self.send_json({"error": "start_work_not_allowed"}, 403)
-                if item["status"] not in ("accepted", "inProgress"):
+                if item["status"] not in ("accepted", "appointmentConfirmed", "inProgress"):
                     return self.send_json({"error": "request_stage_not_allowed"}, 409)
-                con.execute(
-                    "UPDATE customer_requests SET status='inProgress',updated_at=CURRENT_TIMESTAMP WHERE id=?",
-                    (request_id,),
+                agreement = RequestAgreementService(con).get(request_id)
+                if agreement and agreement.get("status") != "confirmed":
+                    return self.send_json({"error": "agreement_confirmation_required"}, 409)
+                RequestLifecycleService(con).transition(
+                    request_id,
+                    "inProgress",
+                    actor_kind="user",
+                    actor_id=item["userId"],
+                    event_type="work_started",
+                    allowed_from={"accepted", "appointmentConfirmed", "inProgress"},
                 )
                 con.execute(
                     "UPDATE app_notifications SET is_read=1 WHERE related_id=? AND type='request'",
@@ -4744,6 +5046,239 @@ class Handler(SimpleHTTPRequestHandler):
                 ):
                     response_request["phone"] = ""
             return self.send_json({"ok": True, "request": response_request})
+
+    def request_workflow(self, data):
+        """Handle agreement, execution, and completion on one guarded workflow."""
+        session = self.session()
+        if not session or session.get("kind") not in {"user", "provider"}:
+            return self.send_json({"error": "auth_required"}, 401)
+        request_id = safe_text(data.get("id"), 120)
+        action = safe_text(data.get("action"), 80)
+        if not request_id or action not in {
+            "agreement_save",
+            "agreement_confirm",
+            "start_work",
+            "completion_submit",
+            "completion_decide",
+            "asset_attach",
+        }:
+            return self.send_json({"error": "invalid_workflow_action"}, 400)
+        actor_kind = session["kind"]
+        actor_id = session.get("userId") or session.get("providerId") or ""
+        with db() as con:
+            request_row = con.execute(
+                "SELECT * FROM customer_requests WHERE id=?", (request_id,)
+            ).fetchone()
+            if not request_row:
+                return self.send_json({"error": "request_not_found"}, 404)
+            request = row_customer_request(request_row)
+            is_owner = actor_kind == "user" and request["userId"] == actor_id
+            is_selected_provider = (
+                actor_kind == "provider"
+                and request["acceptedProviderId"] == actor_id
+            )
+            if not (is_owner or is_selected_provider):
+                return self.send_json({"error": "request_access_denied"}, 403)
+
+            if action == "agreement_save":
+                agreement = RequestAgreementService(con).save(
+                    request_id, actor_kind, actor_id, data
+                )
+                target_kind = "provider" if is_owner else "user"
+                target_id = request["acceptedProviderId"] if is_owner else request["userId"]
+                create_notification(
+                    con,
+                    target_kind,
+                    target_id,
+                    "تم تحديث تفاصيل الموعد",
+                    "راجع الموعد والمدة ثم أكّد النسخة الحالية.",
+                    type_="request",
+                    related_id=request_id,
+                    priority="high",
+                    action_text="مراجعة الاتفاق",
+                    action_route=f"{target_kind}:request:{request_id}",
+                )
+            elif action == "agreement_confirm":
+                try:
+                    version = int(data.get("version") or 0)
+                except (TypeError, ValueError):
+                    return self.send_json({"error": "invalid_agreement_version"}, 400)
+                agreement = RequestAgreementService(con).confirm(
+                    request_id, actor_kind, actor_id, version
+                )
+                target_kind = "provider" if is_owner else "user"
+                target_id = request["acceptedProviderId"] if is_owner else request["userId"]
+                title = (
+                    "تم تأكيد الموعد"
+                    if agreement.get("status") == "confirmed"
+                    else "الطرف الآخر أكّد الاتفاق"
+                )
+                create_notification(
+                    con,
+                    target_kind,
+                    target_id,
+                    title,
+                    "افتح الطلب لمراجعة الموعد الحالي.",
+                    type_="request",
+                    related_id=request_id,
+                    action_text="فتح الطلب",
+                    action_route=f"{target_kind}:request:{request_id}",
+                )
+            elif action == "start_work":
+                agreement = RequestAgreementService(con).get(request_id)
+                if agreement and agreement.get("status") != "confirmed":
+                    return self.send_json({"error": "agreement_confirmation_required"}, 409)
+                RequestLifecycleService(con).transition(
+                    request_id,
+                    "inProgress",
+                    actor_kind=actor_kind,
+                    actor_id=actor_id,
+                    event_type="work_started",
+                    allowed_from={"accepted", "appointmentConfirmed"},
+                )
+                target_kind = "provider" if is_owner else "user"
+                target_id = request["acceptedProviderId"] if is_owner else request["userId"]
+                create_notification(
+                    con,
+                    target_kind,
+                    target_id,
+                    "بدأ تنفيذ الطلب",
+                    request["serviceName"] or request["serviceValue"],
+                    type_="request",
+                    related_id=request_id,
+                    priority="high",
+                    action_text="فتح المهمة",
+                    action_route=f"{target_kind}:{'tasks' if target_kind == 'provider' else 'request'}:{request_id}",
+                )
+            elif action == "completion_submit":
+                if not is_selected_provider:
+                    return self.send_json({"error": "provider_required"}, 403)
+                evidence_service = CompletionEvidenceService(con)
+                existing = evidence_service.get(request_id) or {}
+                before_images = existing.get("beforeImages", [])
+                after_images = existing.get("afterImages", [])
+                if data.get("beforeImagesData"):
+                    before_images = save_many_images(
+                        request_id, data["beforeImagesData"], "completion-before", 5
+                    )
+                if data.get("afterImagesData"):
+                    after_images = save_many_images(
+                        request_id, data["afterImagesData"], "completion-after", 5
+                    )
+                evidence = evidence_service.submit(
+                    request_id,
+                    actor_id,
+                    before_images=before_images,
+                    after_images=after_images,
+                    note=safe_text(data.get("note"), 600),
+                )
+                create_notification(
+                    con,
+                    "user",
+                    request["userId"],
+                    "اكتمل العمل بانتظار تأكيدك",
+                    "راجع صور الإنجاز ثم أكّد حل المشكلة أو أرسلها لمراجعة الجودة.",
+                    type_="request",
+                    related_id=request_id,
+                    priority="high",
+                    action_text="مراجعة الإنجاز",
+                    action_route=f"user:request:{request_id}",
+                )
+            elif action == "completion_decide":
+                if not is_owner:
+                    return self.send_json({"error": "request_owner_required"}, 403)
+                decision = safe_text(data.get("decision"), 40)
+                evidence = CompletionEvidenceService(con).decide(
+                    request_id,
+                    actor_id,
+                    decision,
+                    safe_text(data.get("note"), 600),
+                )
+                title = (
+                    "أكد العميل اكتمال الخدمة"
+                    if decision == "resolved"
+                    else "أُحيلت الخدمة لمراجعة الجودة"
+                )
+                create_notification(
+                    con,
+                    "provider",
+                    request["acceptedProviderId"],
+                    title,
+                    request["serviceName"] or request["serviceValue"],
+                    type_="request",
+                    related_id=request_id,
+                    priority="high" if decision == "issue" else "normal",
+                    action_text="فتح المهمة",
+                    action_route=f"provider:tasks:{request_id}",
+                )
+                if decision == "issue":
+                    create_notification(
+                        con,
+                        "admin",
+                        "",
+                        "طلب يحتاج مراجعة جودة",
+                        request["serviceName"] or request["serviceValue"],
+                        type_="quality",
+                        related_id=request_id,
+                        priority="high",
+                        action_text="فتح الطلب",
+                        action_route=f"admin:request:{request_id}",
+                    )
+            elif action == "asset_attach":
+                if not is_owner:
+                    return self.send_json({"error": "request_owner_required"}, 403)
+                ServiceAssetService(con).attach(
+                    request_id, safe_text(data.get("assetId"), 120), actor_id
+                )
+
+            updated_row = con.execute(
+                "SELECT * FROM customer_requests WHERE id=?", (request_id,)
+            ).fetchone()
+            response_request = request_with_workflow(
+                con,
+                row_customer_request(updated_row, sign_private=True),
+                asset_visible=True,
+            )
+            return self.send_json({"ok": True, "request": response_request})
+
+    def service_assets(self, data):
+        session = self.require_user()
+        if not session:
+            return
+        user_id = session["userId"]
+        action = safe_text(data.get("action"), 40) or "list"
+        with db() as con:
+            service = ServiceAssetService(con)
+            if action == "list":
+                assets = service.list_for_user(
+                    user_id, include_archived=bool(data.get("includeArchived"))
+                )
+            elif action == "save":
+                image_path = None
+                if data.get("imageData"):
+                    asset_ref = safe_text(data.get("id"), 80) or user_id
+                    image_path = save_upload_data(
+                        asset_ref,
+                        data["imageData"],
+                        "service-asset",
+                        IMAGE_MIMES,
+                        2_500_000,
+                    )
+                asset = service.save(user_id, data, image_path=image_path)
+                assets = [asset]
+            elif action == "archive":
+                service.archive(safe_text(data.get("id"), 120), user_id)
+                assets = service.list_for_user(user_id, include_archived=True)
+            elif action == "history":
+                history = service.history(safe_text(data.get("id"), 120), user_id)
+                return self.send_json({"ok": True, "history": history})
+            else:
+                return self.send_json({"error": "invalid_service_asset_action"}, 400)
+            for asset in assets:
+                if asset.get("imagePath"):
+                    asset["imageUrl"] = secure_media_url(asset["imagePath"])
+                    asset.pop("imagePath", None)
+            return self.send_json({"ok": True, "serviceAssets": assets})
 
     def notification_action(self, data):
         session = self.session()
@@ -5093,6 +5628,10 @@ class Handler(SimpleHTTPRequestHandler):
                         category_limit=max(1, int(entitlements.get("maxCategories") or 1)),
                         default_areas=areas,
                     )
+                    availability = normalized_availability(
+                        data.get("availability"),
+                        provider.get("availability", {}),
+                    )
                 except DomainError as err:
                     return self.send_domain_error(err)
                 if not name or len(phone) < 11:
@@ -5127,6 +5666,7 @@ class Handler(SimpleHTTPRequestHandler):
                     "hours": safe_text(data.get("hours", provider["hours"]), 240),
                     "status": status,
                     "services": services,
+                    "availability": availability,
                     "primaryServiceId": primary_service_id,
                     "mapVisible": strict_bool(
                         data.get("mapVisible"), provider.get("mapVisible", True)
