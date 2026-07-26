@@ -1,0 +1,351 @@
+/* Khadamati v62: compact mobile workspace, inline voice composer, and actionable alerts. */
+:root{
+  --v62-line:color-mix(in srgb,var(--primary,#078f8c) 18%,var(--line));
+  --v62-soft:color-mix(in srgb,var(--primary,#078f8c) 7%,var(--panel,#fff));
+  --v62-radius:12px;
+}
+
+.compact-empty{
+  min-height:96px!important;
+  padding:24px 14px!important;
+  border-radius:var(--v62-radius)!important;
+}
+
+/* Provider support stays useful without occupying several phone screens. */
+.provider-support-panel{display:grid;gap:12px}
+.compact-panel-head{
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  gap:10px;
+}
+.compact-panel-head h2{margin:0}
+.compact-panel-head .icon-btn{
+  width:38px;
+  height:38px;
+  min-width:38px;
+  border-radius:10px;
+  box-shadow:none;
+}
+.provider-support-panel .textarea{
+  min-height:88px;
+  max-height:160px;
+  resize:vertical;
+}
+.support-submit{justify-self:start;min-width:116px}
+.compact-settings-disclosure{
+  margin-top:10px!important;
+  padding:0!important;
+  overflow:hidden;
+}
+.compact-settings-disclosure>summary{
+  list-style:none;
+  min-height:64px;
+  display:grid;
+  grid-template-columns:40px minmax(0,1fr) 18px;
+  align-items:center;
+  gap:10px;
+  padding:10px 12px;
+  cursor:pointer;
+}
+.compact-settings-disclosure>summary::-webkit-details-marker{display:none}
+.compact-settings-disclosure>summary>.icon-chip{
+  width:40px;
+  height:40px;
+  display:grid;
+  place-items:center;
+  border-radius:10px;
+  color:var(--primary,#078f8c);
+  background:var(--v62-soft);
+}
+.compact-settings-disclosure>summary b,
+.compact-settings-disclosure>summary small{display:block}
+.compact-settings-disclosure>summary b{font-size:.8rem}
+.compact-settings-disclosure>summary small{
+  margin-top:2px;
+  color:var(--muted);
+  font-size:.62rem;
+  line-height:1.35;
+}
+.compact-settings-disclosure>summary>i{
+  color:var(--muted);
+  font-style:normal;
+  transition:transform .18s ease;
+}
+.compact-settings-disclosure[open]>summary>i{transform:rotate(-90deg)}
+[dir="ltr"] .compact-settings-disclosure[open]>summary>i{transform:rotate(90deg)}
+.compact-settings-actions{
+  display:grid;
+  grid-template-columns:repeat(2,minmax(0,1fr));
+  gap:1px;
+  padding:1px 10px 10px;
+  border-top:1px solid var(--v62-line);
+}
+.compact-settings-actions .menu-row{
+  min-height:48px!important;
+  padding:7px!important;
+  border:0!important;
+}
+.compact-settings-actions .menu-row b{font-size:.66rem;line-height:1.3}
+.compact-settings-actions .icon-chip{width:32px;height:32px}
+.compact-complaints-list{
+  display:grid;
+  gap:7px;
+  padding:10px;
+  border-top:1px solid var(--v62-line);
+}
+.compact-complaints-list .list-item{border-radius:10px!important}
+
+/* Conversation index is a compact bottom sheet, not an empty full-screen page. */
+.conversation-hub-sheet .modal-head{min-height:60px}
+.conversation-hub-sheet .modal-body{padding-top:10px!important}
+.conversation-hub-sheet .conversation-list{gap:7px}
+.conversation-hub-sheet .conversation-card{min-height:64px}
+
+/* WhatsApp-style focused conversation surface. */
+.chat-sheet{
+  height:100dvh!important;
+  max-height:100dvh!important;
+  display:flex!important;
+  flex-direction:column!important;
+}
+.chat-sheet .modal-body{
+  height:100%;
+  flex:1 1 auto!important;
+  min-height:0!important;
+  display:flex!important;
+  flex-direction:column!important;
+  overflow:hidden!important;
+}
+.chat-profile-head{
+  flex:0 0 auto;
+  min-height:58px!important;
+  padding-block:max(8px,env(safe-area-inset-top,0px)) 8px!important;
+}
+.chat-profile-head .chat-back{
+  font-size:1.15rem;
+  font-weight:900;
+}
+.chat-profile-identity{grid-template-columns:36px minmax(0,1fr)!important}
+.chat-profile-identity .avatar,
+.chat-partner-avatar{width:36px!important;height:36px!important;border-radius:10px!important}
+.chat-profile-identity b{font-size:.8rem!important}
+.chat-profile-identity small{font-size:.59rem!important}
+.chat-request-head{
+  min-height:34px;
+  padding:6px 11px!important;
+}
+.chat-request-head b,.chat-request-head small{font-size:.61rem!important}
+.chat-sheet .chat-thread{
+  flex:1 1 0!important;
+  min-height:0!important;
+  max-height:none!important;
+  padding:10px 10px 12px!important;
+}
+.chat-sheet .chat-thread>.empty{margin:auto 0}
+.chat-message{padding:8px 10px!important}
+.chat-message p{line-height:1.55}
+.chat-quick-replies{
+  flex:0 0 auto;
+  padding:5px 8px!important;
+  gap:5px!important;
+  overflow-x:auto;
+  white-space:nowrap;
+}
+.chat-quick-replies>button{
+  min-height:32px!important;
+  padding:5px 9px!important;
+  font-size:.6rem!important;
+}
+.contact-locked-note,.contact-control{
+  flex:0 0 auto;
+  margin:5px 8px!important;
+}
+.contact-locked-note{padding:7px 9px!important;font-size:.59rem!important}
+.chat-sheet .chat-composer{
+  flex:0 0 auto!important;
+  display:grid!important;
+  grid-template-columns:40px minmax(0,1fr) 40px 44px!important;
+  align-items:end!important;
+  gap:6px!important;
+  padding:7px max(8px,env(safe-area-inset-right,0px)) max(7px,env(safe-area-inset-bottom,0px)) max(8px,env(safe-area-inset-left,0px))!important;
+}
+.chat-input-shell{
+  position:relative;
+  min-width:0;
+  min-height:40px;
+}
+.chat-input-shell .textarea{
+  display:block;
+  width:100%;
+  min-height:40px!important;
+  max-height:96px!important;
+  margin:0;
+  padding:9px 12px!important;
+  resize:none!important;
+  overflow-y:auto;
+  border-radius:20px!important;
+}
+.chat-record-state{
+  position:absolute!important;
+  z-index:2;
+  inset:0;
+  min-height:40px!important;
+  display:none!important;
+  align-items:center;
+  padding:5px 9px;
+  border:1px solid var(--v62-line);
+  border-radius:20px;
+  background:var(--v62-soft);
+}
+.chat-composer.is-recording .chat-record-state,
+.chat-composer.has-voice .chat-record-state{display:flex!important}
+.chat-composer.is-recording .chat-input-shell .textarea,
+.chat-composer.has-voice .chat-input-shell .textarea{visibility:hidden}
+.chat-record-state .recording-pill,
+.chat-record-state .voice-ready{
+  width:100%;
+  min-width:0;
+  margin:0!important;
+  align-items:center;
+  justify-content:space-between;
+  gap:6px;
+  font-size:.62rem!important;
+}
+.chat-record-state .recording-pill{display:none}
+.chat-record-state .voice-ready{display:none}
+.chat-composer.is-recording .recording-pill{display:flex}
+.chat-composer.has-voice:not(.is-recording) .voice-ready{display:flex}
+.voice-ready button{
+  width:28px;
+  height:28px;
+  min-width:28px;
+  display:grid;
+  place-items:center;
+  border:0;
+  border-radius:50%;
+  color:#b4232d;
+  background:color-mix(in srgb,#c9474f 10%,var(--panel));
+}
+.voice-ready button svg{width:15px;height:15px}
+.chat-sheet .chat-icon-btn,
+.chat-sheet .chat-composer>.pill-btn{margin:0!important}
+
+/* The task indicator appears only after the existing delay and stays out of content. */
+.task-loading-root{inset-block-start:calc(env(safe-area-inset-top,0px) + 8px)}
+.task-loading-pill{
+  min-height:40px;
+  padding:7px 12px;
+  border-radius:12px;
+  box-shadow:0 10px 28px rgba(4,24,34,.24);
+}
+.task-loading-spinner{width:18px;height:18px;flex-basis:18px}
+
+@media(max-width:700px){
+  /* Undo the older two-row provider header. */
+  .provider-topbar .topbar-inner{
+    height:58px!important;
+    min-height:58px!important;
+    display:flex!important;
+    grid-template-columns:none!important;
+    align-items:center!important;
+    justify-content:space-between!important;
+    align-content:normal!important;
+    gap:5px!important;
+    padding:5px 8px!important;
+  }
+  .provider-topbar .provider-brand{
+    width:auto!important;
+    max-width:92px!important;
+    flex:1 1 auto!important;
+    gap:5px!important;
+  }
+  .provider-topbar .provider-brand .image-mark,
+  .provider-topbar .provider-brand .brand-mark{
+    width:36px!important;
+    height:36px!important;
+    flex:0 0 36px!important;
+  }
+  .provider-topbar .provider-brand>span{
+    max-width:48px;
+    font-size:.65rem!important;
+  }
+  .provider-topbar .provider-top-actions{
+    width:auto!important;
+    flex:0 0 auto!important;
+    grid-template-columns:minmax(54px,64px) repeat(4,34px)!important;
+    gap:3px!important;
+  }
+  .provider-topbar .provider-top-actions .icon-btn{
+    width:34px!important;
+    height:34px!important;
+    min-width:34px!important;
+    min-height:34px!important;
+  }
+  .provider-status-toggle{
+    min-width:54px!important;
+    max-width:64px!important;
+    min-height:34px!important;
+    height:34px!important;
+    padding-inline:5px!important;
+    font-size:.56rem!important;
+  }
+  .provider-shell{padding-top:7px!important}
+  .provider-shell .provider-adaptive-nav{
+    top:58px!important;
+    grid-template-columns:repeat(6,minmax(0,1fr))!important;
+    gap:2px!important;
+    margin-inline:0!important;
+    margin-bottom:8px!important;
+    padding:3px!important;
+  }
+  .provider-adaptive-nav button{
+    min-height:52px!important;
+    padding:4px 1px!important;
+    font-size:.52rem!important;
+  }
+  .provider-adaptive-nav button svg{width:17px!important;height:17px!important}
+  .provider-workspace>.panel:first-child{margin-top:0}
+
+  .conversation-hub-sheet{
+    width:100%!important;
+    height:auto!important;
+    min-height:180px;
+    max-height:88dvh!important;
+    margin:auto auto 0!important;
+    border-radius:18px 18px 0 0!important;
+  }
+  .conversation-hub-sheet .modal-head{
+    padding-top:12px!important;
+    border-radius:18px 18px 0 0!important;
+  }
+}
+
+@media(max-width:380px){
+  .provider-topbar .provider-brand{max-width:42px!important}
+  .provider-topbar .provider-brand>span{display:none!important}
+  .provider-topbar .provider-top-actions{
+    grid-template-columns:minmax(50px,60px) repeat(4,32px)!important;
+  }
+  .provider-topbar .provider-top-actions .icon-btn{
+    width:32px!important;height:32px!important;min-width:32px!important;min-height:32px!important;
+  }
+  .provider-status-toggle{min-width:50px!important;max-width:60px!important}
+  .provider-adaptive-nav button{font-size:.49rem!important}
+  .compact-settings-actions{grid-template-columns:1fr}
+  .chat-sheet .chat-composer{
+    grid-template-columns:38px minmax(0,1fr) 38px 42px!important;
+    gap:4px!important;
+    padding-inline:6px!important;
+  }
+  .chat-sheet .chat-icon-btn{width:38px!important;height:38px!important}
+  .chat-sheet .chat-composer>.pill-btn{width:42px!important}
+}
+
+@media(min-width:701px){
+  .conversation-hub-sheet{height:auto!important}
+}
+
+@media(prefers-reduced-motion:reduce){
+  .compact-settings-disclosure>summary>i{transition:none}
+}

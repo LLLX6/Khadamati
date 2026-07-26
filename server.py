@@ -3574,6 +3574,18 @@ class Handler(SimpleHTTPRequestHandler):
             with db() as con:
                 con.execute("INSERT INTO provider_requests(id,payload) VALUES(?,?)", (item["id"], jdump(item)))
                 settings = jload(con.execute("SELECT value FROM settings WHERE key='platform'").fetchone()["value"], {})
+                create_notification(
+                    con,
+                    "admin",
+                    "",
+                    "طلب تسجيل شركة جديد" if item["providerType"] == "company" else "طلب تسجيل مزود جديد",
+                    f"{item['name']} • {item['phone']}",
+                    type_="provider_request",
+                    related_id=item["id"],
+                    priority="high",
+                    action_text="مراجعة الطلب",
+                    action_route=f"admin:providerRequest:{item['id']}",
+                )
             send_whatsapp(settings.get("adminWhatsapp"), f"طلب مزود جديد في خدماتي: {item['name']} - {item['phone']} - {len(item['services'])} خدمات")
             safe_item = provider_request_view(item)
             return self.send_json({"ok": True, "request": safe_item}, 201)

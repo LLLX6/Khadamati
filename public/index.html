@@ -643,6 +643,7 @@ button,[data-action]{touch-action:manipulation}
 <link rel="stylesheet" href="assets/styles/khadamati-v59.css?v=59" />
 <link rel="stylesheet" href="assets/styles/khadamati-v60.css?v=60" />
 <link rel="stylesheet" href="assets/styles/khadamati-v61.css?v=61" />
+<link rel="stylesheet" href="assets/styles/khadamati-v62.css?v=62" />
 </head>
 <body>
 <div id="app" class="app-shell"><div class="startup-skeleton" aria-label="جاري تحميل خدماتي"><div class="skeleton-bar"></div><div class="skeleton-search"></div><div class="skeleton-banner"></div><div class="skeleton-grid"><i></i><i></i><i></i><i></i><i></i><i></i></div></div></div>
@@ -656,8 +657,8 @@ button,[data-action]{touch-action:manipulation}
 'use strict';
 const STORAGE_KEY = 'KHADAMATI_MARKET_OS_V21';
 const PRIVATE_STATE_KEY = 'KHADAMATI_PRIVATE_STATE_V1';
-const APP_VERSION = 61;
-const APP_BUILD = 'khadamati-app-v61-conversation-hub-2026-07-26';
+const APP_VERSION = 62;
+const APP_BUILD = 'khadamati-app-v62-mobile-workspace-2026-07-26';
 const LEGACY_STORAGE_KEYS = ['KHADAMATI_MARKET_OS_V20','FORAN_MARKET_OS_V14'];
 const ONBOARDING_STORAGE_KEY = 'KHADAMATI_ONBOARDING_V4';
 const SUBSCRIPTION_MIGRATION_KEY = 'KHADAMATI_SUBSCRIPTION_MIGRATION_V1';
@@ -682,11 +683,13 @@ let ONBOARDING_FLOW = null;
 let CHAT_RECORDER = null;
 let CHAT_AUDIO_DATA = '';
 let CHAT_RECORD_TIMER = null;
+const CHAT_DRAFT_KEY = 'KHADAMATI_CHAT_DRAFTS_V1';
 let ARRIVAL_WATCH_ID = null;
 let ARRIVAL_WATCH_REQUEST_ID = '';
 const MODAL_STACK = [];
 let TASK_LOADING_SEQUENCE = 0;
 const TASK_LOADING_HANDLES = new Map();
+let ACCOUNT_REFRESH_TIMER = null;
 const MAP_INSTANCES = new Map();
 let MAP_WATCH_ID = null;
 let MAP_LOCATION_SYNC_AT = 0;
@@ -1917,6 +1920,30 @@ function openAppDeepLink(route=location.href){
  const provider=hash.match(/provider=([^&]+)/);if(provider){setTimeout(()=>openProviderDetails(decodeURIComponent(provider[1])),40);return true;}
  return false;
 }
+function activeAccountRefreshSignature(){
+ const kind=activeAuthKind(),identity=authSubjectForKind(kind);
+ const notifications=targetNotifications(kind,identity).map(n=>`${n.id}:${n.read?'1':'0'}:${n.createdAt||n.created_at||''}`).join('|');
+ const requests=(S.customerRequests||[]).map(r=>`${r.id}:${r.status}:${r.updatedAt||r.updated_at||''}:${(r.messages||[]).length}:${(r.offers||[]).length}`).join('|');
+ const providerRequests=kind==='admin'?(S.providerRequests||[]).map(r=>r.id).join('|'):'';
+ return `${notifications}::${requests}::${providerRequests}`;
+}
+async function refreshActiveAccountData(){
+ const token=activeAuthToken();
+ if(!token||document.hidden||!navigator.onLine||document.querySelector('#modalRoot .modal')||window.__khadamatiAccountRefreshBusy)return;
+ window.__khadamatiAccountRefreshBusy=true;
+ try{
+  const before=activeAccountRefreshSignature();
+  mergeRemote(await api('/api/bootstrap',null,token,{silentLoading:true}));
+  const changed=before!==activeAccountRefreshSignature();
+  save();
+  if(changed)render();
+ }catch(err){if(String(err?.message||err)!=='request_failed')console.warn('Account refresh skipped');}
+ finally{window.__khadamatiAccountRefreshBusy=false;}
+}
+function startAccountAutoRefresh(){
+ clearInterval(ACCOUNT_REFRESH_TIMER);
+ ACCOUNT_REFRESH_TIMER=setInterval(refreshActiveAccountData,15000);
+}
 async function boot(){
  const started=performance.now();
  render();
@@ -1935,6 +1962,7 @@ async function boot(){
  ensurePlatform();const loadMs=Math.round(performance.now()-started);S.systemMetrics.launches=Number(S.systemMetrics.launches||0)+1;S.systemMetrics.lastLoadMs=loadMs;S.systemMetrics.loadSamples=[...(S.systemMetrics.loadSamples||[]),loadMs].slice(-30);save();
  setTimeout(()=>openAppDeepLink(location.href),220);
  if(navigator.onLine)setTimeout(flushOfflineQueue,500);
+ startAccountAutoRefresh();
 }
 function initials(name){ return String(name||'?').trim().split(/\s+/).map(x=>x[0]).slice(0,2).join(''); }
 function waUrl(phone,msg){ return `https://wa.me/${phoneClean(phone)}?text=${encodeURIComponent(msg)}`; }
@@ -2178,12 +2206,39 @@ function accountUpdateNotifications(role=activeAuthKind()){
 }
 function unreadChatNotifications(role=activeAuthKind()){return accountChatNotifications(role).filter(n=>!n.read).length;}
 function unreadUpdateNotifications(role=activeAuthKind()){return accountUpdateNotifications(role).filter(n=>!n.read).length;}
+function chatDraftStore(){return safeJson(localStorage.getItem(CHAT_DRAFT_KEY),{})||{};}
+function chatDraftId(requestId,role=activeAuthKind()){
+ const identity=accountNotificationIdentity(role);
+ return `${role}:${identity.id||'account'}:${requestId}`;
+}
+function readChatDraft(requestId,role){return String(chatDraftStore()[chatDraftId(requestId,role)]||'');}
+function saveChatDraft(requestId,role,text){
+ const drafts=chatDraftStore(),key=chatDraftId(requestId,role),value=String(text||'').slice(0,1000);
+ if(value.trim())drafts[key]=value;else delete drafts[key];
+ try{localStorage.setItem(CHAT_DRAFT_KEY,JSON.stringify(drafts));}catch(_){}
+}
+function clearChatDraft(requestId,role){saveChatDraft(requestId,role,'');}
+function resizeChatComposerInput(box){
+ if(!box)return;
+ box.style.height='auto';
+ box.style.height=`${Math.min(96,Math.max(40,box.scrollHeight))}px`;
+}
+function bindChatComposerDraft(requestId,role){
+ const box=document.getElementById('chatText');if(!box)return;
+ if(!box.value)box.value=readChatDraft(requestId,role);
+ resizeChatComposerInput(box);
+ if(box.dataset.draftBound==='1')return;
+ box.dataset.draftBound='1';
+ box.addEventListener('input',()=>{resizeChatComposerInput(box);saveChatDraft(requestId,role,box.value);});
+}
 function conversationRequests(role=activeAuthKind()){
  const id=role==='provider'?S.currentProviderId:S.session?.userId,rows=(S.customerRequests||[]).filter(request=>{
   if(!request?.acceptedProviderId||!requestContactConsent(request).chat)return false;
   return role==='provider'?request.acceptedProviderId===id:request.userId===id;
  });
  return rows.sort((a,b)=>{
+  const unreadDiff=conversationUnreadIds(b,role).length-conversationUnreadIds(a,role).length;
+  if(unreadDiff)return unreadDiff;
   const last=row=>(row.messages||[]).slice(-1)[0]?.createdAt||row.updatedAt||row.acceptedAt||row.createdAt||'';
   return String(last(b)).localeCompare(String(last(a)));
  });
@@ -2213,7 +2268,7 @@ function conversationCard(request,role=activeAuthKind()){
 }
 function renderConversationsHub(role=activeAuthKind()){
  const rows=conversationRequests(role),identity=accountNotificationIdentity(role),unread=unreadChatNotifications(role);
- return `<div class="modal sheet conversation-hub-sheet"><div class="modal-head"><div><div class="modal-title">${icon('chat')} ${L('المحادثات','Chats')} ${unread?`<span class="badge">${unread}</span>`:''}</div><small class="muted">${role==='provider'?L('محادثات العملاء للمهام المقبولة','Customer chats for accepted jobs'):L('محادثاتك مع المزودين المختارين','Chats with your selected providers')}</small></div><button class="close-btn" data-action="closeModal">${icon('x')}</button></div><div class="modal-body"><div class="conversation-hub-summary"><span>${icon('shield')}</span><div><b>${rows.length} ${L('محادثة نشطة','active chats')}</b><small>${L('كل محادثة مرتبطة بطلب واحد لحماية الخصوصية.','Each chat belongs to one request for privacy.')}</small></div></div><div class="conversation-list">${rows.length?rows.map(request=>conversationCard(request,role)).join(''):`<div class="empty">${L('لا توجد محادثات بعد. تظهر هنا بعد اختيار عرض وفتح التواصل.','No chats yet. They appear after an offer is selected and chat opens.')}</div>`}</div>${!identity.id?`<div class="guest-note">${L('سجّل الدخول لعرض محادثات حسابك.','Sign in to view your account chats.')}</div>`:''}</div></div>`;
+ return `<div class="modal sheet conversation-hub-sheet"><div class="modal-head"><div class="modal-title">${icon('chat')} ${L('المحادثات','Chats')} ${unread?`<span class="badge">${unread}</span>`:''}</div><button class="close-btn" data-action="closeModal">${icon('x')}</button></div><div class="modal-body"><div class="conversation-list">${rows.length?rows.map(request=>conversationCard(request,role)).join(''):`<div class="empty compact-empty">${L('لا توجد محادثات بعد.','No chats yet.')}</div>`}</div>${!identity.id?`<div class="guest-note">${L('سجّل الدخول لعرض محادثاتك.','Sign in to view your chats.')}</div>`:''}</div></div>`;
 }
 async function conversationsSheet(){
  const role=S.view==='provider'?'provider':'user',token=role==='provider'?AUTH.providerToken:AUTH.userToken;
@@ -2693,15 +2748,16 @@ async function openNotificationChat(n){
 }
 function openRequestChat(requestId,preferredRole='',options={}){
  const r=requestByAnyId(requestId);if(!r||!r.acceptedProviderId){toast(L('تُفتح المحادثة بعد اختيار أحد العروض.','Chat opens after selecting an offer.'));return;}
- const role=['provider','user'].includes(preferredRole)?preferredRole:(S.view==='provider'?'provider':'user'),p=getProvider(r.acceptedProviderId),chatPartner=role==='provider'?(r.customerName||L('عميل خدماتي','Khadamati customer')):(p?.name||L('مزود الخدمة','Service provider')),partnerAvatar=role==='user'&&p?avatarHtml(p):`<span class="chat-partner-avatar">${icon('user')}</span>`;CHAT_AUDIO_DATA='';
+ const role=['provider','user'].includes(preferredRole)?preferredRole:(S.view==='provider'?'provider':'user'),p=getProvider(r.acceptedProviderId),customer=(S.users||[]).find(user=>user.id===r.userId),chatPartner=role==='provider'?(r.customerName||customer?.name||L('عميل خدماتي','Khadamati customer')):(p?.name||L('مزود الخدمة','Service provider')),partnerAvatar=role==='user'&&p?avatarHtml(p):avatarHtml({name:chatPartner,avatar:customer?.avatar||initials(chatPartner)});CHAT_AUDIO_DATA='';
  const consent=requestContactConsent(r);if(!consent.chat){if(role==='user')contactConsentSheet(r.id);else toast(L('بانتظار سماح العميل بالمحادثة لهذا الطلب.','Waiting for the customer to allow chat for this request.'));return;}
  const target=role==='provider'?'provider':'user',targetId=role==='provider'?S.currentProviderId:(S.session?.userId||'');(S.notifications||[]).forEach(item=>{if(notificationIsChat(item)&&notificationTargetMatch(item,target,targetId)){const itemRequest=notificationChatRequestId(item);if(itemRequest===r.id||itemRequest===r.serverId)item.read=true;}});save();
-  openModal(`<div class="modal sheet chat-sheet" data-request-id="${esc(r.id)}" data-chat-role="${role}"><div class="modal-head chat-profile-head"><button class="close-btn chat-back" data-action="closeModal" aria-label="${L('العودة','Back')}">${dirFor(S.lang)==='rtl'?'→':'←'}</button><div class="chat-profile-identity">${partnerAvatar}<div><b>${esc(chatPartner)}</b><small>${esc(r.serviceName)} • ${requestLabel(r.status)}</small></div></div><button class="chat-header-action" data-action="openArrivalTracking" data-id="${r.id}" title="${L('الموقع والمتابعة','Location and tracking')}">${icon('map')}</button></div><div class="modal-body"><div class="chat-request-head"><b>${esc(r.wilayah||r.gov||L('طلب خدمة','Service request'))}</b><small class="muted">${requestDateTimeLabel(r)||L('محادثة خاصة بهذا الطلب','Request-specific chat')}</small></div><div class="chat-thread" id="chatThread">${(r.messages||[]).map(m=>chatMessageHtml(m,role)).join('')||`<div class="empty">${L('ابدأ المحادثة بتأكيد التفاصيل أو الموعد.','Start by confirming the details or appointment.')}</div>`}</div><div class="chat-composer"><label class="chat-icon-btn" title="${L('إرفاق صورة','Attach image')}">${icon('plus')}<input class="hidden" id="chatImage" type="file" accept="image/*"></label><textarea class="textarea" id="chatText" maxlength="1000" rows="1" placeholder="${L('اكتب رسالة...','Message...')}"></textarea><button class="chat-icon-btn" id="chatRecordButton" data-action="toggleChatRecording" title="${L('رسالة صوتية','Voice message')}">${icon('mic')}</button><button class="pill-btn primary" data-action="sendChatMessage" data-id="${r.id}" aria-label="${L('إرسال','Send')}">${icon('chat')}</button><div class="chat-record-state"><span class="recording-pill" id="chatRecordingPill">${L('جارٍ التسجيل','Recording')} <b id="chatRecordSeconds">0:00</b></span><span class="voice-ready" id="chatVoiceReady"></span></div></div></div></div>`,options);
+  openModal(`<div class="modal sheet chat-sheet" data-request-id="${esc(r.id)}" data-chat-role="${role}"><div class="modal-head chat-profile-head"><button class="chat-back" data-action="closeModal" aria-label="${L('العودة','Back')}">${dirFor(S.lang)==='rtl'?'→':'←'}</button><div class="chat-profile-identity">${partnerAvatar}<div><b>${esc(chatPartner)}</b><small>${esc(r.serviceName)} • ${requestLabel(r.status)}</small></div></div><button class="chat-header-action" data-action="openArrivalTracking" data-id="${r.id}" title="${L('الموقع والمتابعة','Location and tracking')}">${icon('map')}</button></div><div class="modal-body"><div class="chat-request-head"><b>${esc(r.wilayah||r.gov||L('طلب خدمة','Service request'))}</b><small class="muted">${requestDateTimeLabel(r)||L('محادثة الطلب','Request chat')}</small></div><div class="chat-thread" id="chatThread">${(r.messages||[]).map(m=>chatMessageHtml(m,role)).join('')||`<div class="empty compact-empty">${L('ابدأ بتأكيد التفاصيل أو الموعد.','Confirm the details or appointment to start.')}</div>`}</div><div class="chat-composer"><label class="chat-icon-btn" title="${L('إرفاق صورة','Attach image')}">${icon('plus')}<input class="hidden" id="chatImage" type="file" accept="image/*"></label><div class="chat-input-shell"><textarea class="textarea" id="chatText" maxlength="1000" rows="1" placeholder="${L('اكتب رسالة...','Message...')}"></textarea><div class="chat-record-state"><span class="recording-pill" id="chatRecordingPill">${L('جارٍ التسجيل','Recording')} <b id="chatRecordSeconds">0:00</b></span><span class="voice-ready" id="chatVoiceReady"></span></div></div><button class="chat-icon-btn" id="chatRecordButton" data-action="toggleChatRecording" title="${L('رسالة صوتية','Voice message')}">${icon('mic')}</button><button class="pill-btn primary" data-action="sendChatMessage" data-id="${r.id}" aria-label="${L('إرسال','Send')}">${icon('chat')}</button></div></div></div>`,options);
  const recordButton=document.getElementById('chatRecordButton');if(recordButton)recordButton.innerHTML=icon('mic');
  const replies=role==='provider'?[L('متاح اليوم، ما الوقت المناسب؟','I am available today. What time suits you?'),L('أرسل موقع التنفيذ من فضلك.','Please send the service location.'),L('تم تأكيد الموعد.','The appointment is confirmed.')]:[L('أرسل الوقت المتاح من فضلك.','Please send your available time.'),L('تم، أنا موافق على الموعد.','Confirmed, the appointment works for me.'),L('سأرسل صورة أوضح للمشكلة.','I will send a clearer photo of the issue.')];
   document.querySelector('.chat-composer')?.insertAdjacentHTML('beforebegin',`<div class="chat-quick-replies"><button class="chat-location-action" data-action="shareChatLocation" data-id="${r.id}">${icon('map')} ${L('مشاركة الموقع','Share location')}</button>${replies.map(text=>`<button data-action="chatQuickReply" data-text="${esc(text)}">${esc(text)}</button>`).join('')}</div>`);
- const contactArea=role==='provider'?(consent.whatsapp||consent.call?`<div class="row-actions" style="margin-top:8px">${consent.whatsapp?`<button class="ghost-btn tiny" data-action="providerCustomerWhatsapp" data-id="${r.id}">${icon('chat')} ${L('واتساب العميل','Customer WhatsApp')}</button>`:''}${consent.call?`<button class="ghost-btn tiny" data-action="providerCustomerCall" data-id="${r.id}">${icon('phone')} ${L('اتصال بالعميل','Call customer')}</button>`:''}</div>`:`<div class="contact-locked-note">${icon('shield')} ${L('رقم العميل مخفي حتى يسمح بواتساب أو الاتصال لهذا الطلب.','The customer number stays hidden until they allow WhatsApp or calls for this request.')}</div>`):`<button class="ghost-btn tiny contact-control" data-action="manageRequestContact" data-id="${r.id}" style="margin-top:8px">${icon('shield')} ${L('تحديد طرق التواصل','Choose contact channels')}</button>`;
+ const contactArea=role==='provider'?(consent.whatsapp||consent.call?`<div class="row-actions" style="margin-top:8px">${consent.whatsapp?`<button class="ghost-btn tiny" data-action="providerCustomerWhatsapp" data-id="${r.id}">${icon('chat')} ${L('واتساب','WhatsApp')}</button>`:''}${consent.call?`<button class="ghost-btn tiny" data-action="providerCustomerCall" data-id="${r.id}">${icon('phone')} ${L('اتصال','Call')}</button>`:''}</div>`:`<div class="contact-locked-note">${icon('shield')} ${L('بيانات التواصل مخفية حتى يسمح العميل.','Contact details stay hidden until allowed.')}</div>`):`<button class="ghost-btn tiny contact-control" data-action="manageRequestContact" data-id="${r.id}" style="margin-top:8px">${icon('shield')} ${L('طرق التواصل','Contact options')}</button>`;
  document.querySelector('.chat-quick-replies')?.insertAdjacentHTML('beforebegin',contactArea);
+  bindChatComposerDraft(r.id,role);
   setTimeout(()=>{const thread=document.getElementById('chatThread');if(thread)thread.scrollTop=thread.scrollHeight;},50);
   startRequestChatPolling(r.id,role);
 }
@@ -3196,18 +3252,25 @@ function providerGrowthTips(p,conversion=0){
  return tips.slice(0,4);
 }
 function providerPerformance(p){ const q=p.qualityScore??profileStrength(p),reviews=providerReviews(p.id),views=Number(p.stats?.views||0),contacts=Number(p.stats?.whatsapp||0)+Number(p.stats?.calls||0),conversion=views?Math.round(contacts/views*100):0,tips=providerGrowthTips(p,conversion); return `<div class="admin-grid grid"><div class="card mini-stat"><span>${tr('views')}</span><b>${views}</b></div><div class="card mini-stat"><span>${L('تواصلات','Contacts')}</span><b>${contacts}</b></div><div class="card mini-stat"><span>${L('تحويل','Conversion')}</span><b>${conversion}%</b></div><div class="card mini-stat"><span>${tr('rating')}</span><b>${p.rating||0}</b></div></div><div class="panel" style="margin-top:14px"><h2>${L('جودة الملف','Profile quality')}</h2><div class="quality-row"><div class="score-ring" style="--score:${q}"><span>${q}%</span></div><div><b>${L('كلما اكتمل ملفك زاد ظهورك في النتائج','A complete profile ranks higher in results')}</b><p class="muted">${L('أكمل الصور والأوقات ومناطق العمل وحافظ على التقييمات.','Complete photos, hours, coverage, and maintain ratings.')}</p></div></div></div><div class="panel" style="margin-top:14px"><h2>${L('خطوات نمو مقترحة','Suggested growth steps')}</h2><ul class="growth-tips">${tips.map(x=>`<li>${icon('sparkle')} ${esc(x)}</li>`).join('')||`<li>${L('أداء جيد. حافظ على سرعة الرد وجودة الخدمة.','Good performance. Keep response fast and service quality high.')}</li>`}</ul></div><div class="panel" style="margin-top:14px"><h2>${L('آخر التقييمات الموثقة','Latest verified reviews')}</h2><div class="review-list">${reviews.map(r=>`<div class="review-item"><div class="row-actions" style="justify-content:space-between"><b>⭐ ${r.rating||0} ${r.verified?'✓':''}</b><button class="ghost-btn tiny" data-action="reviewReplyForm" data-id="${r.id}">${r.providerReply?L('تعديل الرد','Edit reply'):L('رد','Reply')}</button></div><div class="review-dimensions"><span>${L('الجودة','Quality')} ${r.dimensions?.quality||r.rating}</span><span>${L('الموعد','Time')} ${r.dimensions?.punctuality||r.rating}</span><span>${L('التعامل','Communication')} ${r.dimensions?.communication||r.rating}</span><span>${L('القيمة','Value')} ${r.dimensions?.value||r.rating}</span></div><p>${esc(r.comment||'')}</p>${r.providerReply?`<div class="provider-reply"><b>${L('رد المزود','Provider reply')}</b><p>${esc(r.providerReply)}</p></div>`:''}</div>`).join('')||`<div class="empty">${L('لا توجد تقييمات بعد','No reviews yet')}</div>`}</div></div>`; }
-function providerSupport(p){ const complaints=(S.complaints||[]).filter(c=>c.provider_id===p.id||c.providerId===p.id); return `<div class="panel"><h2>${tr('providerSupport')}</h2><div class="field"><label>${tr('sendNote')}</label><textarea class="textarea" id="supportNote"></textarea></div><div class="row-actions" style="margin-top:14px"><button class="pill-btn primary" data-action="sendProviderSupport">${tr('sendNote')}</button><button class="ghost-btn" data-action="replayOnboarding">${icon('sparkle')} ${L('دليل لوحة الأعمال','Workspace guide')}</button></div></div><div class="panel" style="margin-top:14px"><h2>${L('إعدادات الحساب','Account settings')}</h2><div class="row-actions"><button class="ghost-btn" data-action="openNotificationSettings">${icon('bell')} ${L('إشعارات الهاتف','Phone notifications')}</button><button class="ghost-btn" data-action="forgotPassword" data-kind="provider">${icon('shield')} ${L('استرجاع رمز الدخول','Recover access code')}</button><button class="ghost-btn danger" data-action="deleteAccountPrompt" data-kind="provider">${icon('shield')} ${L('حذف الحساب','Delete account')}</button><button class="ghost-btn" data-action="providerLogout">${icon('user')} ${L('تسجيل الخروج من حساب المزود','Sign out of provider account')}</button></div></div><div class="panel" style="margin-top:14px"><h2>${L('الشكاوى والمتابعة','Complaints and follow-up')}</h2><div class="list">${complaints.map(c=>`<div class="list-item"><div><b>${esc(c.reason||L('شكوى','Complaint'))}</b><div class="muted">${esc(c.status)} • ${esc(c.created_at||c.createdAt||'')}</div><p>${esc(c.detail||'')}</p></div></div>`).join('')||`<div class="empty">${L('لا توجد شكاوى على حسابك','No complaints on your account')}</div>`}</div></div>`; }
+function providerSupport(p){
+ const complaints=(S.complaints||[]).filter(c=>c.provider_id===p.id||c.providerId===p.id);
+ return `<div class="panel provider-support-panel"><div class="compact-panel-head"><h2>${tr('providerSupport')}</h2><button class="icon-btn" data-action="replayOnboarding" title="${L('دليل لوحة الأعمال','Workspace guide')}" aria-label="${L('دليل لوحة الأعمال','Workspace guide')}">${icon('sparkle')}</button></div><div class="field"><label>${tr('sendNote')}</label><textarea class="textarea" id="supportNote" rows="3" maxlength="600" placeholder="${L('اكتب ملاحظتك للإدارة','Write your note to management')}"></textarea></div><button class="pill-btn primary support-submit" data-action="sendProviderSupport">${tr('sendNote')}</button></div>
+ <details class="panel compact-settings-disclosure"><summary><span class="icon-chip">${icon('settings')}</span><span><b>${L('الحساب والأمان','Account & security')}</b><small>${L('الإشعارات، الرمز، وتسجيل الخروج','Notifications, access code, and sign out')}</small></span><i>${dirFor(S.lang)==='rtl'?'←':'→'}</i></summary><div class="compact-settings-actions"><button class="menu-row" data-action="openNotificationSettings"><span class="icon-chip">${icon('bell')}</span><b>${L('إشعارات الهاتف','Phone notifications')}</b></button><button class="menu-row" data-action="forgotPassword" data-kind="provider"><span class="icon-chip">${icon('shield')}</span><b>${L('استرجاع رمز الدخول','Recover access code')}</b></button><button class="menu-row" data-action="providerLogout"><span class="icon-chip">${icon('user')}</span><b>${L('تسجيل الخروج','Sign out')}</b></button><button class="menu-row danger" data-action="deleteAccountPrompt" data-kind="provider"><span class="icon-chip">${icon('shield')}</span><b>${L('حذف الحساب','Delete account')}</b></button></div></details>
+ <details class="panel compact-settings-disclosure complaints-disclosure"><summary><span class="icon-chip">${icon('bell')}</span><span><b>${L('الشكاوى والمتابعة','Complaints')}</b><small>${complaints.length?`${complaints.length} ${L('قيد المتابعة','in follow-up')}`:L('لا توجد شكاوى','No complaints')}</small></span><i>${dirFor(S.lang)==='rtl'?'←':'→'}</i></summary>${complaints.length?`<div class="compact-complaints-list">${complaints.map(c=>`<div class="list-item"><div><b>${esc(c.reason||L('شكوى','Complaint'))}</b><div class="muted">${esc(c.status)} • ${esc(c.created_at||c.createdAt||'')}</div><p>${esc(c.detail||'')}</p></div></div>`).join('')}</div>`:''}</details>`;
+}
 function adminNotificationDestination(n){
  const parts=String(n?.actionRoute||'').split(':'),kind=parts[0]==='admin'?parts[1]:'';
- const mapped=kind==='user'?'audience':kind==='recovery'?'credentials':kind==='subscription'?'subscriptions':kind==='request'?'leads':kind==='advertisement'?'ads':kind==='company'?'companies':kind==='provider'?'providers':'';
- const fallback={provider:'providers',company:'companies',user:'audience',security:'credentials',subscription:'subscriptions',payment:'finance',request:'leads',offer:'leads',unavailable:'unavailable',expiry:'expiries',ad:'ads',advertisement:'ads',complaint:'complaints'}[n?.type]||'notifications';
+ const mapped=kind==='user'?'audience':kind==='recovery'?'credentials':kind==='subscription'?'subscriptions':kind==='request'?'leads':kind==='advertisement'?'ads':kind==='company'?'companies':kind==='providerRequest'?'providerRequests':kind==='provider'?'providers':'';
+ const fallback={provider:'providers',provider_request:'providerRequests',company:'companies',user:'audience',security:'credentials',subscription:'subscriptions',payment:'finance',request:'leads',offer:'leads',unavailable:'unavailable',expiry:'expiries',ad:'ads',advertisement:'ads',complaint:'complaints'}[n?.type]||'notifications';
  const route=String(mapped||n?.actionRoute||fallback).split(':')[0];
  return ['overview','notifications','leads','providers','companies','unavailable','subscriptions','expiries','ads','audience','credentials','assistant','providerRequests','complaints','categoryAdmin','finance','reports','quality','settings','backup'].includes(route)?route:'notifications';
 }
 function adminSectionUnread(tab){
  const unread=targetNotifications('admin').filter(n=>!n.read);
  if(tab==='notifications')return unread.length;
- return unread.filter(n=>adminNotificationDestination(n)===tab).length;
+ const routed=unread.filter(n=>adminNotificationDestination(n)===tab).length;
+ if(tab==='providerRequests')return Math.max(routed,(S.providerRequests||[]).length);
+ return routed;
 }
 function filterAdminNotificationItems(filter='all'){
  const items=targetNotifications('admin');
@@ -3734,6 +3797,7 @@ function stopChatRecording(){
  clearInterval(CHAT_RECORD_TIMER);CHAT_RECORD_TIMER=null;
  document.getElementById('chatRecordButton')?.classList.remove('recording');
  document.getElementById('chatRecordingPill')?.classList.remove('show');
+ document.querySelector('.chat-composer')?.classList.remove('is-recording');
 }
 async function toggleChatRecording(){
  if(CHAT_RECORDER?.state==='recording'){stopChatRecording();return;}
@@ -3742,8 +3806,8 @@ async function toggleChatRecording(){
   const stream=await navigator.mediaDevices.getUserMedia({audio:true}),preferred=['audio/webm;codecs=opus','audio/mp4','audio/webm'].find(type=>MediaRecorder.isTypeSupported?.(type)),chunks=[];
   CHAT_AUDIO_DATA='';CHAT_RECORDER=new MediaRecorder(stream,preferred?{mimeType:preferred}:undefined);
   CHAT_RECORDER.ondataavailable=e=>{if(e.data?.size)chunks.push(e.data);};
-  CHAT_RECORDER.onstop=()=>{stream.getTracks().forEach(track=>track.stop());const blob=new Blob(chunks,{type:CHAT_RECORDER.mimeType||chunks[0]?.type||'audio/webm'});if(!blob.size){toast(L('لم يُلتقط صوت. حاول التسجيل مرة أخرى.','No audio was captured. Please record again.'));return;}if(blob.size>4000000){toast(L('التسجيل طويل جداً. حاول رسالة أقصر.','Recording is too large. Try a shorter message.'));return;}const reader=new FileReader();reader.onerror=()=>toast(L('تعذر تجهيز الرسالة الصوتية. حاول مرة أخرى.','Could not prepare the voice message. Please try again.'));reader.onload=()=>{CHAT_AUDIO_DATA=String(reader.result||'');const ready=document.getElementById('chatVoiceReady');if(ready)ready.innerHTML=`<span>${L('الرسالة الصوتية جاهزة للإرسال','Voice message ready to send')}</span><button type="button" data-action="cancelChatAudio" aria-label="${L('إلغاء التسجيل','Discard recording')}">${icon('x')}</button>`;};reader.readAsDataURL(blob);};
-  CHAT_RECORDER.start(500);document.getElementById('chatRecordButton')?.classList.add('recording');document.getElementById('chatRecordingPill')?.classList.add('show');
+  CHAT_RECORDER.onstop=()=>{stream.getTracks().forEach(track=>track.stop());const blob=new Blob(chunks,{type:CHAT_RECORDER.mimeType||chunks[0]?.type||'audio/webm'});if(!blob.size){toast(L('لم يُلتقط صوت. حاول التسجيل مرة أخرى.','No audio was captured. Please record again.'));return;}if(blob.size>4000000){toast(L('التسجيل طويل جداً. حاول رسالة أقصر.','Recording is too large. Try a shorter message.'));return;}const reader=new FileReader();reader.onerror=()=>toast(L('تعذر تجهيز الرسالة الصوتية. حاول مرة أخرى.','Could not prepare the voice message. Please try again.'));reader.onload=()=>{CHAT_AUDIO_DATA=String(reader.result||'');const ready=document.getElementById('chatVoiceReady'),composer=document.querySelector('.chat-composer');if(ready)ready.innerHTML=`<span>${L('صوتية جاهزة','Voice ready')}</span><button type="button" data-action="cancelChatAudio" aria-label="${L('إلغاء التسجيل','Discard recording')}">${icon('x')}</button>`;composer?.classList.add('has-voice');};reader.readAsDataURL(blob);};
+  CHAT_RECORDER.start(500);document.getElementById('chatRecordButton')?.classList.add('recording');document.getElementById('chatRecordingPill')?.classList.add('show');document.querySelector('.chat-composer')?.classList.add('is-recording');
   const started=Date.now();CHAT_RECORD_TIMER=setInterval(()=>{const elapsed=Math.floor((Date.now()-started)/1000),label=document.getElementById('chatRecordSeconds');if(label)label.textContent=`${Math.floor(elapsed/60)}:${String(elapsed%60).padStart(2,'0')}`;if(elapsed>=45)stopChatRecording();},250);
  }catch(_){toast(L('تعذر استخدام الميكروفون. تحقق من الإذن.','Could not use the microphone. Check permission.'));}
 }
@@ -3756,6 +3820,8 @@ function qualityCheckSheet(requestId){
 function reviewReplyForm(id){const r=(S.reviews||[]).find(x=>x.id===id);if(!r)return;openModal(`<div class="modal sheet"><div class="modal-head"><div class="modal-title">${L('الرد على التقييم','Reply to review')}</div><button class="close-btn" data-action="closeModal">×</button></div><div class="modal-body"><p class="muted">${esc(r.comment||'')}</p><div class="field"><label>${L('رد المزود','Provider reply')}</label><textarea class="textarea" id="reviewReplyText" maxlength="300">${esc(r.providerReply||'')}</textarea></div><button class="pill-btn primary" data-action="saveReviewReply" data-id="${id}" style="margin-top:14px">${tr('save')}</button></div></div>`);}
 function complaintForm(id){ const p=getProvider(id); openModal(`<div class="modal"><div class="modal-head"><div class="modal-title">تسجيل شكوى ${esc(p?.name||'')}</div><button class="close-btn" data-action="closeModal">×</button></div><div class="modal-body"><div class="two-col"><div class="field"><label>${tr('customerName')}</label><input class="input" id="cmpName" value="${esc(S.user.name||'')}"></div><div class="field"><label>${tr('phone')}</label><input class="input" id="cmpPhone" value="${esc(S.user.phone||'')}"></div><div class="field"><label>السبب</label><select class="select" id="cmpReason"><option value="quality">جودة الخدمة</option><option value="delay">تأخير</option><option value="price">السعر</option><option value="behavior">التعامل</option><option value="other">أخرى</option></select></div></div><div class="field" style="margin-top:12px"><label>التفاصيل</label><textarea class="textarea" id="cmpDetail"></textarea></div><button class="pill-btn warn" data-action="saveComplaint" data-id="${id}" style="margin-top:14px">إرسال الشكوى للإدارة</button></div></div>`); }
 function bindDynamic(){
+ const openChat=document.querySelector('.chat-sheet');
+ if(openChat)bindChatComposerDraft(openChat.dataset.requestId,openChat.dataset.chatRole||'user');
  document.getElementById('userGov')?.addEventListener('change',e=>{document.getElementById('userWilayah').innerHTML=wilOptions(e.target.value,'')});
  document.getElementById('ppGov')?.addEventListener('change',e=>{document.getElementById('ppWilayah').innerHTML=wilOptions(e.target.value,'')});
  document.getElementById('regGov')?.addEventListener('change',e=>{document.getElementById('regWilayah').innerHTML=wilOptions(e.target.value,'')});
@@ -4057,8 +4123,8 @@ async function onClick(e){ const el=e.target.closest('[data-action]'); if(!el)re
   }
  if(a==='refreshRequestChat'){try{const fresh=await api('/api/bootstrap',null,activeAuthToken());mergeRemote(fresh);save();}catch(err){if(String(err?.message||err)!=='request_failed')showError(err);}openRequestChat(id);return;}
   if(a==='toggleChatRecording'){await toggleChatRecording();return;}
-  if(a==='cancelChatAudio'){CHAT_AUDIO_DATA='';const ready=document.getElementById('chatVoiceReady');if(ready)ready.innerHTML='';toast(L('تم إلغاء التسجيل الصوتي.','Voice recording discarded.'));return;}
-  if(a==='chatQuickReply'){const box=document.getElementById('chatText');if(box){box.value=el.dataset.text||'';box.focus({preventScroll:true});}return;}
+  if(a==='cancelChatAudio'){CHAT_AUDIO_DATA='';const ready=document.getElementById('chatVoiceReady');if(ready)ready.innerHTML='';document.querySelector('.chat-composer')?.classList.remove('has-voice');toast(L('تم إلغاء التسجيل الصوتي.','Voice recording discarded.'));return;}
+  if(a==='chatQuickReply'){const box=document.getElementById('chatText');if(box){box.value=el.dataset.text||'';box.dispatchEvent(new Event('input'));box.focus({preventScroll:true});}return;}
   if(a==='shareChatLocation'){await shareChatLocation(id);return;}
   if(a==='sendChatMessage'){
    if(CHAT_RECORDER?.state==='recording'){toast(L('أوقف التسجيل أولاً ثم أرسل الرسالة.','Stop recording before sending.'));return;}
@@ -4067,10 +4133,10 @@ async function onClick(e){ const el=e.target.closest('[data-action]'); if(!el)re
     const r=(S.customerRequests||[]).find(x=>x.id===id),role=S.view==='provider'?'provider':'user',text=val('chatText').trim(),image=(await readImageFiles('chatImage',1))[0],audio=CHAT_AUDIO_DATA;if(!r||(!text&&!image&&!audio)){markInvalid('chatText',L('اكتب رسالة أو أرفق صورة أو تسجيلاً صوتياً.','Write a message or attach an image or voice recording.'));return;}
     let synced=null;try{synced=await syncRequestCollaboration(r.id,'message',{text,imageData:image||undefined,audioData:audio||undefined},role==='provider'?AUTH.providerToken:AUTH.userToken);}catch(err){showError(err);return;}
     if(!synced){const message={id:uid('msg'),sender:role,senderId:role==='provider'?S.currentProviderId:S.session?.userId||'',text,image:image||'',audio:audio||'',createdAt:nowISO()};r.messages=[...(r.messages||[]),message].slice(-120);const target=role==='provider'?'user':'provider',targetId=role==='provider'?r.userId:r.acceptedProviderId,senderName=role==='provider'?(getProvider(r.acceptedProviderId)?.name||L('مزود الخدمة','Service provider')):(r.customerName||userDisplayName()),preview=text.slice(0,105)||L(image?'صورة جديدة':'رسالة صوتية جديدة',image?'New image':'New voice message');addNotification({type:'chat',title:L(`رسالة جديدة من ${senderName}`,`New message from ${senderName}`),message:`${r.serviceName||L('طلب خدمة','Service request')} • ${preview}`,target,targetId,relatedId:r.id,priority:'normal',actionText:L('فتح المحادثة','Open chat'),actionRoute:`${target}:chat:${r.id}`,dedupeKey:`chat:${r.id}:${message.id}`});}
-    CHAT_AUDIO_DATA='';trackEvent('chat_message_sent',{requestId:r.id,role,hasImage:!!image,hasAudio:!!audio});save();
+    CHAT_AUDIO_DATA='';clearChatDraft(r.id,role);trackEvent('chat_message_sent',{requestId:r.id,role,hasImage:!!image,hasAudio:!!audio});save();
     const updated=requestByAnyId(r.id)||r,thread=document.getElementById('chatThread'),textBox=document.getElementById('chatText'),imageInput=document.getElementById('chatImage'),voiceReady=document.getElementById('chatVoiceReady');
     if(thread){thread.innerHTML=(updated.messages||[]).map(message=>chatMessageHtml(message,role)).join('');thread.scrollTop=thread.scrollHeight;}
-    if(textBox)textBox.value='';if(imageInput)imageInput.value='';if(voiceReady)voiceReady.innerHTML='';
+    if(textBox){textBox.value='';resizeChatComposerInput(textBox);}if(imageInput)imageInput.value='';if(voiceReady)voiceReady.innerHTML='';document.querySelector('.chat-composer')?.classList.remove('has-voice','is-recording');
    }finally{if(el.isConnected){delete el.dataset.busy;el.disabled=false;el.removeAttribute('aria-busy');el.innerHTML=original;}}
    return;
   }
@@ -4471,6 +4537,7 @@ document.addEventListener('change', e=>{
 });
 window.addEventListener('resize',()=>positionTopSearchDropdown(document.querySelector('.global-search')),{passive:true});
 window.addEventListener('online',()=>{flushOfflineQueue().finally(render);});
+document.addEventListener('visibilitychange',()=>{if(!document.hidden)refreshActiveAccountData();});
 if('serviceWorker' in navigator && /^https?:$/.test(location.protocol)){
  const refreshKey=`${APP_BUILD}:reloaded`;
  const freshRequested=new URLSearchParams(location.search).has('fresh');

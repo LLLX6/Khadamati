@@ -11,7 +11,7 @@ python tests/security-api.py
 API smoke test (run against an isolated server and set its admin code):
 
 ```powershell
-python tests/smoke-api.py
+python tests/run-smoke-isolated.py
 ```
 
 Mobile user/provider flow test (requires Playwright and Chrome). When no URL is

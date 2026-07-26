@@ -151,6 +151,19 @@ def main():
     expect(status, registration, {201}, "Provider registration failed")
     registration_id = registration["request"]["id"]
     assert registration["request"]["bio"] == "خدمة كهرباء منزلية دقيقة وموثوقة"
+    status, admin_registration_state = request("/api/admin/session", token=admin_token)
+    expect(status, admin_registration_state, {200}, "Admin registration notification state failed")
+    registration_notification = next(
+        (
+            item
+            for item in admin_registration_state.get("notifications", [])
+            if item.get("relatedId") == registration_id
+            and item.get("type") == "provider_request"
+        ),
+        None,
+    )
+    assert registration_notification, "Provider registration did not create an administration notification"
+    assert registration_notification.get("actionRoute") == f"admin:providerRequest:{registration_id}"
 
     status, pending_login = request(
         "/api/provider/login", {"phone": provider_phone, "pin": provider_pin}

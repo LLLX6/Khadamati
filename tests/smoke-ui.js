@@ -692,13 +692,18 @@ async function clickAdminTab(page, tab) {
   await page.locator('[data-action="closeModal"]').click();
   await clickUserNav(page, 'myAccount');
   await page.locator('.account-menu [data-action="providerMode"], .account-menu [data-action="nav"][data-view="provider"]').first().click();
+  await page.waitForSelector('.provider-adaptive-nav');
   const directSupport = page.locator('.side-nav [data-action="providerTab"][data-tab="support"]').first();
   if (await directSupport.isVisible()) await directSupport.click();
-  else {
+  else if (await page.locator('[data-action="openProviderTools"]').isVisible()) {
     await page.locator('[data-action="openProviderTools"]').click();
     await page.locator('[data-action="providerToolTab"][data-tab="support"]').click();
   }
-  await page.locator('[data-action="providerLogout"]').click();
+  else if (await directSupport.count()) await directSupport.evaluate(element => element.click());
+  else throw new Error('Provider support navigation is unavailable.');
+  const accountSecurity = page.locator('.compact-settings-disclosure').filter({ has: page.locator('[data-action="providerLogout"]') });
+  if (!(await accountSecurity.getAttribute('open'))) await accountSecurity.locator('summary').click();
+  await accountSecurity.locator('[data-action="providerLogout"]').click();
   await page.locator('[data-action="goBack"]').click();
   await page.locator('[data-action="enterGuest"]').click();
   if (await page.locator('.role-onboarding').count()) {
