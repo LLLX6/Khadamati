@@ -642,11 +642,13 @@ button,[data-action]{touch-action:manipulation}
 <link rel="stylesheet" href="assets/styles/khadamati-v58.css?v=58" />
 <link rel="stylesheet" href="assets/styles/khadamati-v59.css?v=59" />
 <link rel="stylesheet" href="assets/styles/khadamati-v60.css?v=60" />
+<link rel="stylesheet" href="assets/styles/khadamati-v61.css?v=61" />
 </head>
 <body>
 <div id="app" class="app-shell"><div class="startup-skeleton" aria-label="جاري تحميل خدماتي"><div class="skeleton-bar"></div><div class="skeleton-search"></div><div class="skeleton-banner"></div><div class="skeleton-grid"><i></i><i></i><i></i><i></i><i></i><i></i></div></div></div>
 <div id="modalRoot"></div>
 <div id="drawerRoot"></div>
+<div id="loadingRoot" class="task-loading-root" aria-live="polite"></div>
 <div class="toast-wrap" id="toastRoot"></div>
 <script src="assets/scripts/khadamati-visuals-v56.js?v=56"></script>
 <script>
@@ -654,8 +656,8 @@ button,[data-action]{touch-action:manipulation}
 'use strict';
 const STORAGE_KEY = 'KHADAMATI_MARKET_OS_V21';
 const PRIVATE_STATE_KEY = 'KHADAMATI_PRIVATE_STATE_V1';
-const APP_VERSION = 60;
-const APP_BUILD = 'khadamati-app-v60-request-lifecycle-2026-07-23';
+const APP_VERSION = 61;
+const APP_BUILD = 'khadamati-app-v61-conversation-hub-2026-07-26';
 const LEGACY_STORAGE_KEYS = ['KHADAMATI_MARKET_OS_V20','FORAN_MARKET_OS_V14'];
 const ONBOARDING_STORAGE_KEY = 'KHADAMATI_ONBOARDING_V4';
 const SUBSCRIPTION_MIGRATION_KEY = 'KHADAMATI_SUBSCRIPTION_MIGRATION_V1';
@@ -683,6 +685,8 @@ let CHAT_RECORD_TIMER = null;
 let ARRIVAL_WATCH_ID = null;
 let ARRIVAL_WATCH_REQUEST_ID = '';
 const MODAL_STACK = [];
+let TASK_LOADING_SEQUENCE = 0;
+const TASK_LOADING_HANDLES = new Map();
 const MAP_INSTANCES = new Map();
 let MAP_WATCH_ID = null;
 let MAP_LOCATION_SYNC_AT = 0;
@@ -805,6 +809,26 @@ function tokenForKind(kind){return kind==='admin'?AUTH.adminToken:kind==='provid
 function authSubjectForKind(kind){return kind==='provider'?String(S?.currentProviderId||''):kind==='user'?String(S?.session?.userId||''):kind==='admin'?String(S?.adminUser?.id||'admin'):'';}
 function dropOfflineQueueFor(kind){if(S?.offlineQueue)S.offlineQueue=S.offlineQueue.filter(item=>item.tokenKind!==kind);}
 function revokeAuthToken(token){if(!token||!serverApiAvailable())return;fetch(apiUrl('/api/auth/logout'),{method:'POST',headers:{'Content-Type':'application/json','Authorization':`Bearer ${token}`},body:'{}'}).catch(()=>{});}
+function renderTaskLoading(){
+ const root=document.getElementById('loadingRoot');if(!root)return;
+ const visible=[...TASK_LOADING_HANDLES.values()].filter(item=>item.visible);
+ const latest=visible[visible.length-1];
+ root.innerHTML=latest?`<div class="task-loading-pill" role="status"><span class="task-loading-spinner" aria-hidden="true"></span><span>${esc(latest.label)}</span></div>`:'';
+ document.body.classList.toggle('task-is-loading',!!latest);
+}
+function startTaskLoading(label=L('جارٍ إتمام العملية','Completing action'),delay=420){
+ const id=++TASK_LOADING_SEQUENCE,item={label,visible:false,timer:null};
+ item.timer=setTimeout(()=>{item.visible=true;renderTaskLoading();},Math.max(0,delay));
+ TASK_LOADING_HANDLES.set(id,item);
+ return ()=>{const current=TASK_LOADING_HANDLES.get(id);if(!current)return;clearTimeout(current.timer);TASK_LOADING_HANDLES.delete(id);renderTaskLoading();};
+}
+function apiLoadingLabel(path){
+ if(path.includes('/login'))return L('جارٍ تسجيل الدخول','Signing in');
+ if(path.includes('/request'))return L('جارٍ تحديث الطلب','Updating request');
+ if(path.includes('/provider'))return L('جارٍ تحديث حساب المزود','Updating provider account');
+ if(path.includes('/admin'))return L('جارٍ حفظ التعديل','Saving changes');
+ return L('جارٍ إتمام العملية','Completing action');
+}
 async function flushOfflineQueue(){
  if(!navigator.onLine||!S?.offlineQueue?.length)return;
  const pending=[...S.offlineQueue];
@@ -820,18 +844,22 @@ async function api(path, body=null, token='', options={}){
  if(!serverApiAvailable()) throw new Error('request_failed');
  const headers={'Content-Type':'application/json'};
  if(token) headers.Authorization='Bearer '+token;
- let res;const started=performance.now();
+ const finishLoading=body&&!options.silentLoading?startTaskLoading(options.loadingLabel||apiLoadingLabel(path),options.loadingDelay??420):()=>{};
+ const started=performance.now();
  try{
-   res=await fetch(apiUrl(path),{method:body?'POST':'GET',headers,body:body?JSON.stringify(body):undefined});
- }catch(err){
-   recordApiMetric(false,path,performance.now()-started,'network');
-   if(body&&!options.skipQueue)queueOfflineOperation(path,body);
-   throw new Error('request_failed');
- }
- const data=await res.json().catch(()=>({}));
- if(!res.ok){if(res.status===401&&token){for(const key of ['adminToken','providerToken','userToken'])if(AUTH[key]===token)AUTH[key]='';saveAuth();if(!activeAuthToken())scrubPrivateSessionState(S);}recordApiMetric(false,path,performance.now()-started,data.error||res.status);throw new Error(data.error || 'request_failed');}
- recordApiMetric(true,path,performance.now()-started);
- return data;
+  let res;
+  try{
+    res=await fetch(apiUrl(path),{method:body?'POST':'GET',headers,body:body?JSON.stringify(body):undefined});
+  }catch(err){
+    recordApiMetric(false,path,performance.now()-started,'network');
+    if(body&&!options.skipQueue)queueOfflineOperation(path,body);
+    throw new Error('request_failed');
+  }
+  const data=await res.json().catch(()=>({}));
+  if(!res.ok){if(res.status===401&&token){for(const key of ['adminToken','providerToken','userToken'])if(AUTH[key]===token)AUTH[key]='';saveAuth();if(!activeAuthToken())scrubPrivateSessionState(S);}recordApiMetric(false,path,performance.now()-started,data.error||res.status);throw new Error(data.error || 'request_failed');}
+  recordApiMetric(true,path,performance.now()-started);
+  return data;
+ }finally{finishLoading();}
 }
 async function syncCurrentUserProfile(){
  if(!AUTH.userToken)return;
@@ -842,26 +870,32 @@ async function activateUserMode(){
   userLoginSheet(L('سجّل دخول المستخدم للوصول إلى طلباتك السابقة.','Sign in as a customer to access your previous requests.'));
   return false;
  }
+ const finishLoading=startTaskLoading(L('جارٍ فتح حساب المستخدم','Opening customer account'),220);
  const previousRole=AUTH.activeRole;
  AUTH.activeRole='user';saveAuth();
  try{
-  mergeRemote(await api('/api/bootstrap',null,AUTH.userToken));
+  mergeRemote(await api('/api/bootstrap',null,AUTH.userToken,{silentLoading:true}));
  }catch(err){
   AUTH.activeRole=previousRole;saveAuth();
   showError(err);return false;
+ }finally{
+  finishLoading();
  }
  S.admin=false;S.view='home';save();closeModal();render();window.scrollTo(0,0);
  return true;
 }
 async function activateProviderMode(){
  if(!AUTH.providerToken){openProviderAccess();return false;}
+ const finishLoading=startTaskLoading(L('جارٍ فتح حساب المزود','Opening provider account'),220);
  const previousRole=AUTH.activeRole;
  AUTH.activeRole='provider';saveAuth();
  try{
-  mergeRemote(await api('/api/bootstrap',null,AUTH.providerToken));
+  mergeRemote(await api('/api/bootstrap',null,AUTH.providerToken,{silentLoading:true}));
  }catch(err){
   AUTH.activeRole=previousRole;saveAuth();
   showError(err);return false;
+ }finally{
+  finishLoading();
  }
  S.admin=false;S.view='provider';S.providerTab=S.providerTab||'home';save();closeModal();render();window.scrollTo(0,0);
  return true;
@@ -2016,6 +2050,7 @@ const ICONS={
  ,share:'<circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/><path d="m8.6 10.5 6.8-4M8.6 13.5l6.8 4"/>'
  ,download:'<path d="M12 3v12M7 10l5 5 5-5"/><path d="M4 19h16"/>'
  ,printer:'<path d="M7 8V3h10v5M7 17H5a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2h-2"/><path d="M7 14h10v7H7Z"/>'
+ ,switch:'<path d="M7 7h12l-3-3M19 7l-3 3"/><path d="M17 17H5l3 3M5 17l3-3"/>'
  ,bolt:'<path d="m13 2-8 12h7l-1 8 8-12h-7Z"/>'
  ,droplet:'<path d="M12 2S5 9.2 5 15a7 7 0 0 0 14 0c0-5.8-7-13-7-13Z"/><path d="M9 16a3 3 0 0 0 3 3"/>'
  ,snow:'<path d="M12 2v20M4.2 6.5l15.6 11M19.8 6.5l-15.6 11"/><path d="m9 4 3 3 3-3M9 20l3-3 3 3"/>'
@@ -2130,6 +2165,69 @@ function groupedNotificationItems(items){
  });
  return [...groups.values()].map(n=>({...n,read:n.groupUnread===0}));
 }
+function accountNotificationIdentity(role=activeAuthKind()){
+ return role==='provider'?{target:'provider',id:S.currentProviderId||''}:{target:'user',id:S.session?.userId||''};
+}
+function accountChatNotifications(role=activeAuthKind()){
+ const identity=accountNotificationIdentity(role);
+ return targetNotifications(identity.target,identity.id).filter(notificationIsChat);
+}
+function accountUpdateNotifications(role=activeAuthKind()){
+ const identity=accountNotificationIdentity(role);
+ return targetNotifications(identity.target,identity.id).filter(n=>!notificationIsChat(n));
+}
+function unreadChatNotifications(role=activeAuthKind()){return accountChatNotifications(role).filter(n=>!n.read).length;}
+function unreadUpdateNotifications(role=activeAuthKind()){return accountUpdateNotifications(role).filter(n=>!n.read).length;}
+function conversationRequests(role=activeAuthKind()){
+ const id=role==='provider'?S.currentProviderId:S.session?.userId,rows=(S.customerRequests||[]).filter(request=>{
+  if(!request?.acceptedProviderId||!requestContactConsent(request).chat)return false;
+  return role==='provider'?request.acceptedProviderId===id:request.userId===id;
+ });
+ return rows.sort((a,b)=>{
+  const last=row=>(row.messages||[]).slice(-1)[0]?.createdAt||row.updatedAt||row.acceptedAt||row.createdAt||'';
+  return String(last(b)).localeCompare(String(last(a)));
+ });
+}
+function conversationUnreadIds(request,role=activeAuthKind()){
+ const identity=accountNotificationIdentity(role);
+ return accountChatNotifications(role).filter(n=>!n.read&&[request.id,request.serverId].includes(notificationChatRequestId(n))).map(n=>n.id);
+}
+function conversationPreview(request){
+ const message=(request.messages||[]).slice(-1)[0];
+ if(!message)return L('تم فتح المحادثة. ابدأ بتأكيد التفاصيل.','Chat is ready. Start by confirming the details.');
+ if(message.text)return notificationExcerpt(message.text,72);
+ if(message.image)return L('صورة مرفقة','Photo attached');
+ if(message.audio)return L('رسالة صوتية','Voice message');
+ if(message.location)return L('موقع مشترك','Shared location');
+ return L('تحديث جديد في المحادثة','New chat update');
+}
+function conversationTime(request){
+ const value=(request.messages||[]).slice(-1)[0]?.createdAt||request.updatedAt||request.acceptedAt||request.createdAt;
+ if(!value)return '';
+ const date=new Date(value);if(Number.isNaN(date.getTime()))return '';
+ return date.toLocaleString(S.lang==='ar'?'ar-OM':'en-OM',{month:'short',day:'numeric',hour:'numeric',minute:'2-digit'});
+}
+function conversationCard(request,role=activeAuthKind()){
+ const provider=getProvider(request.acceptedProviderId),customer=(S.users||[]).find(user=>user.id===request.userId),partner=role==='provider'?(request.customerName||customer?.name||L('عميل خدماتي','Khadamati customer')):(provider?.name||L('مزود الخدمة','Service provider')),avatar=role==='provider'?avatarHtml({name:partner,avatar:customer?.avatar||initials(partner)}):avatarHtml(provider||{name:partner,avatar:initials(partner)}),unread=conversationUnreadIds(request,role).length;
+ return `<button class="conversation-card ${unread?'unread':''}" data-action="openConversation" data-id="${esc(request.id)}" data-role="${role}">${avatar}<span class="conversation-card-copy"><span><b>${esc(partner)}</b><time>${esc(conversationTime(request))}</time></span><small>${esc(request.serviceName||L('طلب خدمة','Service request'))}</small><p>${esc(conversationPreview(request))}</p></span>${unread?`<i class="conversation-unread">${unread>99?'99+':unread}</i>`:`<i class="conversation-arrow">${dirFor(S.lang)==='rtl'?'←':'→'}</i>`}</button>`;
+}
+function renderConversationsHub(role=activeAuthKind()){
+ const rows=conversationRequests(role),identity=accountNotificationIdentity(role),unread=unreadChatNotifications(role);
+ return `<div class="modal sheet conversation-hub-sheet"><div class="modal-head"><div><div class="modal-title">${icon('chat')} ${L('المحادثات','Chats')} ${unread?`<span class="badge">${unread}</span>`:''}</div><small class="muted">${role==='provider'?L('محادثات العملاء للمهام المقبولة','Customer chats for accepted jobs'):L('محادثاتك مع المزودين المختارين','Chats with your selected providers')}</small></div><button class="close-btn" data-action="closeModal">${icon('x')}</button></div><div class="modal-body"><div class="conversation-hub-summary"><span>${icon('shield')}</span><div><b>${rows.length} ${L('محادثة نشطة','active chats')}</b><small>${L('كل محادثة مرتبطة بطلب واحد لحماية الخصوصية.','Each chat belongs to one request for privacy.')}</small></div></div><div class="conversation-list">${rows.length?rows.map(request=>conversationCard(request,role)).join(''):`<div class="empty">${L('لا توجد محادثات بعد. تظهر هنا بعد اختيار عرض وفتح التواصل.','No chats yet. They appear after an offer is selected and chat opens.')}</div>`}</div>${!identity.id?`<div class="guest-note">${L('سجّل الدخول لعرض محادثات حسابك.','Sign in to view your account chats.')}</div>`:''}</div></div>`;
+}
+async function conversationsSheet(){
+ const role=S.view==='provider'?'provider':'user',token=role==='provider'?AUTH.providerToken:AUTH.userToken;
+ openModal(`<div class="modal sheet conversation-hub-sheet"><div class="modal-head"><div class="modal-title">${icon('chat')} ${L('المحادثات','Chats')}</div><button class="close-btn" data-action="closeModal">${icon('x')}</button></div><div class="modal-body"><div class="conversation-loading" role="status"><span class="skeleton-line"></span><span class="skeleton-line"></span><span class="skeleton-line"></span></div></div></div>`);
+ if(token&&serverApiAvailable()){try{mergeRemote(await api('/api/bootstrap',null,token,{silentLoading:true}));save();}catch(err){if(String(err?.message||err)!=='request_failed')showError(err);}}
+ openModal(renderConversationsHub(role));
+}
+async function markConversationRead(requestId,role=activeAuthKind()){
+ const request=requestByAnyId(requestId);if(!request)return;
+ const ids=conversationUnreadIds(request,role),token=role==='provider'?AUTH.providerToken:AUTH.userToken;
+ ids.forEach(id=>{const item=(S.notifications||[]).find(n=>n.id===id);if(item)item.read=true;});
+ save();
+ if(token&&ids.length)await Promise.allSettled(ids.map(id=>api('/api/notifications/action',{id,action:'read'},token,{silentLoading:true,skipQueue:true})));
+}
 function notificationExcerpt(value,max=86){const text=String(value||'').replace(/\s+/g,' ').trim();return text.length>max?`${text.slice(0,max-1)}…`:text;}
 function localizedNotificationCopy(n){
  if(S.lang!=='en')return {title:n.title||'',message:n.message||'',actionText:n.actionText||''};
@@ -2163,11 +2261,11 @@ function notificationCard(n,admin=false){
  return `<details class="notification-disclosure ${chat?'chat-notification ':''}${n.read?'':'unread'} ${esc(n.priority||'normal')}" data-notification-group="${group}"><summary><span class="notification-icon">${icon(iconName)}</span><div class="notification-copy"><b><span>${esc(title)}</span>${chat&&unreadCount?`<span class="notification-count">${unreadCount>99?'99+':unreadCount}</span>`:''}</b><p class="notification-message-preview">${esc(notificationExcerpt(message))}</p>${!chat&&context?`<small class="notification-context">${L('الطلب','Request')}: ${esc(context)}</small>`:''}<small class="notification-time">${esc(new Date(n.createdAt||Date.now()).toLocaleString(S.lang==='ar'?'ar-OM':'en-OM',{dateStyle:'short',timeStyle:'short'}))}${count>1&&!chat?` • ${count} ${L('تحديثات','updates')}`:''}</small></div><span>${n.read?'⌄':'•'}</span></summary><div class="notification-actions">${providerRequest?`<button class="pill-btn primary tiny" data-action="providerAcceptRequest" data-id="${n.relatedId}">${L('قبول','Accept')}</button><button class="ghost-btn tiny" data-action="providerDeclineRequest" data-id="${n.relatedId}">${L('رفض','Decline')}</button>`:''}${actionText?`<button class="${chat?'pill-btn primary-chat-action':'ghost-btn'} tiny" data-action="notificationAction" data-id="${n.id}" data-notification-ids="${ids.join(',')}">${esc(actionText)}</button>`:''}${unreadCount?`<button class="ghost-btn tiny" data-action="markNotificationRead" data-id="${n.id}" data-notification-ids="${ids.join(',')}">${L('تعليم كمقروء','Mark read')}</button>`:''}<button class="notification-delete-action" data-action="deleteNotification" data-id="${n.id}" data-notification-ids="${ids.join(',')}" title="${L('حذف الإشعار','Delete notification')}" aria-label="${L('حذف الإشعار','Delete notification')}">${icon('x')}</button></div></details>`;
 }
 function notificationsSheet(){
- const target=S.view==='provider'?'provider':'user',id=target==='provider'?S.currentProviderId:(isRegisteredUser()?S.session?.userId:''),raw=targetNotifications(target,id).slice(0,120),items=groupedNotificationItems(raw);
- const groups=[{id:'messages',label:L('المحادثات','Chats'),icon:'chat'},{id:'requests',label:target==='provider'?L('الطلبات','Requests'):L('طلباتي','My requests'),icon:'briefcase'},{id:'updates',label:L('التحديثات','Updates'),icon:'bell'}],counts=Object.fromEntries(groups.map(group=>[group.id,items.filter(n=>notificationGroup(n)===group.id).length])),unread=Object.fromEntries(groups.map(group=>[group.id,items.filter(n=>notificationGroup(n)===group.id).reduce((sum,n)=>sum+Number(n.groupUnread||0),0)]));
- let active=groups.some(group=>group.id===S.notificationCenterTab)?S.notificationCenterTab:'';if(!active||!counts[active])active=groups.find(group=>unread[group.id])?.id||groups.find(group=>counts[group.id])?.id||'messages';S.notificationCenterTab=active;
+ const target=S.view==='provider'?'provider':'user',id=target==='provider'?S.currentProviderId:(isRegisteredUser()?S.session?.userId:''),raw=targetNotifications(target,id).filter(n=>!notificationIsChat(n)).slice(0,120),items=groupedNotificationItems(raw);
+ const groups=[{id:'requests',label:target==='provider'?L('الطلبات','Requests'):L('طلباتي','My requests'),icon:'briefcase'},{id:'updates',label:L('التحديثات','Updates'),icon:'bell'}],counts=Object.fromEntries(groups.map(group=>[group.id,items.filter(n=>notificationGroup(n)===group.id).length])),unread=Object.fromEntries(groups.map(group=>[group.id,items.filter(n=>notificationGroup(n)===group.id).reduce((sum,n)=>sum+Number(n.groupUnread||0),0)]));
+ let active=groups.some(group=>group.id===S.notificationCenterTab)?S.notificationCenterTab:'';if(!active||!counts[active])active=groups.find(group=>unread[group.id])?.id||groups.find(group=>counts[group.id])?.id||'requests';S.notificationCenterTab=active;
  const visible=items.filter(n=>notificationGroup(n)===active),activeLabel=groups.find(group=>group.id===active)?.label||'';
- openModal(`<div class="modal sheet notification-center-sheet"><div class="modal-head"><div class="modal-title">${L('الإشعارات','Notifications')} <span class="badge">${raw.filter(n=>!n.read).length}</span></div><button class="close-btn" data-action="closeModal">×</button></div><div class="modal-body">${!id?`<div class="guest-note">${L('إشعارات الحساب لا تظهر أثناء التصفح كزائر. سجّل الدخول لعرض محادثاتك وطلباتك.','Account notifications stay hidden while browsing as a visitor. Sign in to view your chats and requests.')}</div>`:''}<div class="notification-center-tabs">${groups.map(group=>`<button class="notification-center-tab ${active===group.id?'active':''}" data-action="notificationCenterTab" data-value="${group.id}">${icon(group.icon)} ${group.label}<span>${unread[group.id]||counts[group.id]}</span></button>`).join('')}</div><div class="notification-center-summary"><span>${activeLabel}</span><span>${visible.length} ${L('محادثة أو طلب','conversations or requests')}</span></div>${raw.some(n=>n.read)?`<div class="row-actions" style="margin-bottom:12px"><button class="ghost-btn tiny" data-action="clearReadNotifications">${L('حذف المقروءة','Delete read')}</button></div>`:''}<div class="list">${visible.length?visible.map(n=>notificationCard(n)).join(''):`<div class="empty">${L('لا يوجد شيء في هذا القسم','Nothing in this section')}</div>`}</div></div></div>`);
+ openModal(`<div class="modal sheet notification-center-sheet"><div class="modal-head"><div class="modal-title">${L('الإشعارات','Notifications')} <span class="badge">${raw.filter(n=>!n.read).length}</span></div><button class="close-btn" data-action="closeModal">×</button></div><div class="modal-body">${!id?`<div class="guest-note">${L('إشعارات الحساب لا تظهر أثناء التصفح كزائر. سجّل الدخول لعرض طلباتك وتحديثاتك.','Account notifications stay hidden while browsing as a visitor. Sign in to view requests and updates.')}</div>`:''}<div class="notification-center-tabs">${groups.map(group=>`<button class="notification-center-tab ${active===group.id?'active':''}" data-action="notificationCenterTab" data-value="${group.id}">${icon(group.icon)} ${group.label}<span>${unread[group.id]||counts[group.id]}</span></button>`).join('')}</div><div class="notification-center-summary"><span>${activeLabel}</span><span>${visible.length} ${L('عنصر','items')}</span></div>${visible.some(n=>n.read)?`<div class="row-actions" style="margin-bottom:12px"><button class="ghost-btn tiny" data-action="clearReadNotifications" data-group="${active}">${L('حذف المقروءة من هذا القسم','Delete read in this section')}</button></div>`:''}<div class="list">${visible.length?visible.map(n=>notificationCard(n)).join(''):`<div class="empty">${L('لا يوجد شيء في هذا القسم','Nothing in this section')}</div>`}</div></div></div>`);
 }
 function notificationPreferencesSheet(){
  const supported='Notification' in window,secure=window.isSecureContext,permission=supported?Notification.permission:'unsupported',enabled=supported&&permission==='granted'&&!!S.platform?.deviceNotifications;
@@ -2202,8 +2300,8 @@ function layout(content, opts={}){
   {view:'search',label:tr('search'),icon:'search'},
   {view:'myAccount',label:tr('myAccount'),icon:'user'},
  ];
- const unread=isRegisteredUser()?unreadNotifications('user',S.session?.userId||''):0;
-return `<header class="app-top"><div class="container"><div class="app-top-row"><div class="brand-stack">${backButton}<button class="app-brand" data-action="brandHome">${logoMark()}<span class="brand-word"><span>${esc(S.lang==='ar'?S.platform.nameAr:S.platform.nameEn)}</span><small>${isGuest()?L('زائر','Visitor'):L('خدمات','Services')}</small></span></button></div><div class="top-cluster"><button class="round-action" data-action="openNotifications" title="${L('الإشعارات','Notifications')}">${icon('bell')}${unread?`<span class="notification-badge">${unread>99?'99+':unread}</span>`:''}</button><button class="round-action" data-action="toggleLang" title="${tr('lang')}">${icon('globe')}</button>${showAdmin?`<button class="round-action" data-action="openAdminLogin" title="${tr('admin')}">${icon('settings')}</button>`:''}</div></div></div></header><main class="container view" data-view="${esc(S.view||'home')}">${content}</main>${opts.noBottom?'':`<nav class="bottom-nav" aria-label="${L('التنقل الرئيسي','Main navigation')}"><div class="bottom-inner">${nav.map(item=>item.cta?`<button class="nav-item primary-nav" data-action="openRequestBoard" title="${L('ساحة الطلبات','Request board')}" aria-label="${L('ساحة الطلبات','Request board')}"><span class="floating-add request-board-fab">${icon(item.icon)}</span>${item.label}</button>`:`<button class="nav-item ${S.view===item.view?'active':''}" data-action="nav" data-view="${item.view}" ${S.view===item.view?'aria-current="page"':''}><span>${icon(item.icon)}</span>${item.label}</button>`).join('')}</div></nav>`}</div>`;
+ const unread=isRegisteredUser()?unreadUpdateNotifications('user'):0,chatUnread=isRegisteredUser()?unreadChatNotifications('user'):0,showSwitch=isRegisteredUser();
+return `<header class="app-top"><div class="container"><div class="app-top-row"><div class="brand-stack">${backButton}<button class="app-brand" data-action="brandHome">${logoMark()}<span class="brand-word"><span>${esc(S.lang==='ar'?S.platform.nameAr:S.platform.nameEn)}</span><small>${isGuest()?L('زائر','Visitor'):L('خدمات','Services')}</small></span></button></div><div class="top-cluster">${isRegisteredUser()?`<button class="round-action" data-action="openConversations" title="${L('المحادثات','Chats')}" aria-label="${L('المحادثات','Chats')}">${icon('chat')}${chatUnread?`<span class="notification-badge">${chatUnread>99?'99+':chatUnread}</span>`:''}</button>`:''}<button class="round-action" data-action="openNotifications" title="${L('الإشعارات','Notifications')}">${icon('bell')}${unread?`<span class="notification-badge">${unread>99?'99+':unread}</span>`:''}</button><button class="round-action" data-action="toggleLang" title="${tr('lang')}">${icon('globe')}</button>${showSwitch?`<button class="round-action account-switch-action" data-action="switchAccountMode" title="${AUTH.providerToken?L('الانتقال إلى حساب المزود','Switch to provider account'):L('دخول حساب المزود','Sign in to provider account')}" aria-label="${AUTH.providerToken?L('الانتقال إلى حساب المزود','Switch to provider account'):L('دخول حساب المزود','Sign in to provider account')}">${icon('switch')}</button>`:''}${showAdmin?`<button class="round-action" data-action="openAdminLogin" title="${tr('admin')}">${icon('settings')}</button>`:''}</div></div></div></header><main class="container view" data-view="${esc(S.view||'home')}">${content}</main>${opts.noBottom?'':`<nav class="bottom-nav" aria-label="${L('التنقل الرئيسي','Main navigation')}"><div class="bottom-inner">${nav.map(item=>item.cta?`<button class="nav-item primary-nav" data-action="openRequestBoard" title="${L('ساحة الطلبات','Request board')}" aria-label="${L('ساحة الطلبات','Request board')}"><span class="floating-add request-board-fab">${icon(item.icon)}</span>${item.label}</button>`:`<button class="nav-item ${S.view===item.view?'active':''}" data-action="nav" data-view="${item.view}" ${S.view===item.view?'aria-current="page"':''}><span>${icon(item.icon)}</span>${item.label}</button>`).join('')}</div></nav>`}</div>`;
 }
 function restoreNavigationScroll(){const dock=document.querySelector('.provider-request-dock'),shell=document.querySelector('.provider-shell'),layout=shell?.querySelector('.side-layout');if(dock&&shell&&layout&&!shell.contains(dock)){dock.classList.add('provider-request-inline');shell.insertBefore(dock,layout);}const nav=document.querySelector('.side-nav');if(!nav)return;const value=S.admin?S.adminNavScroll:S.providerNavScroll;requestAnimationFrame(()=>{nav.scrollLeft=Number(value||0);const active=nav.querySelector('button.active');active?.scrollIntoView({behavior:'auto',block:'nearest',inline:'center'});});}
 function restoreServicesCategoryRail(){
@@ -2593,12 +2691,12 @@ async function openNotificationChat(n){
  if(target==='provider'){if(n.targetId&&getProvider(n.targetId))S.currentProviderId=n.targetId;S.view='provider';S.providerTab=request.acceptedProviderId===S.currentProviderId?'tasks':'leads';}else S.view='myAccount';
  save();render();setTimeout(()=>openRequestChat(request.id,target),80);
 }
-function openRequestChat(requestId,preferredRole=''){
+function openRequestChat(requestId,preferredRole='',options={}){
  const r=requestByAnyId(requestId);if(!r||!r.acceptedProviderId){toast(L('تُفتح المحادثة بعد اختيار أحد العروض.','Chat opens after selecting an offer.'));return;}
  const role=['provider','user'].includes(preferredRole)?preferredRole:(S.view==='provider'?'provider':'user'),p=getProvider(r.acceptedProviderId),chatPartner=role==='provider'?(r.customerName||L('عميل خدماتي','Khadamati customer')):(p?.name||L('مزود الخدمة','Service provider')),partnerAvatar=role==='user'&&p?avatarHtml(p):`<span class="chat-partner-avatar">${icon('user')}</span>`;CHAT_AUDIO_DATA='';
  const consent=requestContactConsent(r);if(!consent.chat){if(role==='user')contactConsentSheet(r.id);else toast(L('بانتظار سماح العميل بالمحادثة لهذا الطلب.','Waiting for the customer to allow chat for this request.'));return;}
  const target=role==='provider'?'provider':'user',targetId=role==='provider'?S.currentProviderId:(S.session?.userId||'');(S.notifications||[]).forEach(item=>{if(notificationIsChat(item)&&notificationTargetMatch(item,target,targetId)){const itemRequest=notificationChatRequestId(item);if(itemRequest===r.id||itemRequest===r.serverId)item.read=true;}});save();
-  openModal(`<div class="modal sheet chat-sheet"><div class="modal-head chat-profile-head"><button class="close-btn chat-back" data-action="closeModal" aria-label="${L('العودة','Back')}">${dirFor(S.lang)==='rtl'?'→':'←'}</button><div class="chat-profile-identity">${partnerAvatar}<div><b>${esc(chatPartner)}</b><small>${esc(r.serviceName)} • ${requestLabel(r.status)}</small></div></div><button class="chat-header-action" data-action="openArrivalTracking" data-id="${r.id}" title="${L('الموقع والمتابعة','Location and tracking')}">${icon('map')}</button></div><div class="modal-body"><div class="chat-request-head"><b>${esc(r.wilayah||r.gov||L('طلب خدمة','Service request'))}</b><small class="muted">${requestDateTimeLabel(r)||L('محادثة خاصة بهذا الطلب','Request-specific chat')}</small></div><div class="chat-thread" id="chatThread">${(r.messages||[]).map(m=>chatMessageHtml(m,role)).join('')||`<div class="empty">${L('ابدأ المحادثة بتأكيد التفاصيل أو الموعد.','Start by confirming the details or appointment.')}</div>`}</div><div class="chat-composer"><label class="chat-icon-btn" title="${L('إرفاق صورة','Attach image')}">${icon('plus')}<input class="hidden" id="chatImage" type="file" accept="image/*"></label><textarea class="textarea" id="chatText" maxlength="1000" rows="1" placeholder="${L('اكتب رسالة...','Message...')}"></textarea><button class="chat-icon-btn" id="chatRecordButton" data-action="toggleChatRecording" title="${L('رسالة صوتية','Voice message')}">${icon('mic')}</button><button class="pill-btn primary" data-action="sendChatMessage" data-id="${r.id}" aria-label="${L('إرسال','Send')}">${icon('chat')}</button><div class="chat-record-state"><span class="recording-pill" id="chatRecordingPill">${L('جارٍ التسجيل','Recording')} <b id="chatRecordSeconds">0:00</b></span><span class="voice-ready" id="chatVoiceReady"></span></div></div></div></div>`);
+  openModal(`<div class="modal sheet chat-sheet" data-request-id="${esc(r.id)}" data-chat-role="${role}"><div class="modal-head chat-profile-head"><button class="close-btn chat-back" data-action="closeModal" aria-label="${L('العودة','Back')}">${dirFor(S.lang)==='rtl'?'→':'←'}</button><div class="chat-profile-identity">${partnerAvatar}<div><b>${esc(chatPartner)}</b><small>${esc(r.serviceName)} • ${requestLabel(r.status)}</small></div></div><button class="chat-header-action" data-action="openArrivalTracking" data-id="${r.id}" title="${L('الموقع والمتابعة','Location and tracking')}">${icon('map')}</button></div><div class="modal-body"><div class="chat-request-head"><b>${esc(r.wilayah||r.gov||L('طلب خدمة','Service request'))}</b><small class="muted">${requestDateTimeLabel(r)||L('محادثة خاصة بهذا الطلب','Request-specific chat')}</small></div><div class="chat-thread" id="chatThread">${(r.messages||[]).map(m=>chatMessageHtml(m,role)).join('')||`<div class="empty">${L('ابدأ المحادثة بتأكيد التفاصيل أو الموعد.','Start by confirming the details or appointment.')}</div>`}</div><div class="chat-composer"><label class="chat-icon-btn" title="${L('إرفاق صورة','Attach image')}">${icon('plus')}<input class="hidden" id="chatImage" type="file" accept="image/*"></label><textarea class="textarea" id="chatText" maxlength="1000" rows="1" placeholder="${L('اكتب رسالة...','Message...')}"></textarea><button class="chat-icon-btn" id="chatRecordButton" data-action="toggleChatRecording" title="${L('رسالة صوتية','Voice message')}">${icon('mic')}</button><button class="pill-btn primary" data-action="sendChatMessage" data-id="${r.id}" aria-label="${L('إرسال','Send')}">${icon('chat')}</button><div class="chat-record-state"><span class="recording-pill" id="chatRecordingPill">${L('جارٍ التسجيل','Recording')} <b id="chatRecordSeconds">0:00</b></span><span class="voice-ready" id="chatVoiceReady"></span></div></div></div></div>`,options);
  const recordButton=document.getElementById('chatRecordButton');if(recordButton)recordButton.innerHTML=icon('mic');
  const replies=role==='provider'?[L('متاح اليوم، ما الوقت المناسب؟','I am available today. What time suits you?'),L('أرسل موقع التنفيذ من فضلك.','Please send the service location.'),L('تم تأكيد الموعد.','The appointment is confirmed.')]:[L('أرسل الوقت المتاح من فضلك.','Please send your available time.'),L('تم، أنا موافق على الموعد.','Confirmed, the appointment works for me.'),L('سأرسل صورة أوضح للمشكلة.','I will send a clearer photo of the issue.')];
   document.querySelector('.chat-composer')?.insertAdjacentHTML('beforebegin',`<div class="chat-quick-replies"><button class="chat-location-action" data-action="shareChatLocation" data-id="${r.id}">${icon('map')} ${L('مشاركة الموقع','Share location')}</button>${replies.map(text=>`<button data-action="chatQuickReply" data-text="${esc(text)}">${esc(text)}</button>`).join('')}</div>`);
@@ -2982,13 +3080,13 @@ function renderProviderApp(){
  if(phoneClean(S.providerLoginMemory?.phone)!==phoneClean(p.phone)){S.providerLoginMemory={phone:phoneClean(p.phone),name:p.name};try{Adapter.save(S);}catch(_){}}
  const tabs=p.pending?['home']:['home','tasks','leads','profile','services','availability','subscription','performance','support'];
  const secondaryTabs=['availability','subscription','performance','support'];
- const unread=unreadNotifications('provider',p.id);
+ const unread=unreadUpdateNotifications('provider'),chatUnread=unreadChatNotifications('provider'),requestUnread=accountUpdateNotifications('provider').filter(n=>!n.read&&notificationGroup(n)==='requests').length;
  const statusText={available:L('متاح','Available'),busy:L('مشغول','Busy'),unavailable:L('غير متاح','Unavailable')}[p.status]||L('غير متاح','Unavailable');
  const statusControl=p.pending?`<span class="provider-status-toggle pending">${L('قيد المراجعة','Under review')}</span>`:`<button class="provider-status-toggle ${esc(p.status||'unavailable')}" data-action="cycleProviderStatus" title="${L('اضغط لتغيير حالة ظهور بطاقتك','Tap to change card visibility')}">${statusText}</button>`;
  const activeJobs=(S.customerRequests||[]).filter(r=>r.acceptedProviderId===p.id&&['accepted','inProgress'].includes(r.status)).length;
- const navButtons=tabs.map(t=>`<button data-action="providerTab" data-tab="${t}" class="provider-nav-tab ${secondaryTabs.includes(t)?'provider-nav-secondary':''} ${S.providerTab===t?'active':''}">${tabIcon(t)} <span>${tr('provider'+cap(t))}</span>${t==='tasks'&&activeJobs?`<span class="badge ok">${activeJobs}</span>`:t==='leads'&&unread?`<span class="badge off">${unread}</span>`:''}</button>`).join('');
+ const navButtons=tabs.map(t=>`<button data-action="providerTab" data-tab="${t}" class="provider-nav-tab ${secondaryTabs.includes(t)?'provider-nav-secondary':''} ${S.providerTab===t?'active':''}">${tabIcon(t)} <span>${tr('provider'+cap(t))}</span>${t==='tasks'&&activeJobs?`<span class="badge ok">${activeJobs}</span>`:t==='leads'&&requestUnread?`<span class="badge off">${requestUnread}</span>`:''}</button>`).join('');
  const moreButton=p.pending?'':`<button class="provider-nav-more ${secondaryTabs.includes(S.providerTab)?'active':''}" data-action="openProviderTools">${icon('more')} <span>${L('المزيد','More')}</span></button>`;
- return `<div class="topbar provider-topbar"><div class="container topbar-inner"><button class="brand provider-brand" data-action="providerTab" data-tab="home">${logoMark()}<span>${esc(p.name)}</span></button><div class="provider-top-actions">${statusControl}<button class="icon-btn" data-action="openNotifications" title="${L('الإشعارات','Notifications')}">${icon('bell')}${unread?`<span class="notification-badge">${unread>99?'99+':unread}</span>`:''}</button><button class="icon-btn" data-action="toggleLang" title="${tr('lang')}">${icon('globe')}</button><button class="icon-btn" data-action="providerUserMode" title="${L('العودة كمستخدم','Return as user')}">${icon('home')}</button><button class="icon-btn" data-action="providerLogout" title="${L('خروج','Sign out')}">${icon('user')}</button></div></div></div><main class="container provider-shell">${!p.pending&&p.status==='unavailable'?`<div class="provider-temporary-pause">${icon('bell')}<div><b>${L('بطاقتك متوقفة مؤقتاً','Your card is temporarily paused')}</b><div>${L('أعد الحالة إلى متاح لتظهر للعملاء.','Set the status to Available to appear to customers.')}</div></div></div>`:''}<div class="side-layout"><aside class="side-nav provider-adaptive-nav">${navButtons}${moreButton}</aside><section class="provider-workspace">${renderProviderTab(p)}</section></div></main>`;
+ return `<div class="topbar provider-topbar"><div class="container topbar-inner"><button class="brand provider-brand" data-action="providerTab" data-tab="home">${logoMark()}<span>${esc(p.name)}</span></button><div class="provider-top-actions">${statusControl}<button class="icon-btn" data-action="openConversations" title="${L('المحادثات','Chats')}" aria-label="${L('المحادثات','Chats')}">${icon('chat')}${chatUnread?`<span class="notification-badge">${chatUnread>99?'99+':chatUnread}</span>`:''}</button><button class="icon-btn" data-action="openNotifications" title="${L('الإشعارات','Notifications')}">${icon('bell')}${unread?`<span class="notification-badge">${unread>99?'99+':unread}</span>`:''}</button><button class="icon-btn" data-action="toggleLang" title="${tr('lang')}">${icon('globe')}</button><button class="icon-btn account-switch-action" data-action="switchAccountMode" title="${AUTH.userToken?L('الانتقال إلى حساب المستخدم','Switch to customer account'):L('دخول حساب المستخدم','Sign in to customer account')}" aria-label="${AUTH.userToken?L('الانتقال إلى حساب المستخدم','Switch to customer account'):L('دخول حساب المستخدم','Sign in to customer account')}">${icon('switch')}</button></div></div></div><main class="container provider-shell">${!p.pending&&p.status==='unavailable'?`<div class="provider-temporary-pause">${icon('bell')}<div><b>${L('بطاقتك متوقفة مؤقتاً','Your card is temporarily paused')}</b><div>${L('أعد الحالة إلى متاح لتظهر للعملاء.','Set the status to Available to appear to customers.')}</div></div></div>`:''}<div class="side-layout"><aside class="side-nav provider-adaptive-nav">${navButtons}${moreButton}</aside><section class="provider-workspace">${renderProviderTab(p)}</section></div></main>`;
 }
 function openProviderTools(){
  const tools=[['availability',L('التوفر والمواعيد','Availability & schedule'),L('حالتك وأيام العمل','Status and working days')],['subscription',L('الباقة والاشتراك','Plan & subscription'),L('الصلاحيات والتجديد','Entitlements and renewal')],['performance',L('الأداء والجودة','Performance & quality'),L('الظهور والتقييمات','Visibility and ratings')],['support',L('الدعم والإعدادات','Support & settings'),L('الإشعارات والحساب','Notifications and account')]];
@@ -3098,17 +3196,36 @@ function providerGrowthTips(p,conversion=0){
  return tips.slice(0,4);
 }
 function providerPerformance(p){ const q=p.qualityScore??profileStrength(p),reviews=providerReviews(p.id),views=Number(p.stats?.views||0),contacts=Number(p.stats?.whatsapp||0)+Number(p.stats?.calls||0),conversion=views?Math.round(contacts/views*100):0,tips=providerGrowthTips(p,conversion); return `<div class="admin-grid grid"><div class="card mini-stat"><span>${tr('views')}</span><b>${views}</b></div><div class="card mini-stat"><span>${L('تواصلات','Contacts')}</span><b>${contacts}</b></div><div class="card mini-stat"><span>${L('تحويل','Conversion')}</span><b>${conversion}%</b></div><div class="card mini-stat"><span>${tr('rating')}</span><b>${p.rating||0}</b></div></div><div class="panel" style="margin-top:14px"><h2>${L('جودة الملف','Profile quality')}</h2><div class="quality-row"><div class="score-ring" style="--score:${q}"><span>${q}%</span></div><div><b>${L('كلما اكتمل ملفك زاد ظهورك في النتائج','A complete profile ranks higher in results')}</b><p class="muted">${L('أكمل الصور والأوقات ومناطق العمل وحافظ على التقييمات.','Complete photos, hours, coverage, and maintain ratings.')}</p></div></div></div><div class="panel" style="margin-top:14px"><h2>${L('خطوات نمو مقترحة','Suggested growth steps')}</h2><ul class="growth-tips">${tips.map(x=>`<li>${icon('sparkle')} ${esc(x)}</li>`).join('')||`<li>${L('أداء جيد. حافظ على سرعة الرد وجودة الخدمة.','Good performance. Keep response fast and service quality high.')}</li>`}</ul></div><div class="panel" style="margin-top:14px"><h2>${L('آخر التقييمات الموثقة','Latest verified reviews')}</h2><div class="review-list">${reviews.map(r=>`<div class="review-item"><div class="row-actions" style="justify-content:space-between"><b>⭐ ${r.rating||0} ${r.verified?'✓':''}</b><button class="ghost-btn tiny" data-action="reviewReplyForm" data-id="${r.id}">${r.providerReply?L('تعديل الرد','Edit reply'):L('رد','Reply')}</button></div><div class="review-dimensions"><span>${L('الجودة','Quality')} ${r.dimensions?.quality||r.rating}</span><span>${L('الموعد','Time')} ${r.dimensions?.punctuality||r.rating}</span><span>${L('التعامل','Communication')} ${r.dimensions?.communication||r.rating}</span><span>${L('القيمة','Value')} ${r.dimensions?.value||r.rating}</span></div><p>${esc(r.comment||'')}</p>${r.providerReply?`<div class="provider-reply"><b>${L('رد المزود','Provider reply')}</b><p>${esc(r.providerReply)}</p></div>`:''}</div>`).join('')||`<div class="empty">${L('لا توجد تقييمات بعد','No reviews yet')}</div>`}</div></div>`; }
-function providerSupport(p){ const complaints=(S.complaints||[]).filter(c=>c.provider_id===p.id||c.providerId===p.id); return `<div class="panel"><h2>${tr('providerSupport')}</h2><div class="field"><label>${tr('sendNote')}</label><textarea class="textarea" id="supportNote"></textarea></div><div class="row-actions" style="margin-top:14px"><button class="pill-btn primary" data-action="sendProviderSupport">${tr('sendNote')}</button><button class="ghost-btn" data-action="replayOnboarding">${icon('sparkle')} ${L('دليل لوحة الأعمال','Workspace guide')}</button></div></div><div class="panel" style="margin-top:14px"><h2>${L('إعدادات الحساب','Account settings')}</h2><div class="row-actions"><button class="ghost-btn" data-action="openNotificationSettings">${icon('bell')} ${L('إشعارات الهاتف','Phone notifications')}</button><button class="ghost-btn" data-action="forgotPassword" data-kind="provider">${icon('shield')} ${L('استرجاع رمز الدخول','Recover access code')}</button><button class="ghost-btn danger" data-action="deleteAccountPrompt" data-kind="provider">${icon('shield')} ${L('حذف الحساب','Delete account')}</button></div></div><div class="panel" style="margin-top:14px"><h2>${L('الشكاوى والمتابعة','Complaints and follow-up')}</h2><div class="list">${complaints.map(c=>`<div class="list-item"><div><b>${esc(c.reason||L('شكوى','Complaint'))}</b><div class="muted">${esc(c.status)} • ${esc(c.created_at||c.createdAt||'')}</div><p>${esc(c.detail||'')}</p></div></div>`).join('')||`<div class="empty">${L('لا توجد شكاوى على حسابك','No complaints on your account')}</div>`}</div></div>`; }
+function providerSupport(p){ const complaints=(S.complaints||[]).filter(c=>c.provider_id===p.id||c.providerId===p.id); return `<div class="panel"><h2>${tr('providerSupport')}</h2><div class="field"><label>${tr('sendNote')}</label><textarea class="textarea" id="supportNote"></textarea></div><div class="row-actions" style="margin-top:14px"><button class="pill-btn primary" data-action="sendProviderSupport">${tr('sendNote')}</button><button class="ghost-btn" data-action="replayOnboarding">${icon('sparkle')} ${L('دليل لوحة الأعمال','Workspace guide')}</button></div></div><div class="panel" style="margin-top:14px"><h2>${L('إعدادات الحساب','Account settings')}</h2><div class="row-actions"><button class="ghost-btn" data-action="openNotificationSettings">${icon('bell')} ${L('إشعارات الهاتف','Phone notifications')}</button><button class="ghost-btn" data-action="forgotPassword" data-kind="provider">${icon('shield')} ${L('استرجاع رمز الدخول','Recover access code')}</button><button class="ghost-btn danger" data-action="deleteAccountPrompt" data-kind="provider">${icon('shield')} ${L('حذف الحساب','Delete account')}</button><button class="ghost-btn" data-action="providerLogout">${icon('user')} ${L('تسجيل الخروج من حساب المزود','Sign out of provider account')}</button></div></div><div class="panel" style="margin-top:14px"><h2>${L('الشكاوى والمتابعة','Complaints and follow-up')}</h2><div class="list">${complaints.map(c=>`<div class="list-item"><div><b>${esc(c.reason||L('شكوى','Complaint'))}</b><div class="muted">${esc(c.status)} • ${esc(c.created_at||c.createdAt||'')}</div><p>${esc(c.detail||'')}</p></div></div>`).join('')||`<div class="empty">${L('لا توجد شكاوى على حسابك','No complaints on your account')}</div>`}</div></div>`; }
+function adminNotificationDestination(n){
+ const parts=String(n?.actionRoute||'').split(':'),kind=parts[0]==='admin'?parts[1]:'';
+ const mapped=kind==='user'?'audience':kind==='recovery'?'credentials':kind==='subscription'?'subscriptions':kind==='request'?'leads':kind==='advertisement'?'ads':kind==='company'?'companies':kind==='provider'?'providers':'';
+ const fallback={provider:'providers',company:'companies',user:'audience',security:'credentials',subscription:'subscriptions',payment:'finance',request:'leads',offer:'leads',unavailable:'unavailable',expiry:'expiries',ad:'ads',advertisement:'ads',complaint:'complaints'}[n?.type]||'notifications';
+ const route=String(mapped||n?.actionRoute||fallback).split(':')[0];
+ return ['overview','notifications','leads','providers','companies','unavailable','subscriptions','expiries','ads','audience','credentials','assistant','providerRequests','complaints','categoryAdmin','finance','reports','quality','settings','backup'].includes(route)?route:'notifications';
+}
+function adminSectionUnread(tab){
+ const unread=targetNotifications('admin').filter(n=>!n.read);
+ if(tab==='notifications')return unread.length;
+ return unread.filter(n=>adminNotificationDestination(n)===tab).length;
+}
+function filterAdminNotificationItems(filter='all'){
+ const items=targetNotifications('admin');
+ if(filter==='unread')return items.filter(n=>!n.read);
+ if(filter==='important')return items.filter(n=>['high','urgent'].includes(n.priority));
+ if(filter==='all')return items;
+ return items.filter(n=>n.type===filter);
+}
 function renderAdminLegacy(){ scanExpiryNotifications();scanOperationalNotifications(); const tabs=['overview','notifications','leads','providers','companies','unavailable','subscriptions','expiries','ads','audience','credentials','assistant','providerRequests','complaints','categoryAdmin','finance','reports','quality','settings','backup']; const unread=unreadNotifications('admin'); return `<div class="topbar"><div class="container topbar-inner"><button class="brand" style="border:0;background:transparent">${logoMark()}<span>${tr('adminPanel')}</span></button><div class="top-actions"><button class="icon-btn" data-action="toggleLang">${icon('globe')}</button><button class="round-action app-back" data-action="adminLogout" aria-label="${tr('back')}">${dirFor(S.lang)==='rtl'?'→':'←'}</button></div></div></div><main class="container admin-shell"><div class="side-layout"><aside class="side-nav">${tabs.map(t=>`<button data-action="adminTab" data-tab="${t}" class="${S.adminTab===t?'active':''}">${adminIcon(t)} ${adminLabel(t)}${t==='notifications'&&unread?` <span class="badge off">${unread}</span>`:''}</button>`).join('')}</aside><section>${renderAdminTab()}</section></div></main>`; }
 function renderAdmin(){
  scanExpiryNotifications();scanOperationalNotifications();
  const primary=['overview','notifications','leads','providers','companies'],all=['overview','notifications','leads','providers','companies','unavailable','subscriptions','expiries','ads','audience','credentials','assistant','providerRequests','complaints','categoryAdmin','finance','reports','quality','settings','backup'],unread=unreadNotifications('admin'),secondary=all.filter(t=>!primary.includes(t));
- const nav=all.map(t=>`<button data-action="adminTab" data-tab="${t}" class="admin-nav-tab ${secondary.includes(t)?'admin-nav-secondary':''} ${S.adminTab===t?'active':''}">${adminIcon(t)} <span>${adminLabel(t)}</span>${t==='notifications'&&unread?`<span class="badge off">${unread}</span>`:''}</button>`).join('');
- return `<div class="topbar admin-topbar"><div class="container topbar-inner"><button class="brand">${logoMark()}<span>${tr('adminPanel')}</span></button><div class="top-actions"><button class="icon-btn" data-action="openAdminNotifications" title="${L('إشعارات الإدارة','Management notifications')}" aria-label="${L('إشعارات الإدارة','Management notifications')}">${icon('bell')}${unread?`<span class="notification-badge">${unread>99?'99+':unread}</span>`:''}</button><button class="icon-btn" data-action="toggleLang">${icon('globe')}</button><button class="round-action app-back" data-action="adminLogout" aria-label="${tr('back')}">${dirFor(S.lang)==='rtl'?'→':'←'}</button></div></div></div><main class="container admin-shell"><div class="side-layout"><aside class="side-nav admin-adaptive-nav">${nav}<button class="admin-nav-more ${secondary.includes(S.adminTab)?'active':''}" data-action="openAdminTools">${icon('more')} <span>${L('المزيد','More')}</span></button></aside><section class="admin-workspace">${renderAdminTab()}</section></div></main>`;
+ const nav=all.map(t=>{const count=adminSectionUnread(t);return `<button data-action="adminTab" data-tab="${t}" class="admin-nav-tab ${secondary.includes(t)?'admin-nav-secondary':''} ${S.adminTab===t?'active':''}">${adminIcon(t)} <span>${adminLabel(t)}</span>${count?`<span class="badge off">${count>99?'99+':count}</span>`:''}</button>`;}).join(''),secondaryUnread=secondary.reduce((sum,tab)=>sum+adminSectionUnread(tab),0);
+ return `<div class="topbar admin-topbar"><div class="container topbar-inner"><button class="brand">${logoMark()}<span>${tr('adminPanel')}</span></button><div class="top-actions"><button class="icon-btn" data-action="openAdminNotifications" title="${L('إشعارات الإدارة','Management notifications')}" aria-label="${L('إشعارات الإدارة','Management notifications')}">${icon('bell')}${unread?`<span class="notification-badge">${unread>99?'99+':unread}</span>`:''}</button><button class="icon-btn" data-action="toggleLang">${icon('globe')}</button><button class="round-action app-back" data-action="adminLogout" aria-label="${tr('back')}">${dirFor(S.lang)==='rtl'?'→':'←'}</button></div></div></div><main class="container admin-shell"><div class="side-layout"><aside class="side-nav admin-adaptive-nav">${nav}<button class="admin-nav-more ${secondary.includes(S.adminTab)?'active':''}" data-action="openAdminTools">${icon('more')} <span>${L('المزيد','More')}</span>${secondaryUnread?`<span class="badge off">${secondaryUnread>99?'99+':secondaryUnread}</span>`:''}</button></aside><section class="admin-workspace">${renderAdminTab()}</section></div></main>`;
 }
 function openAdminTools(){
  const groups=[[L('التشغيل','Operations'),['unavailable','providerRequests','complaints','expiries']],[L('النمو والمال','Growth & finance'),['subscriptions','finance','ads','reports']],[L('النظام','System'),['audience','credentials','assistant','categoryAdmin','quality','settings','backup']]];
- openModal(`<div class="modal sheet workspace-tools-sheet admin-tools-sheet"><div class="modal-head"><div class="modal-title">${L('مركز أدوات الإدارة','Management tools')}</div><button class="close-btn" data-action="closeModal">${icon('x')}</button></div><div class="modal-body">${groups.map(([title,tabs])=>`<section class="admin-tool-group"><h3>${title}</h3><div class="workspace-tool-grid">${tabs.map(tab=>`<button class="workspace-tool-card" data-action="adminToolTab" data-tab="${tab}"><span>${adminIcon(tab)}</span><div><b>${adminLabel(tab)}</b></div><i>${dirFor(S.lang)==='rtl'?'←':'→'}</i></button>`).join('')}</div></section>`).join('')}</div></div>`);
+ openModal(`<div class="modal sheet workspace-tools-sheet admin-tools-sheet"><div class="modal-head"><div class="modal-title">${L('مركز أدوات الإدارة','Management tools')}</div><button class="close-btn" data-action="closeModal">${icon('x')}</button></div><div class="modal-body">${groups.map(([title,tabs])=>`<section class="admin-tool-group"><h3>${title}</h3><div class="workspace-tool-grid">${tabs.map(tab=>{const count=adminSectionUnread(tab);return `<button class="workspace-tool-card" data-action="adminToolTab" data-tab="${tab}"><span>${adminIcon(tab)}</span><div><b>${adminLabel(tab)}</b>${count?`<small>${count} ${L('تنبيهات تحتاج إجراء','alerts need action')}</small>`:''}</div>${count?`<em class="badge off">${count>99?'99+':count}</em>`:`<i>${dirFor(S.lang)==='rtl'?'←':'→'}</i>`}</button>`;}).join('')}</div></section>`).join('')}</div></div>`);
 }
 function adminIcon(t){return ({overview:icon('star'),notifications:icon('bell'),leads:icon('chat'),providers:icon('user'),companies:icon('grid'),unavailable:icon('search'),expiries:icon('bell'),ads:icon('star'),audience:icon('user'),credentials:icon('shield'),assistant:icon('briefcase'),providerRequests:icon('chat'),categoryAdmin:icon('grid'),finance:icon('wallet'),quality:icon('shield'),settings:icon('settings'),backup:icon('sparkle'),complaints:icon('bell'),subscriptions:icon('wallet'),reports:icon('search')})[t]||icon('sparkle')}
 function adminLabel(t){ return ({notifications:L('الإشعارات','Notifications'),leads:L('طلبات العملاء','Customer requests'),companies:L('الشركات','Companies'),unavailable:L('طلبات غير متاحة','Unavailable requests'),expiries:L('التواريخ والتنبيهات','Dates and alerts'),ads:L('الإعلانات','Advertisements'),audience:L('المستخدمون والضيوف','Users and visitors'),credentials:L('أمان الحسابات','Account security'),assistant:L('ساحة الطلبات','Request marketplace'),quality:L('جودة التطبيق','App quality'),complaints:L('الشكاوى والجودة','Complaints and quality'),subscriptions:L('الاشتراكات والباقات','Subscriptions and plans'),reports:L('التقارير','Reports')})[t]||tr(t); }
@@ -3129,9 +3246,8 @@ function smartAdminRecommendations(){
  return out.slice(0,16);
 }
 function adminNotifications(){
- const f=S.adminNotificationFilter||'all'; let items=targetNotifications('admin');
- if(f==='unread')items=items.filter(n=>!n.read); else if(f==='important')items=items.filter(n=>['high','urgent'].includes(n.priority)); else if(f!=='all')items=items.filter(n=>n.type===f);
- return `<div class="section-head admin-notification-head"><div><h2>${L('مركز الإشعارات','Notification center')}</h2><p>${unreadNotifications('admin')} ${L('غير مقروءة من','unread of')} ${targetNotifications('admin').length}</p></div><button class="ghost-btn admin-mark-all" data-action="markAllNotificationsRead">${L('تعليم الكل','Mark all read')}</button></div><div class="tabs admin-notification-tabs">${[['all',L('الكل','All')],['unread',L('غير المقروءة','Unread')],['important',L('المهمة والعاجلة','Important')],['request',L('الطلبات','Requests')],['provider',L('المزودون','Providers')],['subscription',L('الاشتراكات','Subscriptions')],['expiry',L('التواريخ','Dates')],['unavailable',L('غير المتاحة','Unavailable')]].map(([v,l])=>`<button class="tab ${f===v?'active':''}" data-action="filterAdminNotifications" data-value="${v}">${l}</button>`).join('')}</div><div class="list admin-notification-list">${items.length?items.map(n=>notificationCard(n,true)).join(''):`<div class="empty">${L('لا توجد إشعارات ضمن هذا التصنيف.','No notifications in this category.')}</div>`}</div>`;
+ const f=S.adminNotificationFilter||'all',all=targetNotifications('admin'),items=filterAdminNotificationItems(f),filters=[['all',L('الكل','All')],['unread',L('غير المقروءة','Unread')],['important',L('المهمة والعاجلة','Important')],['request',L('الطلبات','Requests')],['provider',L('المزودون','Providers')],['subscription',L('الاشتراكات','Subscriptions')],['expiry',L('التواريخ','Dates')],['unavailable',L('غير المتاحة','Unavailable')]];
+ return `<div class="section-head admin-notification-head"><div><h2>${L('مركز الإشعارات','Notification center')}</h2><p>${unreadNotifications('admin')} ${L('غير مقروءة من','unread of')} ${all.length}</p></div><div class="row-actions"><button class="ghost-btn admin-mark-all" data-action="markVisibleAdminNotificationsRead" data-filter="${f}" ${items.some(n=>!n.read)?'':'disabled'}>${L('تعليم الظاهر كمقروء','Mark visible read')}</button>${items.some(n=>n.read)?`<button class="ghost-btn admin-clear-read" data-action="clearAdminReadNotifications" data-filter="${f}">${L('حذف المقروءة من هذا القسم','Delete read in this section')}</button>`:''}</div></div><div class="tabs admin-notification-tabs">${filters.map(([v,l])=>{const filtered=filterAdminNotificationItems(v),count=filtered.filter(n=>!n.read).length;return `<button class="tab ${f===v?'active':''}" data-action="filterAdminNotifications" data-value="${v}">${l}${count?` <span class="badge off">${count}</span>`:''}</button>`;}).join('')}</div><div class="list admin-notification-list">${items.length?items.map(n=>notificationCard(n,true)).join(''):`<div class="empty">${L('لا توجد إشعارات ضمن هذا التصنيف.','No notifications in this category.')}</div>`}</div>`;
 }
 function adminUnavailable(){
  const items=[...(S.unavailableRequests||[])].sort((a,b)=>Number(b.count||0)-Number(a.count||0));
@@ -3419,12 +3535,12 @@ function modalSnapshot(){
  const body=root.querySelector('.modal-body'),modal=root.querySelector('.modal');return {html:clone.innerHTML,scrollTop:Number(body?.scrollTop||modal?.scrollTop||0)};
 }
 function openModal(html,options={}){
-  const root=document.getElementById('modalRoot'),snapshot=options.stack?modalSnapshot():null;
+ const root=document.getElementById('modalRoot'),incoming=String(html),chatIsOpen=!!root?.querySelector('.chat-sheet'),stack=options.stack===true||(chatIsOpen&&!incoming.includes('chat-sheet')),snapshot=stack?modalSnapshot():null;
   if(!String(html).includes('chat-sheet'))stopRequestChatPolling();
  if(snapshot)MODAL_STACK.push(snapshot);else if(!options.preserveStack)MODAL_STACK.length=0;
  destroyLeafletMaps();
  let safeHtml=String(html);
- if(options.stack){
+ if(stack){
    safeHtml=safeHtml.replace(/data-action="closeModal"/g,'data-action="closeModalSoft"');
    safeHtml=safeHtml.replace(/data-action='closeModal'/g,"data-action='closeModalSoft'");
  }
@@ -3436,7 +3552,7 @@ function openModal(html,options={}){
 function closeModal(){clearInterval(window.__khadamatiArrivalPoll);window.__khadamatiArrivalPoll=null;stopRequestChatPolling();if(CHAT_RECORDER?.state==='recording')stopChatRecording();stopMapLocationWatch();destroyLeafletMaps();MODAL_STACK.length=0;document.getElementById('modalRoot').innerHTML='';document.body.classList.remove('onboarding-open','modal-chat-open');}
 function closeModalLayer(){
  const snapshot=MODAL_STACK.pop();if(!snapshot){closeModal();return;}
- destroyLeafletMaps();const root=document.getElementById('modalRoot');root.innerHTML=snapshot.html;document.body.classList.toggle('modal-chat-open',snapshot.html.includes('chat-sheet'));localizeStaticDom();bindDynamic();requestAnimationFrame(()=>{initLeafletMaps();const body=root.querySelector('.modal-body'),modal=root.querySelector('.modal');if(body)body.scrollTop=snapshot.scrollTop;else if(modal)modal.scrollTop=snapshot.scrollTop;});
+ destroyLeafletMaps();const root=document.getElementById('modalRoot');root.innerHTML=snapshot.html;document.body.classList.toggle('modal-chat-open',snapshot.html.includes('chat-sheet'));localizeStaticDom();bindDynamic();requestAnimationFrame(()=>{initLeafletMaps();const body=root.querySelector('.modal-body'),modal=root.querySelector('.modal');if(body)body.scrollTop=snapshot.scrollTop;else if(modal)modal.scrollTop=snapshot.scrollTop;const chat=root.querySelector('.chat-sheet');if(chat?.dataset.requestId)startRequestChatPolling(chat.dataset.requestId,chat.dataset.chatRole||'user');});
 }
 function onboardingStore(){
  try{return JSON.parse(localStorage.getItem(ONBOARDING_STORAGE_KEY)||'{}')||{};}catch(_){return {};}
@@ -3789,8 +3905,7 @@ function adminRequestDetails(id){
 }
 function openAdminNotificationTarget(n){
  const parts=String(n.actionRoute||'').split(':'),kind=parts[0]==='admin'?parts[1]:'',related=parts[0]==='admin'?(parts[2]||n.relatedId):n.relatedId;
- const mapped=kind==='user'?'audience':kind==='recovery'?'credentials':kind==='subscription'?'subscriptions':kind==='request'?'leads':kind==='advertisement'?'ads':kind==='company'?'companies':kind==='provider'?'providers':'';
- const rawRoute=mapped||n.actionRoute||({provider:'providers',user:'audience',subscription:'subscriptions',request:'leads',expiry:'expiries',ad:'ads'}[n.type]||'notifications'),route=String(rawRoute).split(':')[0];
+ const route=adminNotificationDestination(n);
  notificationIds(n).forEach(id=>{const item=(S.notifications||[]).find(x=>x.id===id);if(item)item.read=true;});S.adminTab=route;save();closeModal();render();
  setTimeout(()=>{
   const provider=getProvider(related);
@@ -3835,6 +3950,11 @@ function couponForm(){ openModal(`<div class="modal"><div class="modal-head"><di
 async function onClick(e){ const el=e.target.closest('[data-action]'); if(!el)return; const a=el.dataset.action; if(el.classList.contains('modal-backdrop')&&e.target!==el)return; const id=el.dataset.id; try{
  if(a==='closeModal'){closeModal();return;}
  if(a==='closeModalSoft'){closeModalLayer();return;}
+ if(a==='openConversations'){await conversationsSheet();return;}
+ if(a==='openConversation'){const role=el.dataset.role||(S.view==='provider'?'provider':'user');await markConversationRead(id,role);openRequestChat(id,role,{stack:true});return;}
+ if(a==='switchAccountMode'){if(S.view==='provider')await activateUserMode();else await activateProviderMode();return;}
+ if(a==='markVisibleAdminNotificationsRead'||a==='markAllNotificationsRead'){const filter=a==='markAllNotificationsRead'?'all':el.dataset.filter||S.adminNotificationFilter||'all',items=filterAdminNotificationItems(filter).filter(n=>!n.read),ids=items.map(n=>n.id);if(AUTH.adminToken&&ids.length)await Promise.allSettled(ids.map(notificationId=>api('/api/notifications/action',{id:notificationId,action:'read'},AUTH.adminToken,{silentLoading:true,skipQueue:true})));items.forEach(n=>n.read=true);save();render();return;}
+ if(a==='clearAdminReadNotifications'){const filter=el.dataset.filter||S.adminNotificationFilter||'all',ids=filterAdminNotificationItems(filter).filter(n=>n.read).map(n=>n.id);if(AUTH.adminToken&&ids.length)await Promise.allSettled(ids.map(notificationId=>api('/api/notifications/action',{id:notificationId,action:'delete'},AUTH.adminToken,{silentLoading:true,skipQueue:true})));S.notifications=(S.notifications||[]).filter(n=>!ids.includes(n.id));save();render();return;}
  if(a==='openWorkImage'){openWorkImage(id,el.dataset.index);return;}
  if(a==='closeMediaViewer'){closeMediaViewer();return;}
  if(a==='mediaViewerMove'){if(MEDIA_VIEWER){const total=MEDIA_VIEWER.images.length;MEDIA_VIEWER.index=(MEDIA_VIEWER.index+Number(el.dataset.value||0)+total)%total;renderMediaViewer();}return;}
@@ -3908,8 +4028,8 @@ async function onClick(e){ const el=e.target.closest('[data-action]'); if(!el)re
  if(a==='manageRequestContact'){contactConsentSheet(id);return;}
  if(a==='saveRequestContactConsent'){
   if(!requireRegisteredUser())return;const r=(S.customerRequests||[]).find(x=>x.id===id),p=getProvider(r?.acceptedProviderId);if(!r||!p){toast(L('اختر مزوداً لهذا الطلب أولاً.','Choose a provider for this request first.'));return;}if(r.userId&&S.session?.userId&&r.userId!==S.session.userId){toast(L('لا يمكنك تعديل تواصل طلب آخر.','You cannot change another request.'));return;}
-   const consent={chat:!!document.getElementById('contactAllowChat')?.checked,whatsapp:!!document.getElementById('contactAllowWhatsapp')?.checked,call:!!document.getElementById('contactAllowCall')?.checked,updatedAt:nowISO()};let synced=null;try{synced=await syncRequestCollaboration(r.id,'contact_consent',{chat:consent.chat,whatsapp:consent.whatsapp,call:consent.call},AUTH.userToken);}catch(err){showError(err);return;}if(!synced){r.contactConsent=consent;const enabled=[consent.chat?L('المحادثة','chat'):'',consent.whatsapp?L('واتساب','WhatsApp'):'',consent.call?L('الاتصال','calls'):''].filter(Boolean).join('، ')||L('لا توجد قناة مفعلة','no enabled channel');addNotification({type:'request',title:L('حدّث العميل خيارات التواصل','Customer updated contact choices'),message:L(`خيارات طلب ${r.serviceName}: ${enabled}.`,`Contact for ${r.serviceName}: ${enabled}.`),target:'provider',targetId:p.id,relatedId:r.id,priority:'normal',actionText:L('فتح الطلب','Open request'),actionRoute:`provider:request:${r.id}`,dedupeKey:`contact-consent:${r.id}:${consent.updatedAt}`});}
-  save();closeModal();toast(L('تم حفظ خصوصية التواصل.','Contact privacy saved.'));render();return;
+   const returnToChat=MODAL_STACK.some(snapshot=>snapshot.html.includes('chat-sheet')),consent={chat:!!document.getElementById('contactAllowChat')?.checked,whatsapp:!!document.getElementById('contactAllowWhatsapp')?.checked,call:!!document.getElementById('contactAllowCall')?.checked,updatedAt:nowISO()};let synced=null;try{synced=await syncRequestCollaboration(r.id,'contact_consent',{chat:consent.chat,whatsapp:consent.whatsapp,call:consent.call},AUTH.userToken);}catch(err){showError(err);return;}if(!synced){r.contactConsent=consent;const enabled=[consent.chat?L('المحادثة','chat'):'',consent.whatsapp?L('واتساب','WhatsApp'):'',consent.call?L('الاتصال','calls'):''].filter(Boolean).join('، ')||L('لا توجد قناة مفعلة','no enabled channel');addNotification({type:'request',title:L('حدّث العميل خيارات التواصل','Customer updated contact choices'),message:L(`خيارات طلب ${r.serviceName}: ${enabled}.`,`Contact for ${r.serviceName}: ${enabled}.`),target:'provider',targetId:p.id,relatedId:r.id,priority:'normal',actionText:L('فتح الطلب','Open request'),actionRoute:`provider:request:${r.id}`,dedupeKey:`contact-consent:${r.id}:${consent.updatedAt}`});}
+  save();toast(L('تم حفظ خصوصية التواصل.','Contact privacy saved.'));if(returnToChat){closeModalLayer();openRequestChat(r.id,'user',{preserveStack:true});}else{closeModal();render();}return;
  }
  if(a==='requestWhatsapp'||a==='requestCall'){
   if(!requireRegisteredUser())return;const r=(S.customerRequests||[]).find(x=>x.id===id),p=getProvider(r?.acceptedProviderId),channel=a==='requestWhatsapp'?'whatsapp':'call',consent=requestContactConsent(r);if(!r||!p||!consent[channel]){toast(L('فعّل هذه القناة من خيارات التواصل أولاً.','Enable this channel in contact choices first.'));return;}if(channel==='whatsapp'){incStat(p.id,'whatsapp');window.open(waUrl(p.phone,L(`مرحباً ${p.name}، بخصوص الطلب ${r.serviceName}.`,`Hello ${p.name}, regarding ${r.serviceName}.`)),'_blank');}else{incStat(p.id,'calls');location.href=callUrl(p.phone);}return;
@@ -4060,12 +4180,12 @@ if(a==='saveUserPin'){const current=val('userCurrentPin'),next=val('userNewPin')
  if(a==='openPolicyDocument'){policyDocumentSheet(id);return;}
  if(a==='acceptPolicy'){try{if(activeAuthToken())await api('/api/policy/accept',{version:APP_CONFIG.policyVersion},activeAuthToken());}catch(err){if(String(err?.message||err)!=='request_failed'){showError(err);return;}}S.policyAcceptedAt=nowISO();S.policyVersion=APP_CONFIG.policyVersion;S.policyAcceptance={version:APP_CONFIG.policyVersion,acceptedAt:S.policyAcceptedAt};save();policySheet();toast(L('تم حفظ موافقتك على هذا الإصدار.','Your acceptance of this version was saved.'));return;}
  if(a==='openAdminDocument'||a==='downloadAdminDocument'){try{await protectedDocument(el.dataset.src,a==='downloadAdminDocument'?`khadamati-document-${el.dataset.index||1}`:'');}catch(err){showError(err);}return;}
- if(a==='notificationCenterTab'){S.notificationCenterTab=el.dataset.value||'messages';save();notificationsSheet();return;}
+ if(a==='notificationCenterTab'){S.notificationCenterTab=el.dataset.value||'requests';save();notificationsSheet();return;}
  if(a==='markNotificationRead'){const ids=String(el.dataset.notificationIds||id).split(',').filter(Boolean);ids.forEach(notificationId=>{const n=(S.notifications||[]).find(x=>x.id===notificationId);if(n)n.read=true;});try{if(activeAuthToken())for(const notificationId of ids)await api('/api/notifications/action',{id:notificationId,action:'read'},activeAuthToken());}catch(_){}save();if(S.admin)render();else notificationsSheet();return;}
  if(a==='deleteNotification'){const ids=String(el.dataset.notificationIds||id).split(',').filter(Boolean);try{if(activeAuthToken())for(const notificationId of ids)await api('/api/notifications/action',{id:notificationId,action:'delete'},activeAuthToken());}catch(_){}S.notifications=(S.notifications||[]).filter(n=>!ids.includes(n.id));save();if(S.admin)render();else notificationsSheet();return;}
  if(a==='notificationAction'){const chatNotification=(S.notifications||[]).find(x=>x.id===id);if(chatNotification&&notificationIsChat(chatNotification)&&!S.admin){const ids=String(el.dataset.notificationIds||id).split(',').filter(Boolean);chatNotification.groupIds=ids;try{if(activeAuthToken())for(const notificationId of ids)await api('/api/notifications/action',{id:notificationId,action:'read'},activeAuthToken());}catch(_){}await openNotificationChat(chatNotification);return;}}
  if(a==='notificationAction'){const n=(S.notifications||[]).find(x=>x.id===id);if(!n)return;const ids=String(el.dataset.notificationIds||id).split(',').filter(Boolean);ids.forEach(notificationId=>{const item=(S.notifications||[]).find(x=>x.id===notificationId);if(item)item.read=true;});try{if(activeAuthToken())for(const notificationId of ids)await api('/api/notifications/action',{id:notificationId,action:'read'},activeAuthToken());}catch(_){}if(S.admin){openAdminNotificationTarget({...n,groupIds:ids});return;}const request=requestByAnyId(n.relatedId);if(request?.acceptedProviderId&&S.view==='provider'&&request.acceptedProviderId===S.currentProviderId){closeModal();S.providerTab='tasks';save();render();if(requestContactConsent(request).chat)setTimeout(()=>openRequestChat(request.id,'provider'),70);return;}if(request?.acceptedProviderId&&S.view!=='provider'&&request.userId===S.session?.userId){closeModal();S.view='myAccount';save();render();if(requestContactConsent(request).chat)setTimeout(()=>openRequestChat(request.id,'user'),70);else setTimeout(()=>focusAccountRequest(request.id),70);return;}const parts=String(n.actionRoute||'').split(':');closeModal();if(parts[0]==='provider'){S.providerTab=parts[1]==='request'?'leads':parts[1]||'home';save();render();if(parts[1]==='request')setTimeout(()=>document.querySelector(`[data-action="providerOpenRequest"][data-id="${CSS.escape(parts[2]||n.relatedId)}"]`)?.click(),60);}else if(parts[0]==='user'&&parts[1]==='suggestion'){providerSuggestionDetailsSheet(parts[2]||n.relatedId);}else if(parts[0]==='user'){openUserRequest(parts[2]||n.relatedId);}else if(S.view==='provider'&&n.actionRoute){S.providerTab=n.actionRoute;save();render();}return;}
- if(a==='clearReadNotifications'){const target=S.view==='provider'?'provider':'user',targetId=target==='provider'?S.currentProviderId:S.session?.userId;S.notifications=(S.notifications||[]).filter(n=>!(notificationTargetMatch(n,target,targetId)&&n.read));save();notificationsSheet();return;}
+ if(a==='clearReadNotifications'){const target=S.view==='provider'?'provider':'user',targetId=target==='provider'?S.currentProviderId:S.session?.userId,group=el.dataset.group||S.notificationCenterTab||'requests',ids=(S.notifications||[]).filter(n=>notificationTargetMatch(n,target,targetId)&&!notificationIsChat(n)&&notificationGroup(n)===group&&n.read).map(n=>n.id),token=target==='provider'?AUTH.providerToken:AUTH.userToken;if(token&&ids.length)await Promise.allSettled(ids.map(notificationId=>api('/api/notifications/action',{id:notificationId,action:'delete'},token,{silentLoading:true,skipQueue:true})));S.notifications=(S.notifications||[]).filter(n=>!ids.includes(n.id));save();notificationsSheet();return;}
  if(a==='applyMapFilters'){S.mapFilters={service:val('mapService'),gov:val('mapGov')};save();liveMapSheet({preserveStack:true});return;}
  if(a==='clearMapFilters'){S.mapFilters={service:'',gov:''};save();liveMapSheet({preserveStack:true});return;}
  if(a==='openProviderOnMap'){

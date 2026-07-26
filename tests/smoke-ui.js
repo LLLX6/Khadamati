@@ -509,7 +509,7 @@ async function clickAdminTab(page, tab) {
   await page.locator('#offerNote').fill('يشمل المعاينة والتنفيذ');
   await page.locator('[data-action="submitProviderOffer"]').click();
   await page.waitForSelector('#modalRoot .modal-backdrop', { state: 'detached' });
-  await page.locator('[data-action="providerUserMode"]').click();
+  await page.locator('.provider-top-actions [data-action="switchAccountMode"]').click();
   const customerModeAuth = await page.evaluate(() => JSON.parse(localStorage.getItem('KHADAMATI_AUTH_V3') || '{}'));
   assert(customerModeAuth.activeRole === 'user' && customerModeAuth.userToken === 'ui-user-token', 'Returning from provider mode did not restore the customer session.');
   await clickUserNav(page, 'myAccount');
@@ -554,6 +554,14 @@ async function clickAdminTab(page, tab) {
   assert(chatViewportFit, 'Chat does not fill the active viewport or its composer overflows the phone screen.');
   assert(await page.locator('.chat-sheet [data-action="refreshRequestChat"]').count() === 0, 'Chat still exposes a manual refresh button.');
   assert(await page.evaluate(() => Boolean(window.__khadamatiChatPoll)), 'Chat automatic refresh did not start.');
+  await page.locator('.chat-sheet [data-action="manageRequestContact"]').click();
+  assert(await page.locator('.contact-consent-sheet').count(), 'Contact choices did not open above the active chat.');
+  await page.locator('.contact-consent-sheet [data-action="closeModalSoft"]').click();
+  assert(await page.locator('.chat-sheet #chatThread').count(), 'Closing contact choices did not restore the same chat.');
+  await page.locator('.chat-sheet [data-action="manageRequestContact"]').click();
+  await page.locator('.contact-consent-sheet [data-action="saveRequestContactConsent"]').click();
+  await page.waitForSelector('.chat-sheet #chatThread');
+  assert(await page.locator('.chat-sheet #chatThread').count(), 'Saving contact choices removed the user from the active chat.');
   assert(await page.locator('.chat-quick-replies button').count() >= 4, 'Chat quick replies or location sharing are missing.');
   assert(await page.locator('[data-action="shareChatLocation"]').count() === 1, 'Chat location sharing action is missing.');
   await page.locator('[data-action="shareChatLocation"]').click();
@@ -607,16 +615,20 @@ async function clickAdminTab(page, tab) {
 
   await page.locator('.account-menu [data-action="providerMode"], .account-menu [data-action="nav"][data-view="provider"]').first().click();
   await page.locator('.provider-top-actions [data-action="openNotifications"]').click();
-  assert(await page.locator('.notification-center-tab').count() === 3, 'Notification center must have chats, requests, and updates sections.');
-  await page.locator('[data-action="notificationCenterTab"][data-value="messages"]').click();
-  const providerChatNotice = page.locator('.chat-notification [data-action="notificationAction"]').first();
-  assert(await providerChatNotice.count(), 'Provider chat notification is missing from the chats section.');
-  assert((await page.locator('.chat-notification .notification-copy b').first().textContent()).includes('مستخدم الاختبار الآلي'), 'Provider chat notification does not identify the customer.');
-  await providerChatNotice.locator('xpath=ancestor::details').locator('summary').click();
-  await providerChatNotice.click();
+  assert(await page.locator('.notification-center-tab').count() === 2, 'Notification center must keep only requests and updates.');
+  assert(await page.locator('[data-action="notificationCenterTab"][data-value="messages"]').count() === 0, 'Chats still appear inside the notification center.');
+  await page.locator('.notification-center-sheet [data-action="closeModal"]').click();
+  await page.locator('.provider-top-actions [data-action="openConversations"]').click();
+  await page.waitForSelector('.conversation-hub-sheet .conversation-card');
+  const providerConversation = page.locator('.conversation-card').first();
+  assert(await providerConversation.count(), 'Provider conversation hub is empty.');
+  assert((await providerConversation.textContent()).includes('مستخدم الاختبار الآلي'), 'Provider conversation does not identify the customer.');
+  await providerConversation.click();
   await page.waitForSelector('.chat-sheet #chatThread');
-  assert(await page.locator('.chat-profile-identity b').filter({ hasText: /مستخدم الاختبار/i }).count(), 'Provider notification did not open the correct chat directly.');
-  await page.locator('[data-action="closeModal"]').click();
+  assert(await page.locator('.chat-profile-identity b').filter({ hasText: /مستخدم الاختبار/i }).count(), 'Provider conversation hub did not open the correct chat directly.');
+  await page.locator('.chat-sheet [data-action="closeModalSoft"]').click();
+  assert(await page.locator('.conversation-hub-sheet').count(), 'Closing a chat did not return to the conversation hub.');
+  await page.locator('.conversation-hub-sheet [data-action="closeModal"]').click();
   await page.locator('.side-nav [data-action="providerTab"][data-tab="tasks"]').click();
   assert(await page.locator('.provider-active-jobs .provider-task-card').count(), 'Accepted request is missing from provider active jobs.');
   assert(await page.locator('.provider-active-jobs [data-action="providerAcceptRequest"]').count() === 0, 'Provider can still submit an offer after being selected.');
@@ -644,17 +656,16 @@ async function clickAdminTab(page, tab) {
   await page.waitForSelector('.provider-media-preview');
   await capture(page, '07-provider-media');
 
-  await page.locator('[data-action="providerUserMode"]').click();
-  await page.locator('.app-top [data-action="openNotifications"]').click();
-  await page.locator('[data-action="notificationCenterTab"][data-value="messages"]').click();
-  const userChatNotice = page.locator('.chat-notification [data-action="notificationAction"]').first();
-  assert(await userChatNotice.count(), 'User chat notification is missing from the chats section.');
-  assert((await page.locator('.chat-notification .notification-copy b').first().textContent()).includes('سالم البلوشي'), 'User chat notification does not identify the provider.');
-  await userChatNotice.locator('xpath=ancestor::details').locator('summary').click();
-  await userChatNotice.click();
+  await page.locator('.provider-top-actions [data-action="switchAccountMode"]').click();
+  await page.locator('.app-top [data-action="openConversations"]').click();
+  await page.waitForSelector('.conversation-hub-sheet .conversation-card');
+  const userConversation = page.locator('.conversation-card').first();
+  assert((await userConversation.textContent()).includes('سالم البلوشي'), 'User conversation does not identify the provider.');
+  await userConversation.click();
   await page.waitForSelector('.chat-sheet #chatThread');
-  assert(await page.locator('.chat-profile-identity b').filter({ hasText: /سالم البلوشي/i }).count(), 'User notification did not open the correct chat directly.');
-  await page.locator('[data-action="closeModal"]').click();
+  assert(await page.locator('.chat-profile-identity b').filter({ hasText: /سالم البلوشي/i }).count(), 'User conversation hub did not open the correct chat directly.');
+  await page.locator('.chat-sheet [data-action="closeModalSoft"]').click();
+  await page.locator('.conversation-hub-sheet [data-action="closeModal"]').click();
   await clickUserNav(page, 'search');
   await page.waitForTimeout(600);
   if (await page.locator('#modalRoot .modal-backdrop.show').count()) {
@@ -681,6 +692,12 @@ async function clickAdminTab(page, tab) {
   await page.locator('[data-action="closeModal"]').click();
   await clickUserNav(page, 'myAccount');
   await page.locator('.account-menu [data-action="providerMode"], .account-menu [data-action="nav"][data-view="provider"]').first().click();
+  const directSupport = page.locator('.side-nav [data-action="providerTab"][data-tab="support"]').first();
+  if (await directSupport.isVisible()) await directSupport.click();
+  else {
+    await page.locator('[data-action="openProviderTools"]').click();
+    await page.locator('[data-action="providerToolTab"][data-tab="support"]').click();
+  }
   await page.locator('[data-action="providerLogout"]').click();
   await page.locator('[data-action="goBack"]').click();
   await page.locator('[data-action="enterGuest"]').click();

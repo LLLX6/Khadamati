@@ -316,8 +316,15 @@ def run():
                 assert error.code == 413, f"oversized body returned HTTP {error.code}"
 
             sw = (ROOT / "service-worker.js").read_text(encoding="utf-8")
-            assert "khadamati-app-shell-v60-request-lifecycle" in sw
+            assert "khadamati-app-shell-v61-conversation-hub" in sw
             assert "./assets/styles/khadamati-v60.css" in sw
+            assert "./assets/styles/khadamati-v61.css" in sw
+            page_source = (ROOT / "index.html").read_text(encoding="utf-8")
+            assert 'data-action="openConversations"' in page_source
+            assert "notificationGroup(n)===group&&n.read" in page_source
+            assert "function adminSectionUnread(tab)" in page_source
+            assert "adminSectionUnread(t)" in page_source
+            assert "chatIsOpen&&!incoming.includes('chat-sheet')" in page_source
             assert "api|media|uploads" in sw and "cache: 'no-store'" in sw
 
             return {
