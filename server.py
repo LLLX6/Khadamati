@@ -224,6 +224,26 @@ def safe_text(value, limit=240):
     return str(value or "").strip()[:limit]
 
 
+def log_event(event, level="info", **fields):
+    """Write one structured event without request bodies, query strings, or secrets."""
+    record = {
+        "timestamp": datetime.now(UTC).isoformat(),
+        "level": safe_text(level, 20) or "info",
+        "event": safe_text(event, 120) or "application.event",
+        "release": APP_RELEASE,
+        "environment": APP_ENV,
+    }
+    for key, value in fields.items():
+        if value is None:
+            continue
+        record[key] = (
+            value
+            if isinstance(value, (str, int, float, bool, dict, list))
+            else str(value)
+        )
+    print(jdump(record), flush=True)
+
+
 def finite_number(value, default=0.0, *, minimum=None, maximum=None):
     try:
         number = float(value)
@@ -616,7 +636,7 @@ def create_pre_migration_backup():
 def init_db():
     backup_path = create_pre_migration_backup()
     if backup_path:
-        print(f"Pre-migration database backup: {backup_path}", flush=True)
+        log_event("database.pre_migration_backup", file=backup_path.name)
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
     with db() as con:
         con.executescript(
@@ -1003,7 +1023,7 @@ def init_db():
             )
         con.execute("UPDATE packages SET max_services=5,max_images=15 WHERE id='company_year' AND max_services>5")
         migration_summary = run_subscription_migration_v1(con)
-        print(f"Subscription migration: {jdump(migration_summary)}", flush=True)
+        log_event("database.subscription_migration", summary=migration_summary)
         if DEMO_DATA_ENABLED and con.execute("SELECT COUNT(*) n FROM reviews").fetchone()["n"] == 0:
             con.execute(
                 """INSERT INTO reviews(
@@ -1060,9 +1080,10 @@ def init_db():
                 ("admin_owner", "المالك", hash_pin(INITIAL_ADMIN_CODE), "super_admin", jdump(ALL_PERMISSIONS)),
             )
         elif con.execute("SELECT COUNT(*) n FROM admin_users").fetchone()["n"] == 0:
-            print(
-                "Admin account not seeded. Set KHADAMATI_ADMIN_CODE once, then rotate it from administration settings.",
-                flush=True,
+            log_event(
+                "security.admin_seed_skipped",
+                level="warning",
+                reason="admin_code_not_configured",
             )
         con.execute(
             "UPDATE admin_users SET role='super_admin',permissions=? WHERE role='owner'",
@@ -1783,7 +1804,11 @@ def deliver_push(target_kind, target_id, payload):
                 with db() as con:
                     con.execute("UPDATE push_subscriptions SET active=0 WHERE id=?", (subscription["id"],))
         except Exception as err:
-            print(f"Push delivery skipped: {err}", flush=True)
+            log_event(
+                "push.delivery_skipped",
+                level="warning",
+                errorType=type(err).__name__,
+            )
 
 
 def create_notification(con, target_kind, target_id, title, message="", *, type_="general",
@@ -2564,11 +2589,20 @@ def whatsapp_configured():
 
 
 def log_whatsapp(target, status, detail):
+    digits = normalize_phone(target)
+    masked_target = f"***{digits[-4:]}" if len(digits) >= 4 else "***"
     try:
         with db() as con:
-            con.execute("INSERT INTO whatsapp_logs VALUES(?,?,?,?,CURRENT_TIMESTAMP)", (slug("wa"), target, status, detail[:900]))
+            con.execute(
+                "INSERT INTO whatsapp_logs VALUES(?,?,?,?,CURRENT_TIMESTAMP)",
+                (slug("wa"), masked_target, status, safe_text(detail, 900)),
+            )
     except sqlite3.OperationalError as err:
-        print(f"WhatsApp log skipped: {err}", flush=True)
+        log_event(
+            "whatsapp.audit_log_skipped",
+            level="warning",
+            errorType=type(err).__name__,
+        )
 
 
 def send_whatsapp(to, text):
@@ -2594,11 +2628,36 @@ def send_whatsapp(to, text):
         )
         response = connection.getresponse()
         body = response.read().decode("utf-8", errors="replace")
+        try:
+            response_data = jload(body, {})
+        except json.JSONDecodeError:
+            response_data = {}
         if 200 <= response.status < 300:
-            log_whatsapp(target, "sent", body)
-            return {"ok": True, "configured": True, "response": jload(body, {})}
-        log_whatsapp(target, "failed", body)
-        return {"ok": False, "configured": True, "error": body}
+            messages = response_data.get("messages", []) if isinstance(response_data, dict) else []
+            message_id = (
+                safe_text(messages[0].get("id"), 160)
+                if messages and isinstance(messages[0], dict)
+                else ""
+            )
+            log_whatsapp(
+                target,
+                "sent",
+                jdump({"status": response.status, "messageId": message_id}),
+            )
+            return {"ok": True, "configured": True, "messageId": message_id}
+        error_data = response_data.get("error", {}) if isinstance(response_data, dict) else {}
+        log_whatsapp(
+            target,
+            "failed",
+            jdump(
+                {
+                    "status": response.status,
+                    "code": error_data.get("code", ""),
+                    "type": safe_text(error_data.get("type"), 120),
+                }
+            ),
+        )
+        return {"ok": False, "configured": True, "error": "gateway_rejected"}
     except Exception as err:
         log_whatsapp(target, "failed", str(err))
         return {"ok": False, "configured": True, "error": "delivery_failed"}
@@ -2817,10 +2876,52 @@ def upsert_provider(con, data):
 
 class Handler(SimpleHTTPRequestHandler):
     def __init__(self, *args, **kwargs):
+        self.request_id = secrets.token_hex(12)
+        self.request_started = time.monotonic()
         super().__init__(*args, directory=str(PUBLIC_DIR), **kwargs)
+
+    def handle_one_request(self):
+        self.request_id = secrets.token_hex(12)
+        self.request_started = time.monotonic()
+        return super().handle_one_request()
+
+    def log_request(self, code="-", size="-"):
+        try:
+            status = int(code)
+        except (TypeError, ValueError):
+            status = code
+        try:
+            response_bytes = int(size)
+        except (TypeError, ValueError):
+            response_bytes = None
+        log_event(
+            "http.request",
+            requestId=self.request_id,
+            method=safe_text(getattr(self, "command", ""), 16),
+            path=safe_text(urlparse(getattr(self, "path", "")).path, 500),
+            status=status,
+            responseBytes=response_bytes,
+            durationMs=round((time.monotonic() - self.request_started) * 1000, 2),
+        )
+
+    def log_message(self, format_, *args):
+        log_event(
+            "http.message",
+            requestId=self.request_id,
+            message=safe_text(format_ % args, 400),
+        )
+
+    def log_error(self, format_, *args):
+        log_event(
+            "http.error",
+            requestId=self.request_id,
+            level="warning",
+            message=safe_text(format_ % args, 400),
+        )
 
     def end_headers(self):
         path = urlparse(self.path).path
+        self.send_header("X-Request-ID", self.request_id)
         if path.startswith(("/api/", "/media/", "/uploads/")):
             self.send_header("Cache-Control", "no-store")
         elif path.endswith((".css", ".js", ".webp", ".png", ".svg", ".woff", ".woff2")):
@@ -2846,6 +2947,7 @@ class Handler(SimpleHTTPRequestHandler):
             self.send_header("Access-Control-Allow-Origin", origin)
             self.send_header("Access-Control-Allow-Headers", "Authorization, Content-Type")
             self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+            self.send_header("Access-Control-Expose-Headers", "X-Request-ID")
             self.send_header("Vary", "Origin")
         super().end_headers()
 
@@ -6026,5 +6128,10 @@ if __name__ == "__main__":
         display_host = "127.0.0.1" if ipaddress.ip_address(host).is_unspecified else host
     except ValueError:
         display_host = host
-    print(f"Khadamati platform running: http://{display_host}:{port}", flush=True)
+    log_event(
+        "service.started",
+        host=display_host,
+        port=port,
+        database="sqlite",
+    )
     ThreadingHTTPServer((host, port), Handler).serve_forever()

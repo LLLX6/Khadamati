@@ -491,6 +491,22 @@ class KhadamatiDomainTests(unittest.TestCase):
                     (admin_related, user_related),
                 )
 
+    def test_whatsapp_audit_masks_the_target_phone(self):
+        detail = f"audit-{os.urandom(4).hex()}"
+        server.log_whatsapp("96895550177", "failed", detail)
+        try:
+            with server.db() as con:
+                row = con.execute(
+                    "SELECT target,detail FROM whatsapp_logs WHERE detail=?",
+                    (detail,),
+                ).fetchone()
+            self.assertIsNotNone(row)
+            self.assertEqual("***0177", row["target"])
+            self.assertNotIn("96895550177", row["target"])
+        finally:
+            with server.db() as con:
+                con.execute("DELETE FROM whatsapp_logs WHERE detail=?", (detail,))
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

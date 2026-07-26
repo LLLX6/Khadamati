@@ -165,6 +165,13 @@ python scripts/restore_sqlite_backup.py --archive backups/khadamati-backup.zip -
 
 `render.yaml` يجهز خادم Python. في Render أضف أسرار الإدارة وOTP والدفع يدوياً، واضبط قرصاً دائماً أو PostgreSQL وتخزين ملفات دائم قبل الإطلاق العام.
 
+قبل أي نشر إنتاجي شغّل فحص الجاهزية بعد تركيب مسارات التخزين، وهو يعرض أسماء
+المتغيرات الناقصة ورموز الأخطاء فقط ولا يطبع قيم الأسرار:
+
+```powershell
+python scripts/check_production_readiness.py
+```
+
 [نشر أو استعادة خادم خدماتي على Render](https://render.com/deploy?repo=https://github.com/LLLX6/Khadamati)
 
 الخادم المنشور للتطبيق هو `https://khadamati-app-api.onrender.com`. يمكن فحصه من `https://khadamati-app-api.onrender.com/api/bootstrap`. إذا أعاد الخادم حالة `503` مع عبارة `Service Suspended`، فخدمة Render نفسها متوقفة وليست المشكلة في الواجهة أو رقم الهاتف. افتح الخدمة من لوحة Render واختر **Resume**، أو أنشئها من رابط النشر أعلاه. إذا كان الإيقاف مفروضاً من Render على الخطة المجانية، يلزم نقل الخدمة إلى خطة مدفوعة وفق سياسة Render.
@@ -184,6 +191,7 @@ python -m py_compile server.py khadamati_domain.py
 python -m unittest discover -s tests -p "test_*.py" -v
 python tests/security-api.py
 python tests/run-smoke-isolated.py
+python tests/performance-api.py
 python scripts/verify_repository.py
 python scripts/audit_database.py khadamati.sqlite3 --allow-demo-data
 node tests/smoke-ui.js

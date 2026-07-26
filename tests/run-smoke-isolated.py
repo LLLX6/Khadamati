@@ -27,7 +27,7 @@ def free_port() -> int:
 def wait_until_ready(base_url: str) -> None:
     for _ in range(100):
         try:
-            with urllib.request.urlopen(f"{base_url}/api/bootstrap", timeout=2) as response:
+            with urllib.request.urlopen(f"{base_url}/readyz", timeout=2) as response:
                 if response.status == 200:
                     return
         except (urllib.error.URLError, TimeoutError):

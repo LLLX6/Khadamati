@@ -67,9 +67,24 @@ def expect(status, data, expected, message):
 def main():
     assert ADMIN_CODE, "Set KHADAMATI_TEST_ADMIN_CODE for the isolated test server."
 
-    status, health = request("/healthz")
+    status, health_headers, health_raw = raw_request("/healthz")
+    health = json.loads(health_raw.decode("utf-8"))
     expect(status, health, {200}, "Health check failed")
     assert health.get("ok") is True and health.get("service") == "khadamati-api"
+    request_id = next(
+        (value for key, value in health_headers.items() if key.lower() == "x-request-id"),
+        "",
+    )
+    exposed = next(
+        (
+            value
+            for key, value in health_headers.items()
+            if key.lower() == "access-control-expose-headers"
+        ),
+        "",
+    )
+    assert len(request_id) == 24 and all(ch in "0123456789abcdef" for ch in request_id)
+    assert "X-Request-ID" in exposed
 
     status, ready = request("/readyz")
     expect(status, ready, {200}, "Readiness check failed")
