@@ -9,12 +9,16 @@ services:
     renderSubdomainPolicy: enabled
     buildCommand: pip install -r requirements.txt
     startCommand: python server.py
-    healthCheckPath: /api/bootstrap
+    healthCheckPath: /healthz
     envVars:
       - key: HOST
         value: 0.0.0.0
       - key: KHADAMATI_ENV
         value: production
+      - key: KHADAMATI_RELEASE
+        value: v62
+      - key: KHADAMATI_SEED_DEMO_DATA
+        value: false
       - key: KHADAMATI_PUBLIC_URL
         value: https://lllx6.github.io/Khadamati/
       - key: KHADAMATI_ALLOWED_ORIGINS

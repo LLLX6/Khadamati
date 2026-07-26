@@ -4,7 +4,8 @@ const http = require('http');
 const path = require('path');
 
 const BASE_URL = process.env.KHADAMATI_TEST_URL || '';
-const CHROME_PATH = process.env.CHROME_PATH || 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe';
+const DEFAULT_CHROME_PATH = 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe';
+const CHROME_PATH = process.env.CHROME_PATH || (fs.existsSync(DEFAULT_CHROME_PATH) ? DEFAULT_CHROME_PATH : '');
 let localServer;
 
 async function startStaticServer() {
@@ -49,7 +50,9 @@ async function startStaticServer() {
 
 (async () => {
   const testUrl = BASE_URL || await startStaticServer();
-  const browser = await chromium.launch({ headless: true, executablePath: CHROME_PATH });
+  const launchOptions = { headless: true };
+  if (CHROME_PATH) launchOptions.executablePath = CHROME_PATH;
+  const browser = await chromium.launch(launchOptions);
   const page = await browser.newPage({
     viewport: { width: 390, height: 844 },
     isMobile: true,

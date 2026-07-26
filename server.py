@@ -52,6 +52,19 @@ UPLOAD_DIR = Path(os.environ.get("KHADAMATI_UPLOAD_DIR") or os.environ.get("FORA
 _legacy_db = BASE_DIR / "foran.sqlite3"
 DB_PATH = Path(os.environ.get("KHADAMATI_DB_PATH") or os.environ.get("FORAN_DB_PATH") or (_legacy_db if _legacy_db.exists() else BASE_DIR / "khadamati.sqlite3"))
 APP_ENV = os.environ.get("KHADAMATI_ENV", "development").strip().lower() or "development"
+
+
+def environment_flag(name, default=False):
+    value = os.environ.get(name)
+    if value is None:
+        return bool(default)
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+APP_RELEASE = os.environ.get("KHADAMATI_RELEASE", "v62").strip() or "v62"
+DEMO_DATA_ENABLED = environment_flag(
+    "KHADAMATI_SEED_DEMO_DATA", APP_ENV in {"development", "test"}
+)
 INITIAL_ADMIN_CODE = (
     os.environ.get("KHADAMATI_ADMIN_CODE")
     or os.environ.get("FORAN_ADMIN_CODE")
@@ -150,6 +163,8 @@ def db():
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     con = sqlite3.connect(DB_PATH, timeout=12)
     con.row_factory = sqlite3.Row
+    con.execute("PRAGMA busy_timeout=12000")
+    con.execute("PRAGMA foreign_keys=ON")
     try:
         with con:
             yield con
@@ -948,21 +963,22 @@ def init_db():
                     "UPDATE services SET icon=?, ar=?, en=? WHERE id=? AND category_id=?",
                     (s["icon"], s["ar"], s["en"], s["id"], c["id"]),
                 )
-        for p in SEED_PROVIDERS:
-            con.execute(
-                """INSERT OR IGNORE INTO providers(id,name,phone,gov,wilayah,areas,bio,hours,status,active,verified,featured,
-                package_id,rating,reviews,services,subscription_until,subscription_start,provider_type,company_name,stats,pin_hash)
-                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (
-                    p["id"], p["name"], p["phone"], p["gov"], p["wilayah"], jdump(p["areas"]), p["bio"], p["hours"],
-                    p.get("status", "available"), p.get("active", 1), p.get("verified", 0), p.get("featured", 0),
-                    p.get("package_id", "intro"), p.get("rating", 0), p.get("reviews", 0), jdump(p.get("services", [])),
-                    p.get("subscription_until", ""), p.get("subscription_start", ""),
-                    p.get("provider_type", "individual"), p.get("company_name", ""),
-                    jdump(p.get("stats", {"views": 0, "whatsapp": 0, "calls": 0})),
-                    "",
-                ),
-            )
+        if DEMO_DATA_ENABLED:
+            for p in SEED_PROVIDERS:
+                con.execute(
+                    """INSERT OR IGNORE INTO providers(id,name,phone,gov,wilayah,areas,bio,hours,status,active,verified,featured,
+                    package_id,rating,reviews,services,subscription_until,subscription_start,provider_type,company_name,stats,pin_hash)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (
+                        p["id"], p["name"], p["phone"], p["gov"], p["wilayah"], jdump(p["areas"]), p["bio"], p["hours"],
+                        p.get("status", "available"), p.get("active", 1), p.get("verified", 0), p.get("featured", 0),
+                        p.get("package_id", "intro"), p.get("rating", 0), p.get("reviews", 0), jdump(p.get("services", [])),
+                        p.get("subscription_until", ""), p.get("subscription_start", ""),
+                        p.get("provider_type", "individual"), p.get("company_name", ""),
+                        jdump(p.get("stats", {"views": 0, "whatsapp": 0,"calls": 0})),
+                        "",
+                    ),
+                )
         for p in SEED_PROVIDERS:
             con.execute(
                 "UPDATE providers SET pin_hash='' WHERE id=? AND pin_hash IN (?,?)",
@@ -988,7 +1004,7 @@ def init_db():
         con.execute("UPDATE packages SET max_services=5,max_images=15 WHERE id='company_year' AND max_services>5")
         migration_summary = run_subscription_migration_v1(con)
         print(f"Subscription migration: {jdump(migration_summary)}", flush=True)
-        if con.execute("SELECT COUNT(*) n FROM reviews").fetchone()["n"] == 0:
+        if DEMO_DATA_ENABLED and con.execute("SELECT COUNT(*) n FROM reviews").fetchone()["n"] == 0:
             con.execute(
                 """INSERT INTO reviews(
                 id,provider_id,rating,customer_name,phone,comment,approved,created_at)
@@ -2202,7 +2218,10 @@ def get_bootstrap(session=None):
                 item["providerSuggestions"] = request_suggestions(con, item["id"], include_hidden=True)
             notifications = [
                 row_notification(r)
-                for r in con.execute("SELECT * FROM app_notifications ORDER BY created_at DESC LIMIT 300")
+                for r in con.execute(
+                    """SELECT * FROM app_notifications
+                    WHERE target_kind='admin' ORDER BY created_at DESC LIMIT 300"""
+                )
             ]
             users = [
                 row_app_user(r, private=True, sign_private=True)
@@ -2323,7 +2342,8 @@ def get_bootstrap(session=None):
                 "SELECT COUNT(*) n FROM customer_requests WHERE status='unavailable'"
             ).fetchone()["n"],
             "unreadNotifications": con.execute(
-                "SELECT COUNT(*) n FROM app_notifications WHERE is_read=0"
+                """SELECT COUNT(*) n FROM app_notifications
+                WHERE target_kind='admin' AND is_read=0"""
             ).fetchone()["n"] if is_admin else len([n for n in notifications if not n["read"]]),
         }
         if not is_admin:
@@ -2483,7 +2503,8 @@ def get_bootstrap(session=None):
                 "otpDeliveryConfigured": whatsapp_configured() or (
                     APP_ENV != "production" and bool(os.environ.get("KHADAMATI_DEV_OTP_CODE"))
                 ),
-                "postgresReady": True,
+                "postgresReady": False,
+                "databaseEngine": "sqlite",
             },
             "permissions": ALL_PERMISSIONS if is_admin else [],
         }
@@ -2799,7 +2820,13 @@ class Handler(SimpleHTTPRequestHandler):
         super().__init__(*args, directory=str(PUBLIC_DIR), **kwargs)
 
     def end_headers(self):
-        self.send_header("Cache-Control", "no-store")
+        path = urlparse(self.path).path
+        if path.startswith(("/api/", "/media/", "/uploads/")):
+            self.send_header("Cache-Control", "no-store")
+        elif path.endswith((".css", ".js", ".webp", ".png", ".svg", ".woff", ".woff2")):
+            self.send_header("Cache-Control", "public, max-age=86400")
+        else:
+            self.send_header("Cache-Control", "no-cache")
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("X-Frame-Options", "SAMEORIGIN")
         self.send_header("Referrer-Policy", "strict-origin-when-cross-origin")
@@ -2923,6 +2950,46 @@ class Handler(SimpleHTTPRequestHandler):
     def do_GET(self):
         parsed = urlparse(self.path)
         path = parsed.path
+        if path == "/healthz":
+            return self.send_json(
+                {"ok": True, "service": "khadamati-api", "release": APP_RELEASE}
+            )
+        if path == "/readyz":
+            issues = []
+            if APP_ENV == "production":
+                if not os.environ.get("KHADAMATI_DB_PATH"):
+                    issues.append("database_path_not_configured")
+                if not os.environ.get("KHADAMATI_UPLOAD_DIR"):
+                    issues.append("upload_path_not_configured")
+                if not os.environ.get("KHADAMATI_BACKUP_DIR"):
+                    issues.append("backup_path_not_configured")
+                if not (
+                    os.environ.get("KHADAMATI_MEDIA_SIGNING_KEY")
+                    or os.environ.get("KHADAMATI_OTP_PEPPER")
+                ):
+                    issues.append("media_signing_key_not_configured")
+            try:
+                with db() as con:
+                    con.execute("SELECT 1").fetchone()
+            except sqlite3.Error:
+                issues.append("database_unavailable")
+            storage_writable = (
+                os.access(DB_PATH.parent, os.W_OK)
+                and os.access(UPLOAD_DIR, os.W_OK)
+            )
+            if not storage_writable:
+                issues.append("storage_not_writable")
+            ready = not issues
+            return self.send_json(
+                {
+                    "ok": ready,
+                    "service": "khadamati-api",
+                    "release": APP_RELEASE,
+                    "database": "sqlite",
+                    "issues": issues,
+                },
+                200 if ready else 503,
+            )
         if path.startswith("/media/"):
             filename = path.removeprefix("/media/")
             query = parse_qs(parsed.query)

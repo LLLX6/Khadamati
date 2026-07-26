@@ -427,6 +427,70 @@ class KhadamatiDomainTests(unittest.TestCase):
             OTPService(self.con, environment=environment).request("96895550103", "login")
         self.assertEqual("otp_delivery_unavailable", caught.exception.code)
 
+    def test_production_database_does_not_seed_demo_profiles(self):
+        with tempfile.TemporaryDirectory(prefix="khadamati-production-seed-") as temp:
+            old_db = server.DB_PATH
+            old_uploads = server.UPLOAD_DIR
+            old_demo = server.DEMO_DATA_ENABLED
+            try:
+                server.DB_PATH = Path(temp) / "production.sqlite3"
+                server.UPLOAD_DIR = Path(temp) / "uploads"
+                server.DEMO_DATA_ENABLED = False
+                server.init_db()
+                con = sqlite3.connect(server.DB_PATH)
+                try:
+                    provider_count = con.execute(
+                        """SELECT COUNT(*) FROM providers
+                        WHERE id IN ('p1','p2','p3','p4','p5','p6',
+                                     'p7','p8','p9','p10','p11','p12')"""
+                    ).fetchone()[0]
+                    review_count = con.execute(
+                        "SELECT COUNT(*) FROM reviews WHERE id IN ('rev_seed_1','rev_seed_2')"
+                    ).fetchone()[0]
+                finally:
+                    con.close()
+                self.assertEqual(0, provider_count)
+                self.assertEqual(0, review_count)
+            finally:
+                server.DB_PATH = old_db
+                server.UPLOAD_DIR = old_uploads
+                server.DEMO_DATA_ENABLED = old_demo
+
+    def test_admin_bootstrap_contains_only_admin_notifications(self):
+        admin_related = f"admin-scope-{os.urandom(4).hex()}"
+        user_related = f"user-scope-{os.urandom(4).hex()}"
+        with server.db() as con:
+            server.create_notification(
+                con, "admin", "", "Admin scoped notification",
+                related_id=admin_related,
+            )
+            server.create_notification(
+                con, "user", "test-user", "User scoped notification",
+                related_id=user_related,
+            )
+        try:
+            data = server.get_bootstrap(
+                {
+                    "kind": "admin",
+                    "id": "test-admin",
+                    "name": "Test admin",
+                    "role": "super_admin",
+                    "permissions": server.ALL_PERMISSIONS,
+                }
+            )
+            related_ids = {item["relatedId"] for item in data["notifications"]}
+            self.assertIn(admin_related, related_ids)
+            self.assertNotIn(user_related, related_ids)
+            self.assertTrue(
+                all(item["targetKind"] == "admin" for item in data["notifications"])
+            )
+        finally:
+            with server.db() as con:
+                con.execute(
+                    "DELETE FROM app_notifications WHERE related_id IN (?,?)",
+                    (admin_related, user_related),
+                )
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

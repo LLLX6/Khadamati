@@ -67,6 +67,14 @@ def expect(status, data, expected, message):
 def main():
     assert ADMIN_CODE, "Set KHADAMATI_TEST_ADMIN_CODE for the isolated test server."
 
+    status, health = request("/healthz")
+    expect(status, health, {200}, "Health check failed")
+    assert health.get("ok") is True and health.get("service") == "khadamati-api"
+
+    status, ready = request("/readyz")
+    expect(status, ready, {200}, "Readiness check failed")
+    assert ready.get("ok") is True and ready.get("database") == "sqlite"
+
     status, public = request("/api/bootstrap")
     expect(status, public, {200}, "Public bootstrap failed")
     assert public.get("categories"), "Public categories are missing"
@@ -79,6 +87,12 @@ def main():
     status, admin = request("/api/admin/login", {"code": ADMIN_CODE})
     expect(status, admin, {200}, "Admin login failed")
     admin_token = admin["token"]
+    status, scoped_admin = request("/api/admin/session", token=admin_token)
+    expect(status, scoped_admin, {200}, "Admin notification scope failed")
+    assert all(
+        item.get("targetKind") == "admin"
+        for item in scoped_admin.get("notifications", [])
+    ), "Admin session received account-scoped notifications"
 
     status, headers, report_csv = raw_request("/api/reports/summary.csv?lang=ar", admin_token)
     assert status == 200 and report_csv.startswith(b"\xef\xbb\xbf"), "Arabic CSV report is not UTF-8 BOM encoded"

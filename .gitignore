@@ -4,6 +4,13 @@ foran-export.json
 khadamati-export.json
 __pycache__/
 *.pyc
+.pytest_cache/
+.coverage
+coverage/
+node_modules/
+.env
+.env.*
+!.env.example
 server.log
 server.err
 public/uploads/*

@@ -1,0 +1,14 @@
+{
+  "name": "khadamati-app-quality",
+  "version": "62.0.0",
+  "private": true,
+  "description": "Quality tooling for the Khadamati PWA",
+  "scripts": {
+    "check:js": "node --check tests/smoke-ui.js && node --check tests/performance-ui.js && node --check assets/scripts/khadamati-visuals-v56.js",
+    "test:ui": "node tests/smoke-ui.js",
+    "test:performance": "node tests/performance-ui.js"
+  },
+  "devDependencies": {
+    "playwright": "1.61.1"
+  }
+}

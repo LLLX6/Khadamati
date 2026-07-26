@@ -4,7 +4,8 @@ const http = require('http');
 const path = require('path');
 
 const BASE_URL = process.env.KHADAMATI_TEST_URL || '';
-const CHROME_PATH = process.env.CHROME_PATH || 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe';
+const DEFAULT_CHROME_PATH = 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe';
+const CHROME_PATH = process.env.CHROME_PATH || (fs.existsSync(DEFAULT_CHROME_PATH) ? DEFAULT_CHROME_PATH : '');
 const SCREENSHOT_DIR = process.env.KHADAMATI_SCREENSHOT_DIR || '';
 const VIEWPORT_WIDTH = Number(process.env.KHADAMATI_VIEWPORT_WIDTH || 390);
 const VIEWPORT_HEIGHT = Number(process.env.KHADAMATI_VIEWPORT_HEIGHT || 844);
@@ -72,11 +73,12 @@ async function clickAdminTab(page, tab) {
 
 (async () => {
   const testUrl = BASE_URL || await startStaticServer();
-  const browser = await chromium.launch({
+  const launchOptions = {
     headless: true,
-    executablePath: CHROME_PATH,
     args: ['--use-fake-device-for-media-stream', '--use-fake-ui-for-media-stream'],
-  });
+  };
+  if (CHROME_PATH) launchOptions.executablePath = CHROME_PATH;
+  const browser = await chromium.launch(launchOptions);
   const context = await browser.newContext({
     viewport: { width: VIEWPORT_WIDTH, height: VIEWPORT_HEIGHT },
     deviceScaleFactor: 2,
