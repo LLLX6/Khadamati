@@ -89,7 +89,7 @@ def register_provider(base: str, admin_token: str, suffix: str):
                 "priceFrom": 8,
                 "note": "خدمة كهرباء منزلية دقيقة وموثوقة",
                 "hours": "الأحد: 8:00 ص - 8:00 م",
-                "documentsData": [TEST_PNG],
+                "documentsData": [TEST_PNG, TEST_PNG],
             },
         ),
         {201},
@@ -316,11 +316,11 @@ def run():
                 assert error.code == 413, f"oversized body returned HTTP {error.code}"
 
             sw = (ROOT / "service-worker.js").read_text(encoding="utf-8")
-            assert "khadamati-app-shell-v63-" in sw
+            assert "khadamati-app-shell-v64-" in sw
             assert "./assets/styles/khadamati-v60.css" in sw
             assert "./assets/styles/khadamati-v61.css" in sw
             assert "./assets/styles/khadamati-v62.css" in sw
-            assert "./assets/styles/khadamati-v63.css" in sw
+            assert "./assets/styles/khadamati-v64.css" in sw
             page_source = (ROOT / "index.html").read_text(encoding="utf-8")
             assert 'data-action="openConversations"' in page_source
             assert "notificationGroup(n)===group&&n.read" in page_source

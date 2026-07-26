@@ -147,7 +147,7 @@ def main():
             "services": [{"catId": "homecare", "serviceId": "electrician", "priceFrom": 8}],
             "note": "خدمة كهرباء منزلية دقيقة وموثوقة",
             "hours": "الأحد: 8:00 ص - 8:00 م",
-            "documentsData": [TEST_PNG],
+            "documentsData": [TEST_PNG, TEST_PNG],
         },
     )
     expect(status, missing_expiry, {400}, "Provider registration accepted a missing licence expiry")
@@ -174,7 +174,7 @@ def main():
             "priceFrom": 8,
             "note": "خدمة كهرباء منزلية دقيقة وموثوقة",
             "hours": "الأحد، الاثنين: 8:00 ص - 8:00 م",
-            "documentsData": [TEST_PNG],
+            "documentsData": [TEST_PNG, TEST_PNG],
         },
     )
     expect(status, registration, {201}, "Provider registration failed")
@@ -848,6 +848,21 @@ def main():
         "completion_confirmed",
     }.issubset(timeline_types), f"Request timeline is incomplete: {timeline_types}"
 
+    status, hidden_history = request(
+        "/api/provider/history",
+        {"requestId": request_id, "action": "hide"},
+        provider_token,
+    )
+    expect(status, hidden_history, {200}, "Provider work history hide failed")
+    assert request_id in hidden_history.get("hiddenHistoryIds", [])
+    status, restored_history = request(
+        "/api/provider/history",
+        {"requestId": request_id, "action": "restore"},
+        provider_token,
+    )
+    expect(status, restored_history, {200}, "Provider work history restore failed")
+    assert request_id not in restored_history.get("hiddenHistoryIds", [])
+
     status, review = request(
         "/api/reviews",
         {"providerId": provider_id, "requestId": request_id, "rating": 5, "comment": "خدمة ممتازة"},
@@ -860,6 +875,51 @@ def main():
         user_token,
     )
     assert status == 409 and duplicate.get("error") == "request_already_reviewed", "Duplicate review was accepted"
+
+    review_id = review["review"]["id"]
+    status, deleted_review = request(
+        "/api/admin/review-status",
+        {"id": review_id, "action": "delete", "reason": "طلب إداري موثق"},
+        admin_token,
+    )
+    expect(status, deleted_review, {200}, "Admin review deletion failed")
+    status, public_after_review_delete = request("/api/bootstrap")
+    expect(status, public_after_review_delete, {200}, "Public state after review deletion failed")
+    assert all(
+        item.get("id") != review_id for item in public_after_review_delete.get("reviews", [])
+    ), "Deleted review remained public"
+
+    status, unsafe_delete = request(
+        "/api/admin/provider-delete",
+        {"id": provider_id, "adminCode": ADMIN_CODE, "reason": "اختبار الحذف الآمن"},
+        admin_token,
+    )
+    assert (
+        status == 409
+        and unsafe_delete.get("error") == "provider_must_be_stopped_before_delete"
+    ), f"Active provider was deleted without being stopped: HTTP {status} {unsafe_delete}"
+    status, stopped_provider = request(
+        "/api/admin/provider-status",
+        {
+            "id": provider_id,
+            "status": "unavailable",
+            "active": False,
+            "verified": True,
+            "featured": False,
+        },
+        admin_token,
+    )
+    expect(status, stopped_provider, {200}, "Provider could not be stopped before deletion")
+    status, deleted_provider = request(
+        "/api/admin/provider-delete",
+        {"id": provider_id, "adminCode": ADMIN_CODE, "reason": "اختبار الحذف الآمن"},
+        admin_token,
+    )
+    expect(status, deleted_provider, {200}, "Stopped provider deletion failed")
+    status, revoked_provider_state = request("/api/provider/me", token=provider_token)
+    assert status in {401, 403}, (
+        f"Deleted provider session remained active: HTTP {status} {revoked_provider_state}"
+    )
 
     print(
         json.dumps(
@@ -882,7 +942,10 @@ def main():
                 "provider_quote_templates": True,
                 "provider_support_delivery": True,
                 "accepted_job_lifecycle": True,
+                "provider_work_history": True,
                 "verified_review": True,
+                "admin_review_deletion": True,
+                "admin_provider_deletion": True,
                 "visitor_isolation": True,
             },
             ensure_ascii=False,

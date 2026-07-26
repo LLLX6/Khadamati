@@ -99,6 +99,7 @@ def install_workflow_schema(con) -> None:
           model TEXT DEFAULT '',
           year INTEGER,
           location_json TEXT NOT NULL DEFAULT '{}',
+          details_json TEXT NOT NULL DEFAULT '{}',
           notes TEXT DEFAULT '',
           image_path TEXT DEFAULT '',
           active INTEGER NOT NULL DEFAULT 1,
@@ -140,6 +141,9 @@ def install_workflow_schema(con) -> None:
     columns = {row["name"] for row in con.execute("PRAGMA table_info(customer_requests)")}
     if "asset_id" not in columns:
         con.execute("ALTER TABLE customer_requests ADD COLUMN asset_id TEXT DEFAULT ''")
+    asset_columns = {row["name"] for row in con.execute("PRAGMA table_info(service_assets)")}
+    if "details_json" not in asset_columns:
+        con.execute("ALTER TABLE service_assets ADD COLUMN details_json TEXT NOT NULL DEFAULT '{}'")
     con.execute(
         """CREATE INDEX IF NOT EXISTS idx_request_asset
         ON customer_requests(asset_id,status,created_at)"""
@@ -445,6 +449,7 @@ class ServiceAssetService:
             "model": item["model"],
             "year": item["year"],
             "location": load(item["location_json"], {}),
+            "details": load(item.get("details_json"), {}),
             "notes": item["notes"],
             "imagePath": item["image_path"],
             "active": bool(item["active"]),
@@ -499,16 +504,30 @@ class ServiceAssetService:
             if year < 1900 or year > datetime.now(UTC).year + 1:
                 raise DomainError("invalid_service_asset_year")
         location = data.get("location") if isinstance(data.get("location"), dict) else {}
+        details = data.get("details") if isinstance(data.get("details"), dict) else {}
+        allowed_detail_fields = {
+            "home": {"houseNumber", "wayNumber", "buildingNumber", "floor", "unitNumber"},
+            "vehicle": {"plateNumber", "vehicleType", "engine", "color"},
+            "appliance": {"serialNumber", "applianceType", "purchaseYear"},
+            "property": {"propertyNumber", "wayNumber", "buildingNumber", "floor", "unitNumber"},
+            "other": {"referenceNumber"},
+        }
+        details = {
+            key: _safe_text(value, 100)
+            for key, value in details.items()
+            if key in allowed_detail_fields.get(asset_type, set()) and value not in (None, "")
+        }
         current_image = existing["image_path"] if existing else ""
         effective_image = current_image if image_path is None else image_path
         self.con.execute(
             """INSERT INTO service_assets(
             id,user_id,name,asset_type,category_id,brand,model,year,location_json,
-            notes,image_path,active,created_at,updated_at)
-            VALUES(?,?,?,?,?,?,?,?,?,?,?,1,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)
+            details_json,notes,image_path,active,created_at,updated_at)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,1,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)
             ON CONFLICT(id) DO UPDATE SET name=excluded.name,asset_type=excluded.asset_type,
             category_id=excluded.category_id,brand=excluded.brand,model=excluded.model,
-            year=excluded.year,location_json=excluded.location_json,notes=excluded.notes,
+            year=excluded.year,location_json=excluded.location_json,
+            details_json=excluded.details_json,notes=excluded.notes,
             image_path=excluded.image_path,active=1,updated_at=CURRENT_TIMESTAMP""",
             (
                 asset_id,
@@ -520,6 +539,7 @@ class ServiceAssetService:
                 _safe_text(data.get("model"), 80),
                 year,
                 dump(location),
+                dump(details),
                 _safe_text(data.get("notes"), 600),
                 effective_image,
             ),
@@ -683,6 +703,11 @@ class CompletionEvidenceService:
                 """UPDATE providers SET completed_jobs=completed_jobs+1,
                 updated_at=CURRENT_TIMESTAMP WHERE id=?""",
                 (request["accepted_provider_id"],),
+            )
+            self.con.execute(
+                """UPDATE customer_requests SET latitude=NULL,longitude=NULL,
+                contact_consent='{}',updated_at=CURRENT_TIMESTAMP WHERE id=?""",
+                (request_id,),
             )
         else:
             lifecycle.transition(

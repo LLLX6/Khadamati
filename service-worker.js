@@ -1,4 +1,4 @@
-const CACHE_NAME = 'khadamati-app-shell-v63-request-workflow';
+const CACHE_NAME = 'khadamati-app-shell-v64-final-workflow';
 const SHELL = [
   './',
   './index.html',
@@ -13,6 +13,7 @@ const SHELL = [
   './assets/styles/khadamati-v61.css',
   './assets/styles/khadamati-v62.css',
   './assets/styles/khadamati-v63.css',
+  './assets/styles/khadamati-v64.css',
   './assets/scripts/khadamati-visuals-v56.js',
   './app-icon-192.png',
   './app-icon-512.png',

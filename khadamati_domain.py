@@ -137,6 +137,28 @@ PLAN_DEFINITIONS: tuple[dict[str, Any], ...] = (
 )
 
 PLAN_IDS = tuple(plan["id"] for plan in PLAN_DEFINITIONS)
+PLAN_ACCOUNT_LIMITS: dict[str, dict[str, dict[str, int]]] = {
+    "foundation_12m": {
+        "individual": {"maxServices": 3, "maxCategories": 1, "maxImages": 5, "maxWilayats": 5},
+        "company": {"maxServices": 6, "maxCategories": 3, "maxImages": 10, "maxWilayats": 5},
+    },
+    "basic_6m": {
+        "individual": {"maxServices": 6, "maxCategories": 2, "maxImages": 5, "maxWilayats": 10},
+        "company": {"maxServices": 8, "maxCategories": 4, "maxImages": 10, "maxWilayats": 10},
+    },
+    "basic_12m": {
+        "individual": {"maxServices": 6, "maxCategories": 2, "maxImages": 5, "maxWilayats": 10},
+        "company": {"maxServices": 8, "maxCategories": 4, "maxImages": 10, "maxWilayats": 10},
+    },
+    "professional_12m": {
+        "individual": {"maxServices": 10, "maxCategories": 3, "maxImages": 5, "maxWilayats": 25},
+        "company": {"maxServices": 12, "maxCategories": 4, "maxImages": 10, "maxWilayats": 25},
+    },
+    "business_12m": {
+        "individual": {"maxServices": 12, "maxCategories": 4, "maxImages": 5, "maxWilayats": 25},
+        "company": {"maxServices": 20, "maxCategories": 5, "maxImages": 10, "maxWilayats": 61},
+    },
+}
 LEGACY_PLAN_MAP = {
     "intro": "foundation_12m",
     "intro_90": "foundation_12m",
@@ -239,6 +261,19 @@ def row_dict(row: Any) -> dict[str, Any]:
 
 class PlanCatalog:
     @staticmethod
+    def account_limits(plan: dict[str, Any] | None, account_type: str) -> dict[str, int]:
+        plan = plan or {}
+        normalized_type = "company" if account_type == "company" else "individual"
+        entitlements = plan.get("entitlements") if isinstance(plan.get("entitlements"), dict) else {}
+        limits = entitlements.get("accountLimits", {}).get(normalized_type, {})
+        return {
+            "maxServices": int(limits.get("maxServices") or plan.get("max_services") or 0),
+            "maxCategories": int(limits.get("maxCategories") or plan.get("max_categories") or 0),
+            "maxImages": int(limits.get("maxImages") or plan.get("max_images") or 0),
+            "maxWilayats": int(limits.get("maxWilayats") or plan.get("max_wilayats") or 0),
+        }
+
+    @staticmethod
     def seed(con) -> None:
         for plan in PLAN_DEFINITIONS:
             entitlements = {
@@ -253,6 +288,7 @@ class PlanCatalog:
                 "branches": plan["max_branches"],
                 "sharedInbox": bool(plan["shared_inbox"]),
                 "advancedReports": bool(plan["advanced_reports"]),
+                "accountLimits": PLAN_ACCOUNT_LIMITS.get(plan["id"], {}),
             }
             con.execute(
                 """INSERT INTO packages(
@@ -262,19 +298,7 @@ class PlanCatalog:
                 advanced_reports,badge_ar,badge_en,foundation_once,verified_required,
                 legacy,entitlements)
                 VALUES(?,?,?,?,?,?,?,?,1,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0,?)
-                ON CONFLICT(id) DO UPDATE SET ar=excluded.ar,en=excluded.en,
-                price=excluded.price,duration_days=excluded.duration_days,
-                max_services=excluded.max_services,max_images=excluded.max_images,
-                currency=excluded.currency,max_categories=excluded.max_categories,
-                max_wilayats=excluded.max_wilayats,
-                max_governorates=excluded.max_governorates,
-                monthly_response_limit=excluded.monthly_response_limit,
-                lead_delay_minutes=excluded.lead_delay_minutes,
-                max_team_members=excluded.max_team_members,max_branches=excluded.max_branches,
-                shared_inbox=excluded.shared_inbox,advanced_reports=excluded.advanced_reports,
-                badge_ar=excluded.badge_ar,badge_en=excluded.badge_en,
-                foundation_once=excluded.foundation_once,verified_required=excluded.verified_required,
-                active=1,legacy=0,entitlements=excluded.entitlements""",
+                ON CONFLICT(id) DO NOTHING""",
                 (
                     plan["id"], plan["ar"], plan["en"], plan["price"],
                     plan["duration_days"], 0, plan["max_services"], plan["max_images"],
@@ -285,6 +309,25 @@ class PlanCatalog:
                     plan["foundation_once"], plan["verified_required"], dump(entitlements),
                 ),
             )
+            current = con.execute(
+                "SELECT entitlements FROM packages WHERE id=?", (plan["id"],)
+            ).fetchone()
+            current_entitlements = load(current["entitlements"], {}) if current else {}
+            if not isinstance(current_entitlements, dict):
+                current_entitlements = {}
+            changed = False
+            for key, value in entitlements.items():
+                if key not in current_entitlements:
+                    current_entitlements[key] = value
+                    changed = True
+            if not isinstance(current_entitlements.get("accountLimits"), dict):
+                current_entitlements["accountLimits"] = PLAN_ACCOUNT_LIMITS.get(plan["id"], {})
+                changed = True
+            if changed:
+                con.execute(
+                    "UPDATE packages SET entitlements=? WHERE id=?",
+                    (dump(current_entitlements), plan["id"]),
+                )
         con.execute(
             "UPDATE packages SET active=0,legacy=1 WHERE id NOT IN (?,?,?,?,?)",
             PLAN_IDS,
@@ -708,15 +751,30 @@ class EntitlementService:
         sync = subscription_service.synchronize_provider(provider_id)
         subscription = sync.get("subscription")
         plan = PlanCatalog.get(self.con, subscription.get("package_id", ""), False) if subscription else None
+        provider = self.con.execute(
+            "SELECT provider_type FROM providers WHERE id=?", (provider_id,)
+        ).fetchone()
+        account_type = (
+            "company"
+            if provider and str(provider["provider_type"] or "individual") == "company"
+            else "individual"
+        )
+        plan_entitlements = (plan or {}).get("entitlements") or {}
+        account_limits = (
+            plan_entitlements.get("accountLimits", {}).get(account_type, {})
+            if isinstance(plan_entitlements, dict)
+            else {}
+        )
         return {
             "providerId": provider_id,
+            "accountType": account_type,
             "state": sync["state"],
             "planId": plan.get("id", "") if plan else "",
             "allowed": sync["state"] in SubscriptionService.ACTIVE_ACCESS_STATES,
-            "maxServices": int((plan or {}).get("max_services") or 0),
-            "maxCategories": int((plan or {}).get("max_categories") or 0),
-            "maxImages": int((plan or {}).get("max_images") or 0),
-            "maxWilayats": int((plan or {}).get("max_wilayats") or 0),
+            "maxServices": int(account_limits.get("maxServices") or (plan or {}).get("max_services") or 0),
+            "maxCategories": int(account_limits.get("maxCategories") or (plan or {}).get("max_categories") or 0),
+            "maxImages": int(account_limits.get("maxImages") or (plan or {}).get("max_images") or 0),
+            "maxWilayats": int(account_limits.get("maxWilayats") or (plan or {}).get("max_wilayats") or 0),
             "maxGovernorates": int((plan or {}).get("max_governorates") or 0),
             "monthlyResponses": int((plan or {}).get("monthly_response_limit") or 0),
             "leadDelayMinutes": int((plan or {}).get("lead_delay_minutes") or 0),
@@ -753,7 +811,7 @@ class EntitlementService:
             str(area).strip() for area in load(provider["areas"], []) if str(area).strip()
         })
         is_company = str(provider["provider_type"] or "individual") == "company"
-        service_limit = int(entitlements.get("maxServices") or 0) if is_company else 1
+        service_limit = int(entitlements.get("maxServices") or 0)
         return {
             **entitlements,
             "accountType": "company" if is_company else "individual",

@@ -25,6 +25,7 @@ from khadamati_domain import (  # noqa: E402
     EntitlementService,
     OTPService,
     PLAN_IDS,
+    PlanCatalog,
     PaymentAdapter,
     RequestMarketplace,
     SubscriptionService,
@@ -348,16 +349,20 @@ class KhadamatiDomainTests(unittest.TestCase):
         consent.set_channel(request_id, user_id, provider_id, "whatsapp", False)
         self.assertFalse(consent.allowed(request_id, provider_id, "whatsapp"))
 
-    def test_individual_provider_is_limited_to_one_primary_service(self):
+    def test_individual_provider_respects_account_specific_plan_limits(self):
         provider_id = self.provider("105")
         self.activate(provider_id, "basic_12m")
         entitlement = EntitlementService(self.con)
         valid = entitlement.validate_profile(
             provider_id,
-            services=[{"catId": "cleaning", "serviceId": "home_cleaning"}],
+            services=[
+                {"catId": "cleaning", "serviceId": "home_cleaning"},
+                {"catId": "cleaning", "serviceId": "carpet_cleaning"},
+                {"catId": "technology", "serviceId": "computer_repair"},
+            ],
             areas=["السيب", "بوشر"],
         )
-        self.assertEqual(1, valid["maxServices"])
+        self.assertEqual(6, valid["maxServices"])
         self.assertEqual(2, valid["maxCategories"])
         with self.assertRaises(DomainError) as caught:
             entitlement.validate_profile(
@@ -365,10 +370,53 @@ class KhadamatiDomainTests(unittest.TestCase):
                 services=[
                     {"catId": "cleaning", "serviceId": "home_cleaning"},
                     {"catId": "technology", "serviceId": "computer_repair"},
+                    {"catId": "homecare", "serviceId": "electrician"},
                 ],
                 areas=["السيب"],
             )
-        self.assertEqual("service_limit_exceeded", caught.exception.code)
+        self.assertEqual("provider_category_limit", caught.exception.code)
+
+    def test_foundation_limits_differ_for_individual_and_company_accounts(self):
+        individual_id = self.provider("1051")
+        company_id = self.provider("1052")
+        self.con.execute(
+            "UPDATE providers SET provider_type='company' WHERE id=?", (company_id,)
+        )
+        self.activate(individual_id, "foundation_12m")
+        self.activate(company_id, "foundation_12m")
+        individual = EntitlementService(self.con).profile_limits(individual_id)
+        company = EntitlementService(self.con).profile_limits(company_id)
+        self.assertEqual(
+            (3, 1, 5),
+            (
+                individual["maxServices"],
+                individual["maxCategories"],
+                individual["maxImages"],
+            ),
+        )
+        self.assertEqual(
+            (6, 3, 10),
+            (
+                company["maxServices"],
+                company["maxCategories"],
+                company["maxImages"],
+            ),
+        )
+
+    def test_plan_seed_preserves_admin_account_limit_edits(self):
+        plan = PlanCatalog.get(self.con, "basic_12m", False)
+        entitlements = plan["entitlements"]
+        entitlements["accountLimits"]["individual"]["maxServices"] = 7
+        self.con.execute(
+            "UPDATE packages SET entitlements=? WHERE id=?",
+            (json.dumps(entitlements, ensure_ascii=False), "basic_12m"),
+        )
+        PlanCatalog.seed(self.con)
+        refreshed = PlanCatalog.get(self.con, "basic_12m", False)
+        self.assertEqual(
+            7,
+            refreshed["entitlements"]["accountLimits"]["individual"]["maxServices"],
+        )
 
     def test_business_plan_allows_multiple_services_and_categories_within_limit(self):
         provider_id = self.provider("106")
@@ -623,7 +671,15 @@ class KhadamatiDomainTests(unittest.TestCase):
                 "brand": "",
                 "model": "",
                 "location": {"lat": 23.59, "lng": 58.20},
+                "details": {
+                    "houseNumber": "142",
+                    "wayNumber": "3812",
+                    "plateNumber": "must-not-be-kept",
+                },
             },
+        )
+        self.assertEqual(
+            {"houseNumber": "142", "wayNumber": "3812"}, asset["details"]
         )
         request_id = self.customer_request("703", owner_id)
         service.attach(request_id, asset["id"], owner_id)

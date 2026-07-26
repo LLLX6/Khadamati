@@ -70,7 +70,7 @@ def environment_flag(name, default=False):
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
-APP_RELEASE = os.environ.get("KHADAMATI_RELEASE", "v63").strip() or "v63"
+APP_RELEASE = os.environ.get("KHADAMATI_RELEASE", "v64").strip() or "v64"
 DEMO_DATA_ENABLED = environment_flag(
     "KHADAMATI_SEED_DEMO_DATA", APP_ENV in {"development", "test"}
 )
@@ -400,6 +400,16 @@ def iso_date(days=0):
 
 def iso_datetime(minutes=0, days=0):
     return (datetime.now(UTC) + timedelta(minutes=minutes, days=days)).isoformat()
+
+
+def parse_iso(value):
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        return parsed.replace(tzinfo=UTC) if parsed.tzinfo is None else parsed.astimezone(UTC)
+    except (TypeError, ValueError):
+        return None
 
 
 def seed_service(service_id, icon, ar, en):
@@ -950,8 +960,14 @@ def init_db():
         ensure_column(con, "providers", "completed_jobs", "INTEGER NOT NULL DEFAULT 0")
         ensure_column(con, "providers", "quote_templates", "TEXT DEFAULT '[]'")
         ensure_column(con, "providers", "updated_at", "TEXT DEFAULT ''")
+        ensure_column(con, "providers", "gender", "TEXT DEFAULT 'not_specified'")
+        ensure_column(con, "providers", "location_sharing_expires_at", "TEXT DEFAULT ''")
+        ensure_column(con, "providers", "deleted_at", "TEXT DEFAULT ''")
+        ensure_column(con, "providers", "delete_reason", "TEXT DEFAULT ''")
+        ensure_column(con, "providers", "hidden_history", "TEXT DEFAULT '[]'")
         ensure_column(con, "app_users", "location_updated_at", "TEXT DEFAULT ''")
         ensure_column(con, "app_users", "updated_at", "TEXT DEFAULT ''")
+        ensure_column(con, "app_users", "gender", "TEXT DEFAULT 'not_specified'")
         ensure_column(con, "customer_requests", "offers", "TEXT DEFAULT '[]'")
         ensure_column(con, "customer_requests", "messages", "TEXT DEFAULT '[]'")
         ensure_column(con, "customer_requests", "arrival", "TEXT DEFAULT '{}'")
@@ -1011,6 +1027,8 @@ def init_db():
         ensure_column(con, "leads", "status", "TEXT DEFAULT 'open'")
         ensure_column(con, "reviews", "request_id", "TEXT DEFAULT ''")
         ensure_column(con, "reviews", "user_id", "TEXT DEFAULT ''")
+        ensure_column(con, "reviews", "deleted_at", "TEXT DEFAULT ''")
+        ensure_column(con, "reviews", "moderation_reason", "TEXT DEFAULT ''")
         ensure_column(con, "complaints", "request_id", "TEXT DEFAULT ''")
         ensure_column(con, "complaints", "user_id", "TEXT DEFAULT ''")
         for c in SEED_CATEGORIES:
@@ -1277,10 +1295,20 @@ def row_provider(r, private=False, sign_private=False):
     d["verificationExpiry"] = d.pop("verification_expiry", "")
     d["commercialExpiry"] = d.pop("commercial_expiry", "")
     d["licenseExpiry"] = d.pop("license_expiry", "")
+    d["locationSharingExpiresAt"] = d.pop("location_sharing_expires_at", "")
+    d["deletedAt"] = d.pop("deleted_at", "")
+    d["deleteReason"] = d.pop("delete_reason", "")
+    hidden_history = jload(d.pop("hidden_history", "[]"), [])
+    if private:
+        d["hiddenHistoryIds"] = hidden_history if isinstance(hidden_history, list) else []
     latitude = d.pop("latitude", None)
     longitude = d.pop("longitude", None)
     location_updated_at = d.pop("location_updated_at", "")
-    if not private and not d["mapVisible"]:
+    sharing_expires = parse_iso(d.get("locationSharingExpiresAt"))
+    if not private and (
+        not d["mapVisible"]
+        or (sharing_expires is not None and sharing_expires <= datetime.now(UTC))
+    ):
         latitude, longitude = None, None
     d["location"] = (
         {"lat": latitude, "lng": longitude, "updatedAt": location_updated_at}
@@ -1292,6 +1320,8 @@ def row_provider(r, private=False, sign_private=False):
         for key in (
             "phone", "adminNote", "documents", "commercialNo", "companyId",
             "verificationExpiry", "commercialExpiry", "licenseExpiry", "pinConfigured",
+            "locationSharingExpiresAt", "deletedAt", "deleteReason",
+            "hiddenHistoryIds",
         ):
             d.pop(key, None)
     return d
@@ -1318,8 +1348,9 @@ def provider_request_view(payload, created_at=""):
 def row_review(r, private=False):
     d = dict(r)
     d["approved"] = bool(d["approved"])
+    d["deleted"] = bool(d.get("deleted_at"))
     if not private:
-        for key in ("phone", "user_id", "request_id"):
+        for key in ("phone", "user_id", "request_id", "deleted_at", "moderation_reason"):
             d.pop(key, None)
     return d
 
@@ -1354,6 +1385,13 @@ def row_package(r):
     d["foundationOnce"] = bool(d.pop("foundation_once", 0))
     d["verifiedRequired"] = bool(d.pop("verified_required", 0))
     d["entitlements"] = jload(d.get("entitlements"), {})
+    account_limits = (
+        d["entitlements"].get("accountLimits", {})
+        if isinstance(d["entitlements"], dict)
+        else {}
+    )
+    d["individualLimits"] = account_limits.get("individual", {})
+    d["companyLimits"] = account_limits.get("company", {})
     return d
 
 
@@ -1434,7 +1472,12 @@ def recompute_provider_quality(con, provider_id):
     if not r:
         return
     provider = row_provider(r, private=True)
-    approved = con.execute("SELECT COUNT(*) n, COALESCE(AVG(rating),0) avg_rating FROM reviews WHERE provider_id=? AND approved=1", (provider_id,)).fetchone()
+    approved = con.execute(
+        """SELECT COUNT(*) n, COALESCE(AVG(rating),0) avg_rating
+        FROM reviews WHERE provider_id=? AND approved=1
+        AND COALESCE(deleted_at,'')=''""",
+        (provider_id,),
+    ).fetchone()
     open_complaints = con.execute("SELECT COUNT(*) n FROM complaints WHERE provider_id=? AND status!='closed'", (provider_id,)).fetchone()["n"]
     profile_score = 0
     profile_score += 15 if provider.get("imagePath") else 0
@@ -2342,7 +2385,14 @@ def get_bootstrap(session=None):
             leads = [row_lead(r) for r in con.execute("SELECT * FROM leads ORDER BY created_at DESC LIMIT 120")]
         elif is_provider:
             pid = session["providerId"]
-            reviews = [row_review(r) for r in con.execute("SELECT * FROM reviews WHERE provider_id=? AND approved=1 ORDER BY created_at DESC", (pid,))]
+            reviews = [
+                row_review(r)
+                for r in con.execute(
+                    """SELECT * FROM reviews WHERE provider_id=? AND approved=1
+                    AND COALESCE(deleted_at,'')='' ORDER BY created_at DESC""",
+                    (pid,),
+                )
+            ]
             complaints = [row_complaint(r) for r in con.execute("SELECT * FROM complaints WHERE provider_id=? ORDER BY created_at DESC", (pid,))]
             subscriptions = [row_subscription(r) for r in con.execute("SELECT * FROM subscriptions WHERE provider_id=? ORDER BY created_at DESC", (pid,))]
             payments = [row_payment(r) for r in con.execute("SELECT * FROM payments WHERE provider_id=? ORDER BY created_at DESC", (pid,))]
@@ -2354,7 +2404,13 @@ def get_bootstrap(session=None):
                 leads = leads + matched[:40]
             audits = []
         else:
-            reviews = [row_review(r) for r in con.execute("SELECT * FROM reviews WHERE approved=1 ORDER BY created_at DESC")]
+            reviews = [
+                row_review(r)
+                for r in con.execute(
+                    """SELECT * FROM reviews WHERE approved=1
+                    AND COALESCE(deleted_at,'')='' ORDER BY created_at DESC"""
+                )
+            ]
             complaints, subscriptions, payments, audits, leads = [], [], [], [], []
         all_customer_requests = [
             row_customer_request(r, sign_private=bool(is_admin or is_provider or is_user))
@@ -2507,7 +2563,9 @@ def get_bootstrap(session=None):
             "requests": con.execute("SELECT COUNT(*) n FROM provider_requests").fetchone()["n"],
             "leads": con.execute("SELECT COUNT(*) n FROM leads").fetchone()["n"],
             "revenue": payment_revenue + finance_revenue,
-            "reviews": con.execute("SELECT COUNT(*) n FROM reviews WHERE approved=1").fetchone()["n"],
+            "reviews": con.execute(
+                "SELECT COUNT(*) n FROM reviews WHERE approved=1 AND COALESCE(deleted_at,'')=''"
+            ).fetchone()["n"],
             "openComplaints": con.execute("SELECT COUNT(*) n FROM complaints WHERE status!='closed'").fetchone()["n"],
             "activeSubscriptions": con.execute("SELECT COUNT(*) n FROM subscriptions WHERE status='active'").fetchone()["n"],
             "qualityAverage": round(con.execute("SELECT COALESCE(AVG(quality_score),0) n FROM providers").fetchone()["n"], 1),
@@ -2893,14 +2951,21 @@ def upsert_provider(con, data):
         pin_hash = hash_pin(data["pin"])
     if not pin_hash:
         pin_hash = existing["pin_hash"] if existing else ""
+    package_id = data.get(
+        "packageId", existing_provider.get("packageId", "foundation_12m")
+    )
+    package = PlanCatalog.get(con, package_id, False) or PlanCatalog.get(
+        con, "foundation_12m", False
+    )
+    account_limits = PlanCatalog.account_limits(package, p["providerType"])
+    image_limit = max(1, int(account_limits.get("maxImages") or 5))
     work_images = data.get("workImages") or existing_provider.get("workImages", [])
     if data.get("workImagesData"):
-        limit = 15 if data.get("providerType", existing_provider.get("providerType")) == "company" else 5
         new_images = save_many_images(
             p["id"], data.get("workImagesData"),
-            f"work{int(time.time())}-", max(0, limit - len(work_images)),
+            f"work{int(time.time())}-", max(0, image_limit - len(work_images)),
         )
-        work_images = list(dict.fromkeys([*work_images, *new_images]))[:limit]
+        work_images = list(dict.fromkeys([*work_images, *new_images]))
     card_image = data.get("cardImage") or existing_provider.get("cardImage", "") or image_url(image_path)
     if isinstance(card_image, str) and card_image.startswith("data:"):
         if card_image == data.get("imageData"):
@@ -2984,7 +3049,7 @@ def upsert_provider(con, data):
             p["id"], p.get("name", ""), p.get("phone", ""), p.get("gov", ""), p.get("wilayah", ""),
             jdump(p.get("areas", [])), p.get("bio", ""), p.get("hours", ""), p.get("status", "available"),
             int(bool(p.get("active", True))), int(bool(p.get("verified", False))), int(bool(p.get("featured", False))),
-            p.get("packageId", existing_provider.get("packageId", "foundation_12m")),
+            package_id,
             finite_number(p.get("rating", existing_provider.get("rating", 0)), minimum=0, maximum=5),
             int(finite_number(p.get("reviews", existing_provider.get("reviews", 0)), minimum=0, maximum=10_000_000)),
             p.get("adminNote", ""), image_path, card_image, pin_hash, jdump(p.get("services", [])), jdump(work_images), jdump(documents),
@@ -3011,12 +3076,24 @@ def upsert_provider(con, data):
     )
     con.execute(
         """UPDATE providers SET before_after=?,intro_video_url=?,availability=?,
-        response_minutes=?,completed_jobs=? WHERE id=?""",
+        response_minutes=?,completed_jobs=?,gender=?,location_sharing_expires_at=?
+        WHERE id=?""",
         (
             jdump(before_after), intro_video_url,
             jdump(p.get("availability", existing_provider.get("availability", {}))),
             int(finite_number(p.get("responseMinutes", existing_provider.get("responseMinutes", 30)), default=30, minimum=0, maximum=100_000)),
             int(finite_number(p.get("completedJobs", existing_provider.get("completedJobs", 0)), minimum=0, maximum=100_000_000)),
+            p.get("gender", existing_provider.get("gender", "not_specified"))
+            if p.get("gender", existing_provider.get("gender", "not_specified"))
+            in {"male", "female", "not_specified"}
+            else "not_specified",
+            safe_text(
+                p.get(
+                    "locationSharingExpiresAt",
+                    existing_provider.get("locationSharingExpiresAt", ""),
+                ),
+                80,
+            ),
             p["id"],
         ),
     )
@@ -3722,6 +3799,11 @@ class Handler(SimpleHTTPRequestHandler):
             phone = normalize_phone(data.get("phone", ""))
             name = str(data.get("name", "") or "").strip()[:80]
             pin = str(data.get("pin", "") or "")
+            gender = (
+                data.get("gender")
+                if data.get("gender") in {"male", "female", "not_specified"}
+                else ""
+            )
             if len(phone) < 11:
                 return self.send_json({"error": "valid_phone_required"}, 400)
             with db() as con:
@@ -3766,10 +3848,11 @@ class Handler(SimpleHTTPRequestHandler):
                         """UPDATE app_users SET name=COALESCE(NULLIF(?,''),name),gov=COALESCE(NULLIF(?,''),gov),
                         wilayah=COALESCE(NULLIF(?,''),wilayah),latitude=COALESCE(?,latitude),
                         longitude=COALESCE(?,longitude),last_login=CURRENT_TIMESTAMP,
-                        login_count=login_count+1,failed_attempts=0 WHERE id=?""",
+                        login_count=login_count+1,failed_attempts=0,
+                        gender=COALESCE(NULLIF(?,''),gender) WHERE id=?""",
                         (
                             name, data.get("gov", ""), data.get("wilayah", ""),
-                            location.get("lat"), location.get("lng"), row["id"],
+                            location.get("lat"), location.get("lng"), gender, row["id"],
                         ),
                     )
                     user_id = row["id"]
@@ -3786,12 +3869,13 @@ class Handler(SimpleHTTPRequestHandler):
                     user_id = slug("usr")
                     con.execute(
                         """INSERT INTO app_users(
-                        id,phone,name,pin_hash,gov,wilayah,latitude,longitude)
-                        VALUES(?,?,?,?,?,?,?,?)""",
+                        id,phone,name,pin_hash,gov,wilayah,latitude,longitude,gender)
+                        VALUES(?,?,?,?,?,?,?,?,?)""",
                         (
                             user_id, phone, name, hash_pin(pin) if len(pin) >= 4 else "",
                             data.get("gov", ""), data.get("wilayah", ""),
                             location.get("lat"), location.get("lng"),
+                            gender or "not_specified",
                         ),
                     )
                     create_notification(
@@ -3825,6 +3909,9 @@ class Handler(SimpleHTTPRequestHandler):
                 "registrationVersion": 57,
                 "companySize": safe_text(data.get("companySize"), 80),
                 "businessRole": safe_text(data.get("businessRole"), 80),
+                "gender": data.get("gender")
+                if data.get("gender") in {"male", "female", "not_specified"}
+                else "not_specified",
                 "gov": safe_text(data.get("gov", "مسقط"), 80),
                 "wilayah": safe_text(data.get("wilayah"), 80),
                 "location": location,
@@ -3852,10 +3939,13 @@ class Handler(SimpleHTTPRequestHandler):
                 with db() as con:
                     foundation = PlanCatalog.get(con, "foundation_12m", False) or {}
                     is_company = item["providerType"] == "company"
+                    limits = PlanCatalog.account_limits(
+                        foundation, "company" if is_company else "individual"
+                    )
                     item["services"] = normalized_provider_services(
                         con, raw_services,
-                        limit=max(1, int(foundation.get("max_services") or 1)) if is_company else 1,
-                        category_limit=max(1, int(foundation.get("max_categories") or 1)) if is_company else 1,
+                        limit=max(1, int(limits.get("maxServices") or 1)),
+                        category_limit=max(1, int(limits.get("maxCategories") or 1)),
                         fallback_price=item["priceFrom"], default_areas=[item["wilayah"]],
                     )
             except DomainError as err:
@@ -3885,15 +3975,27 @@ class Handler(SimpleHTTPRequestHandler):
                 return self.send_json({"error": "service_required"}, 400)
             if not item["hours"]:
                 return self.send_json({"error": "availability_required"}, 400)
-            if not data.get("documentsData"):
+            documents_data = (
+                data.get("documentsData")
+                if isinstance(data.get("documentsData"), list)
+                else []
+            )
+            if len([doc for doc in documents_data if doc]) < 2:
                 return self.send_json({"error": "documents_required"}, 400)
             try:
                 if data.get("imageData"):
                     item["imagePath"] = save_data_url(req_id, data.get("imageData"))
                 if data.get("workImagesData"):
-                    item["workImages"] = save_many_images(req_id, data.get("workImagesData"), "work", 15 if item["providerType"] == "company" else 5)
+                    item["workImages"] = save_many_images(
+                        req_id,
+                        data.get("workImagesData"),
+                        "work",
+                        10 if item["providerType"] == "company" else 5,
+                    )
                 if data.get("documentsData"):
-                    item["documents"] = save_many_documents(req_id, data.get("documentsData"), "doc", 3)
+                    item["documents"] = save_many_documents(
+                        req_id, data.get("documentsData"), "doc", 4
+                    )
             except ValueError as err:
                 return self.send_json({"error": str(err)}, 400)
             with db() as con:
@@ -4159,13 +4261,17 @@ class Handler(SimpleHTTPRequestHandler):
                     return self.send_domain_error(err)
                 con.execute(
                     """UPDATE app_users SET name=?,gov=?,wilayah=?,avatar=?,
-                    latitude=COALESCE(?,latitude),longitude=COALESCE(?,longitude)
+                    latitude=COALESCE(?,latitude),longitude=COALESCE(?,longitude),gender=?
                     WHERE id=?""",
                     (
                         str(data.get("name", user_row["name"]) or "").strip()[:80],
                         str(data.get("gov", user_row["gov"]) or "").strip()[:80],
                         str(data.get("wilayah", user_row["wilayah"]) or "").strip()[:80],
-                        avatar, location.get("lat"), location.get("lng"), user_id,
+                        avatar, location.get("lat"), location.get("lng"),
+                        data.get("gender")
+                        if data.get("gender") in {"male", "female", "not_specified"}
+                        else user_row["gender"],
+                        user_id,
                     ),
                 )
                 updated = con.execute("SELECT * FROM app_users WHERE id=?", (user_id,)).fetchone()
@@ -5090,12 +5196,12 @@ class Handler(SimpleHTTPRequestHandler):
                     con,
                     target_kind,
                     target_id,
-                    "تم تحديث تفاصيل الموعد",
-                    "راجع الموعد والمدة ثم أكّد النسخة الحالية.",
+                    "وصلك اتفاق تنفيذ",
+                    "راجع الموعد والمدة والسعر ثم أكّد الاتفاق.",
                     type_="request",
                     related_id=request_id,
                     priority="high",
-                    action_text="مراجعة الاتفاق",
+                    action_text="عرض الاتفاق",
                     action_route=f"{target_kind}:request:{request_id}",
                 )
             elif action == "agreement_confirm":
@@ -5543,6 +5649,7 @@ class Handler(SimpleHTTPRequestHandler):
             "/api/provider/pin": "profile",
             "/api/provider/quote-templates": "profile",
             "/api/provider/support": "requests",
+            "/api/provider/history": "requests",
             "/api/provider/subscription-request": "subscription",
             "/api/provider/payment-intent": "subscription",
             "/api/provider/team": "team",
@@ -5556,6 +5663,32 @@ class Handler(SimpleHTTPRequestHandler):
             if not row:
                 return self.send_json({"error": "not_found"}, 404)
             provider = row_provider(row, private=True)
+            if path == "/api/provider/history":
+                request_id = safe_text(data.get("requestId"), 120)
+                action = safe_text(data.get("action", "hide"), 20)
+                request_row = con.execute(
+                    """SELECT id,status FROM customer_requests
+                    WHERE id=? AND accepted_provider_id=?""",
+                    (request_id, provider["id"]),
+                ).fetchone()
+                if not request_row:
+                    return self.send_json({"error": "request_not_found"}, 404)
+                if request_row["status"] not in {"closed", "archived", "cancelled"}:
+                    return self.send_json({"error": "request_not_terminal"}, 409)
+                hidden_ids = list(dict.fromkeys(provider.get("hiddenHistoryIds") or []))
+                if action == "restore":
+                    hidden_ids = [item for item in hidden_ids if item != request_id]
+                elif action == "hide":
+                    if request_id not in hidden_ids:
+                        hidden_ids.append(request_id)
+                else:
+                    return self.send_json({"error": "invalid_history_action"}, 400)
+                con.execute(
+                    "UPDATE providers SET hidden_history=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                    (jdump(hidden_ids[-500:]), provider["id"]),
+                )
+                log_audit(con, session, f"provider.history.{action}", request_id, provider["id"])
+                return self.send_json({"ok": True, "hiddenHistoryIds": hidden_ids[-500:]})
             if path == "/api/provider/quote-templates":
                 raw_templates = data.get("templates")
                 if not isinstance(raw_templates, list) or not 1 <= len(raw_templates) <= 10:
@@ -5671,6 +5804,17 @@ class Handler(SimpleHTTPRequestHandler):
                     "mapVisible": strict_bool(
                         data.get("mapVisible"), provider.get("mapVisible", True)
                     ),
+                    "locationSharingExpiresAt": safe_text(
+                        data.get(
+                            "locationSharingExpiresAt",
+                            provider.get("locationSharingExpiresAt", ""),
+                        ),
+                        80,
+                    ),
+                    "gender": data.get("gender", provider.get("gender", "not_specified"))
+                    if data.get("gender", provider.get("gender", "not_specified"))
+                    in {"male", "female", "not_specified"}
+                    else "not_specified",
                     "cardImage": data.get("cardImage", provider.get("cardImage", "")),
                     "beforeAfter": data.get("beforeAfter", provider.get("beforeAfter", [])),
                     "beforeAfterData": data.get("beforeAfterData", {}),
@@ -5984,6 +6128,16 @@ class Handler(SimpleHTTPRequestHandler):
                 return self.send_json({"ok": True})
             if path == "/api/admin/provider-delete":
                 provider_id = str(data.get("id", "") or "")
+                admin_code = safe_text(data.get("adminCode", ""), 128)
+                delete_reason = safe_text(data.get("reason", ""), 500)
+                admin_row = con.execute(
+                    "SELECT code_hash FROM admin_users WHERE id=? AND active=1",
+                    (session.get("id", ""),),
+                ).fetchone()
+                if not admin_row or not verify_secret(admin_code, admin_row["code_hash"]):
+                    return self.send_json({"error": "invalid_code"}, 403)
+                if len(delete_reason) < 3:
+                    return self.send_json({"error": "delete_reason_required"}, 400)
                 provider_row = con.execute(
                     "SELECT id,name,phone,active,status FROM providers WHERE id=?", (provider_id,)
                 ).fetchone()
@@ -5998,15 +6152,22 @@ class Handler(SimpleHTTPRequestHandler):
                     """UPDATE providers SET active=0,status='deleted',listing_enabled=0,
                     request_enabled=0,name='حساب مزود محذوف',phone=?,pin_hash='',image_path='',
                     card_image='',work_images='[]',documents='[]',latitude=NULL,longitude=NULL,
-                    location_updated_at='',updated_at=CURRENT_TIMESTAMP WHERE id=?""",
-                    (anonymous_phone, provider_id),
+                    location_updated_at='',deleted_at=CURRENT_TIMESTAMP,delete_reason=?,
+                    updated_at=CURRENT_TIMESTAMP WHERE id=?""",
+                    (anonymous_phone, delete_reason, provider_id),
                 )
                 con.execute(
                     "UPDATE push_subscriptions SET active=0 WHERE target_kind='provider' AND target_id=?",
                     (provider_id,),
                 )
                 revoke_account_sessions(con, "provider", provider_id)
-                log_audit(con, session, "provider.deleted", provider_id, provider_row["name"])
+                log_audit(
+                    con,
+                    session,
+                    "provider.deleted",
+                    provider_id,
+                    f"{provider_row['name']} | {delete_reason}",
+                )
                 return self.send_json({"ok": True})
             if path == "/api/admin/request-decision":
                 decision = safe_text(data.get("decision"), 20)
@@ -6030,7 +6191,7 @@ class Handler(SimpleHTTPRequestHandler):
                         return self.send_json({"error": "credential_expiry_required"}, 400)
                     if note_words < 3 or note_words > 20:
                         return self.send_json({"error": "description_word_limit"}, 400)
-                    if not payload.get("documents"):
+                    if len(payload.get("documents") or []) < 2:
                         return self.send_json({"error": "documents_required"}, 400)
                     if not payload.get("pinHash"):
                         return self.send_json({"error": "pin_not_configured"}, 400)
@@ -6048,6 +6209,7 @@ class Handler(SimpleHTTPRequestHandler):
                         "licenseExpiry": payload.get("licenseExpiry", ""),
                         "companySize": payload.get("companySize", ""),
                         "businessRole": payload.get("businessRole", ""),
+                        "gender": payload.get("gender", "not_specified"),
                         "gov": payload.get("gov", ""),
                         "wilayah": payload.get("wilayah", ""),
                         "location": payload.get("location"),
@@ -6070,7 +6232,7 @@ class Handler(SimpleHTTPRequestHandler):
                         "pinHash": payload.get("pinHash") or "",
                     }
                     services = payload.get("services") if isinstance(payload.get("services"), list) else []
-                    service_limit = 3
+                    service_limit = 6 if payload.get("providerType") == "company" else 3
                     provider["services"] = [
                         {
                             "id": svc.get("id") or slug("ps"),
@@ -6143,12 +6305,37 @@ class Handler(SimpleHTTPRequestHandler):
             if path == "/api/admin/review-status":
                 review_id = safe_text(data.get("id"), 120)
                 approved = strict_bool(data.get("approved"), True)
-                row = con.execute("SELECT provider_id FROM reviews WHERE id=?", (review_id,)).fetchone()
+                action = safe_text(data.get("action", "status"), 30)
+                row = con.execute(
+                    "SELECT provider_id FROM reviews WHERE id=?", (review_id,)
+                ).fetchone()
                 if not row:
                     return self.send_json({"error": "review_not_found"}, 404)
-                con.execute("UPDATE reviews SET approved=? WHERE id=?", (int(approved), review_id))
+                if action == "delete":
+                    reason = safe_text(data.get("reason", ""), 500)
+                    if len(reason) < 3:
+                        return self.send_json({"error": "delete_reason_required"}, 400)
+                    con.execute(
+                        """UPDATE reviews SET approved=0,deleted_at=CURRENT_TIMESTAMP,
+                        moderation_reason=? WHERE id=?""",
+                        (reason, review_id),
+                    )
+                    audit_action = "review.deleted"
+                    audit_detail = reason
+                else:
+                    con.execute(
+                        """UPDATE reviews SET approved=?,deleted_at='',
+                        moderation_reason=? WHERE id=?""",
+                        (
+                            int(approved),
+                            safe_text(data.get("reason", ""), 500),
+                            review_id,
+                        ),
+                    )
+                    audit_action = "review.status.updated"
+                    audit_detail = str(approved)
                 recompute_provider_quality(con, row["provider_id"])
-                log_audit(con, session, "review.status.updated", review_id, str(approved))
+                log_audit(con, session, audit_action, review_id, audit_detail)
                 return self.send_json({"ok": True})
             if path == "/api/admin/complaint-status":
                 complaint_id = data.get("id")
@@ -6210,11 +6397,66 @@ class Handler(SimpleHTTPRequestHandler):
                 package_id = str(data.get("id", "") or "")
                 if package_id not in PLAN_IDS:
                     return self.send_json({"error": "fixed_plan_catalog"}, 409)
+                current_plan = PlanCatalog.get(con, package_id, False) or {}
+                current_individual = PlanCatalog.account_limits(current_plan, "individual")
+                current_company = PlanCatalog.account_limits(current_plan, "company")
+                individual_limits = {
+                    "maxServices": bounded_int(
+                        data.get("individualMaxServices", current_individual.get("maxServices", 3)),
+                        current_individual.get("maxServices", 3),
+                        minimum=1,
+                        maximum=100,
+                    ),
+                    "maxCategories": bounded_int(
+                        data.get("individualMaxCategories", current_individual.get("maxCategories", 1)),
+                        current_individual.get("maxCategories", 1),
+                        minimum=1,
+                        maximum=20,
+                    ),
+                    "maxImages": bounded_int(
+                        data.get("individualMaxImages", current_individual.get("maxImages", 5)),
+                        current_individual.get("maxImages", 5),
+                        minimum=1,
+                        maximum=50,
+                    ),
+                    "maxWilayats": bounded_int(
+                        data.get("individualMaxWilayats", current_individual.get("maxWilayats", 5)),
+                        current_individual.get("maxWilayats", 5),
+                        minimum=1,
+                        maximum=100,
+                    ),
+                }
+                company_limits = {
+                    "maxServices": bounded_int(
+                        data.get("companyMaxServices", current_company.get("maxServices", 6)),
+                        current_company.get("maxServices", 6),
+                        minimum=1,
+                        maximum=100,
+                    ),
+                    "maxCategories": bounded_int(
+                        data.get("companyMaxCategories", current_company.get("maxCategories", 3)),
+                        current_company.get("maxCategories", 3),
+                        minimum=1,
+                        maximum=20,
+                    ),
+                    "maxImages": bounded_int(
+                        data.get("companyMaxImages", current_company.get("maxImages", 10)),
+                        current_company.get("maxImages", 10),
+                        minimum=1,
+                        maximum=50,
+                    ),
+                    "maxWilayats": bounded_int(
+                        data.get("companyMaxWilayats", current_company.get("maxWilayats", 5)),
+                        current_company.get("maxWilayats", 5),
+                        minimum=1,
+                        maximum=100,
+                    ),
+                }
                 entitlements = {
-                    "maxServices": bounded_int(data.get("maxServices", 1), 1, minimum=1, maximum=100),
-                    "maxCategories": bounded_int(data.get("maxCategories", 1), 1, minimum=1, maximum=20),
-                    "maxImages": bounded_int(data.get("maxImages", 5), 5, minimum=1, maximum=100),
-                    "maxWilayats": bounded_int(data.get("maxWilayats", 5), 5, minimum=1, maximum=100),
+                    "maxServices": max(individual_limits["maxServices"], company_limits["maxServices"]),
+                    "maxCategories": max(individual_limits["maxCategories"], company_limits["maxCategories"]),
+                    "maxImages": max(individual_limits["maxImages"], company_limits["maxImages"]),
+                    "maxWilayats": max(individual_limits["maxWilayats"], company_limits["maxWilayats"]),
                     "maxGovernorates": bounded_int(data.get("maxGovernorates", 1), 1, minimum=1, maximum=20),
                     "monthlyResponses": bounded_int(data.get("monthlyResponses", 0), 0, minimum=0, maximum=100000),
                     "leadDelayMinutes": bounded_int(data.get("leadDelayMinutes", 0), 0, minimum=0, maximum=1440),
@@ -6222,6 +6464,10 @@ class Handler(SimpleHTTPRequestHandler):
                     "branches": bounded_int(data.get("branches", 1), 1, minimum=1, maximum=100),
                     "sharedInbox": strict_bool(data.get("sharedInbox"), False),
                     "advancedReports": strict_bool(data.get("advancedReports"), False),
+                    "accountLimits": {
+                        "individual": individual_limits,
+                        "company": company_limits,
+                    },
                 }
                 con.execute(
                     """UPDATE packages SET ar=?,en=?,price=?,currency='OMR',duration_days=?,

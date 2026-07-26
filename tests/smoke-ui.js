@@ -308,6 +308,12 @@ async function clickAdminTab(page, tab) {
   assert(await page.locator('#modalRoot .modal-backdrop').count() === 0, 'Closing the request board left a blocking modal layer.');
   await page.locator('.direct-request-card [data-action="quickRequestForm"]').click();
   await page.waitForTimeout(150);
+  if (await page.locator('.direct-request-guide').count()) {
+    const directGuideImage = page.locator('.direct-request-guide img');
+    assert(/assets\/onboarding\/v49\/user-direct-request\.webp/.test(await directGuideImage.getAttribute('src')), 'Direct-request guidance artwork is missing.');
+    await page.locator('[data-action="continueDirectRequestGuide"]').click();
+    await page.waitForTimeout(150);
+  }
   assert(await page.locator('.request-wizard').count(), `Direct request did not open: ${(await page.locator('#toast').textContent().catch(() => '')) || errors.join(' | ') || 'no visible message'}`);
   await capture(page, '01c-direct-service');
   const requestCategoryColumns = await page.locator('.category-availability-grid').evaluate(grid => getComputedStyle(grid).gridTemplateColumns.split(' ').length);
@@ -440,7 +446,17 @@ async function clickAdminTab(page, tab) {
   assert(await page.locator('#providerRegisterForm .registration-subservice.show').count() === 0, 'Optional sub-services should start collapsed.');
   const progressDirection = await page.locator('.provider-reg-progress').evaluate(element => getComputedStyle(element).direction);
   assert(progressDirection === 'rtl', 'Arabic provider registration progress must run right to left.');
-  assert(!(await page.locator('[data-action="addRegistrationSubservice"]').isVisible()), 'Individual registration must not offer extra services.');
+  assert(await page.locator('[data-action="addRegistrationSubservice"]').isVisible(), 'Individual registration must offer its two additional foundation services.');
+  await page.locator('#regService').evaluate(select => {
+    const option = [...select.options].find(item => item.value);
+    select.value = option?.value || '';
+    select.dispatchEvent(new Event('change', { bubbles: true }));
+  });
+  await page.locator('[data-action="addRegistrationSubservice"]').click();
+  await page.locator('[data-action="addRegistrationSubservice"]').click();
+  assert(await page.locator('#providerRegisterForm .registration-subservice.show').count() === 2, 'Individual registration must allow three services in total.');
+  const individualCategory = String(await page.locator('#regService').inputValue()).split('|')[0];
+  assert(await page.locator('#regServiceExtra1').getAttribute('data-cat-filter') === individualCategory, 'Individual additional services must stay inside the primary category.');
   await page.locator('#regAvatar').setInputFiles(path.join(__dirname, '..', 'app-icon-512.png'));
   await page.waitForSelector('.image-editor-v57');
   assert(await page.locator('.image-editor-v57 [data-action="cropZoomDelta"]').count() === 2, 'The modern image editor must provide zoom-in and zoom-out controls.');
@@ -453,7 +469,7 @@ async function clickAdminTab(page, tab) {
   await page.locator('#regProviderType').selectOption('company');
   assert(await page.locator('[data-action="addRegistrationSubservice"]').isVisible(), 'Company registration must offer plan-limited services.');
   await page.locator('[data-action="addRegistrationSubservice"]').click();
-  assert(await page.locator('#providerRegisterForm .registration-subservice.show').count() === 1, 'Company add-service should reveal one optional field at a time.');
+  assert(await page.locator('#providerRegisterForm .registration-subservice.show').count() === 3, 'Company add-service should reveal one optional field at a time while preserving existing choices.');
   await capture(page, '01e-provider-register');
   await page.locator('#modalRoot [data-action="closeModal"]').click();
   await page.locator('[data-action="toggleLang"]').first().click();
@@ -808,7 +824,10 @@ async function clickAdminTab(page, tab) {
   assert(await page.locator('.subscription-command').count(), 'Subscription control center is missing.');
   assert(await page.locator('.package-admin-grid .package-admin-card').count() === 5, 'The production plan catalog must contain exactly five plans.');
   await page.locator('.package-admin-grid [data-action="packageForm"]').first().click();
-  await page.waitForSelector('#pkgMaxWilayats');
+  await page.waitForSelector('#pkgIndividualMaxWilayats');
+  assert(await page.locator('#pkgIndividualMaxServices').count(), 'Individual service limit is missing from plan management.');
+  assert(await page.locator('#pkgCompanyMaxServices').count(), 'Company service limit is missing from plan management.');
+  assert(await page.locator('#pkgCompanyMaxImages').count(), 'Company image limit is missing from plan management.');
   assert(await page.locator('#pkgLeadDelay').count(), 'Plan lead-delay entitlement is missing.');
   assert(await page.locator('#pkgMonthlyResponses').count(), 'Plan monthly-response entitlement is missing.');
   assert(await page.locator('#pkgSharedInbox').count(), 'Plan shared-inbox entitlement is missing.');
