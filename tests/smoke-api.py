@@ -180,6 +180,11 @@ def main():
     expect(status, registration, {201}, "Provider registration failed")
     registration_id = registration["request"]["id"]
     assert registration["request"]["bio"] == "خدمة كهرباء منزلية دقيقة وموثوقة"
+    registration_token = registration.get("token", "")
+    assert registration_token, "Provider registration did not create a durable pending session"
+    status, registration_state = request("/api/bootstrap", token=registration_token)
+    expect(status, registration_state, {200}, "New provider session was not reusable after registration")
+    assert registration_state.get("requests", [{}])[0].get("id") == registration_id
     status, admin_registration_state = request("/api/admin/session", token=admin_token)
     expect(status, admin_registration_state, {200}, "Admin registration notification state failed")
     registration_notification = next(

@@ -129,6 +129,21 @@ async function clickAdminTab(page, tab) {
   }
   await page.waitForSelector('[data-action="openUserLogin"]');
   await capture(page, '00-entry');
+  if (IS_MOBILE && VIEWPORT_HEIGHT > 700) {
+    const entryLayout = await page.locator('.entry-card-v35').evaluate(card => {
+      const cardBox = card.getBoundingClientRect();
+      const utilities = card.querySelector('.entry-utilities')?.getBoundingClientRect();
+      const trust = card.querySelector('.entry-trust-line')?.getBoundingClientRect();
+      return {
+        cardHeight: cardBox.height,
+        viewportHeight: window.innerHeight,
+        topGap: utilities ? utilities.top - cardBox.top : 999,
+        bottomGap: trust ? cardBox.bottom - trust.bottom : 999,
+      };
+    });
+    assert(entryLayout.cardHeight >= entryLayout.viewportHeight * 0.9, 'The mobile entry card no longer uses the available screen height.');
+    assert(entryLayout.topGap <= 32 && entryLayout.bottomGap <= 36, 'The mobile entry content leaves an excessive blank band at the top or bottom.');
+  }
 
   await page.locator('[data-action="openUserLogin"]').click();
   await page.locator('#customerLoginPhone').click();
@@ -489,6 +504,19 @@ async function clickAdminTab(page, tab) {
   const dualRoleAuth = await page.evaluate(() => JSON.parse(localStorage.getItem('KHADAMATI_AUTH_V3') || '{}'));
   assert(dualRoleAuth.providerToken === 'ui-provider-token' && dualRoleAuth.userToken === 'ui-user-token', 'Provider sign-in discarded the existing user session on the same device.');
   assert(dualRoleAuth.activeRole === 'provider', 'Provider sign-in did not activate the provider session context.');
+  const accountMemory = await page.evaluate(() => JSON.parse(localStorage.getItem('KHADAMATI_ACCOUNT_MEMORY_V1') || '{}'));
+  assert(accountMemory.user?.id === 'ui-user' && accountMemory.provider?.id === 'p1', 'The device did not retain both account identities for a later app launch.');
+  const resumedPage = await context.newPage();
+  await resumedPage.goto(testUrl, { waitUntil: 'domcontentloaded' });
+  await resumedPage.waitForSelector('.provider-topbar');
+  assert(await resumedPage.locator('[data-action="openProviderAccess"]').count() === 0, 'A full app reopen returned the saved provider to the sign-in gateway.');
+  await resumedPage.locator('.provider-top-actions [data-action="switchAccountMode"]').click();
+  await resumedPage.waitForSelector('.app-top');
+  assert(await resumedPage.locator('#customerLoginPhone').count() === 0, 'Switching to the saved customer account requested credentials again.');
+  await resumedPage.locator('.app-top [data-action="switchAccountMode"]').click();
+  await resumedPage.waitForSelector('.provider-topbar');
+  assert(await resumedPage.locator('#loginOtp').count() === 0, 'Switching back to the saved provider account requested the PIN again.');
+  await resumedPage.close();
   await page.waitForTimeout(200);
   if (await page.locator('#modalRoot .modal-backdrop.show').count()) {
     assert(await page.locator('#modalRoot .notification-disclosure').count(), 'Provider login notification popup is empty.');

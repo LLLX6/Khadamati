@@ -646,6 +646,7 @@ button,[data-action]{touch-action:manipulation}
 <link rel="stylesheet" href="assets/styles/khadamati-v62.css?v=62" />
 <link rel="stylesheet" href="assets/styles/khadamati-v63.css?v=63" />
 <link rel="stylesheet" href="assets/styles/khadamati-v64.css?v=64" />
+<link rel="stylesheet" href="assets/styles/khadamati-v65.css?v=65" />
 </head>
 <body>
 <div id="app" class="app-shell"><div class="startup-skeleton" aria-label="جاري تحميل خدماتي"><div class="skeleton-bar"></div><div class="skeleton-search"></div><div class="skeleton-banner"></div><div class="skeleton-grid"><i></i><i></i><i></i><i></i><i></i><i></i></div></div></div>
@@ -659,8 +660,8 @@ button,[data-action]{touch-action:manipulation}
 'use strict';
 const STORAGE_KEY = 'KHADAMATI_MARKET_OS_V21';
 const PRIVATE_STATE_KEY = 'KHADAMATI_PRIVATE_STATE_V1';
-const APP_VERSION = 64;
-const APP_BUILD = 'khadamati-app-v64-final-workflow-2026-07-26';
+const APP_VERSION = 65;
+const APP_BUILD = 'khadamati-app-v65-durable-accounts-2026-07-27';
 const LEGACY_STORAGE_KEYS = ['KHADAMATI_MARKET_OS_V20','FORAN_MARKET_OS_V14'];
 const ONBOARDING_STORAGE_KEY = 'KHADAMATI_ONBOARDING_V4';
 const DIRECT_REQUEST_GUIDE_KEY = 'KHADAMATI_DIRECT_REQUEST_GUIDE_V1';
@@ -741,16 +742,93 @@ function providerDistanceLabel(p){
 const AUTH_KEY = 'KHADAMATI_AUTH_V3';
 const LEGACY_AUTH_KEY = 'FORAN_AUTH_V2';
 const LEGACY_AUTH_KEY_2 = 'KHADAMATI_AUTH';
+const ACCOUNT_MEMORY_KEY = 'KHADAMATI_ACCOUNT_MEMORY_V1';
 const AUTH_STABLE_KEYS = [LEGACY_AUTH_KEY, LEGACY_AUTH_KEY_2];
 function safeJson(value, fallback = null){
   if (!value) return fallback;
   try { return JSON.parse(value); } catch (_) { return fallback; }
 }
+function readStoredAccountMemory(){
+  const value=safeJson(localStorage.getItem(ACCOUNT_MEMORY_KEY),{});
+  return {
+    version:1,
+    activeRole:['provider','user'].includes(value?.activeRole)?value.activeRole:'',
+    user:value?.user&&typeof value.user==='object'?value.user:null,
+    provider:value?.provider&&typeof value.provider==='object'?value.provider:null
+  };
+}
+let ACCOUNT_MEMORY=readStoredAccountMemory();
+function compactAccountIdentity(value={},kind='user'){
+  const identity={
+    id:String(value.id||'').slice(0,120),
+    name:String(value.name||'').slice(0,120),
+    phone:phoneClean(value.phone||''),
+    gov:String(value.gov||'').slice(0,80),
+    wilayah:String(value.wilayah||'').slice(0,80)
+  };
+  if(kind==='provider')Object.assign(identity,{
+    providerType:value.providerType==='company'?'company':'individual',
+    status:String(value.status||'available').slice(0,40),
+    pending:!!value.pending,
+    active:value.active!==false,
+    verified:!!value.verified
+  });
+  return identity;
+}
+function persistAccountMemory(state){
+  if(!state)return;
+  if(AUTH.userToken&&state.session?.userId&&state.user?.phone){
+    ACCOUNT_MEMORY.user=compactAccountIdentity({...state.user,id:state.session.userId},'user');
+  }
+  if(AUTH.providerToken&&state.currentProviderId){
+    const provider=[...(state.providers||[]),...(state.providerRequests||[])].find(item=>item.id===state.currentProviderId);
+    if(provider)ACCOUNT_MEMORY.provider=compactAccountIdentity(provider,'provider');
+  }
+  if(['provider','user'].includes(AUTH.activeRole))ACCOUNT_MEMORY.activeRole=AUTH.activeRole;
+  try{localStorage.setItem(ACCOUNT_MEMORY_KEY,JSON.stringify(ACCOUNT_MEMORY));}catch(_){}
+}
+function forgetAccountMemory(kind){
+  if(kind==='provider')ACCOUNT_MEMORY.provider=null;
+  if(kind==='user')ACCOUNT_MEMORY.user=null;
+  if(ACCOUNT_MEMORY.activeRole===kind)ACCOUNT_MEMORY.activeRole='';
+  try{localStorage.setItem(ACCOUNT_MEMORY_KEY,JSON.stringify(ACCOUNT_MEMORY));}catch(_){}
+}
+function restoreStoredAccountContext(state,role=AUTH.activeRole){
+  if(!state)return false;
+  let restored=false;
+  if(AUTH.userToken&&ACCOUNT_MEMORY.user?.id){
+    const user=compactAccountIdentity(ACCOUNT_MEMORY.user,'user');
+    state.user={...(state.user||{}),...user};
+    state.session={mode:'registered',userId:user.id};
+    restored=true;
+  }
+  if(AUTH.providerToken&&ACCOUNT_MEMORY.provider?.id){
+    const provider=compactAccountIdentity(ACCOUNT_MEMORY.provider,'provider');
+    const list=provider.pending?(state.providerRequests=state.providerRequests||[]):(state.providers=state.providers||[]);
+    const current=list.find(item=>item.id===provider.id);
+    if(current)Object.assign(current,provider);
+    else list.push(normalizeProvider({...provider,services:[],areas:[],stats:{views:0,whatsapp:0,calls:0}}));
+    state.currentProviderId=provider.id;
+    state.providerLoginMemory={phone:provider.phone,name:provider.name};
+    restored=true;
+  }
+  if(role==='provider'&&AUTH.providerToken){
+    state.entrySeen=true;state.splashSeen=true;state.view='provider';
+  }else if(role==='user'&&AUTH.userToken){
+    state.entrySeen=true;state.splashSeen=true;
+    if(['entry','providerEntry','provider','admin'].includes(state.view))state.view='home';
+  }
+  return restored;
+}
 function readStoredAuth(){
   const sessionRaw = sessionStorage.getItem(AUTH_KEY);
   const localRaw = localStorage.getItem(AUTH_KEY);
   const legacyRaw = localStorage.getItem(LEGACY_AUTH_KEY) || localStorage.getItem(LEGACY_AUTH_KEY_2);
-  const auth = safeJson(sessionRaw, safeJson(localRaw, safeJson(legacyRaw, {})));
+  const auth = {
+    ...safeJson(legacyRaw,{}),
+    ...safeJson(localRaw,{}),
+    ...safeJson(sessionRaw,{})
+  };
   const storedRole = ['admin','provider','user'].includes(auth?.activeRole) ? auth.activeRole : '';
   return {
     adminToken: typeof auth?.adminToken === 'string' ? auth.adminToken : '',
@@ -762,7 +840,11 @@ function readStoredAuth(){
 let AUTH = readStoredAuth();
 if(!AUTH.activeRole)AUTH.activeRole=AUTH.adminToken?'admin':AUTH.providerToken?'provider':AUTH.userToken?'user':'';
 for (const legacy of AUTH_STABLE_KEYS) localStorage.removeItem(legacy);
-if(AUTH.adminToken||AUTH.providerToken||AUTH.userToken) sessionStorage.setItem(AUTH_KEY,JSON.stringify(AUTH));
+if(AUTH.adminToken||AUTH.providerToken||AUTH.userToken){
+  const serialized=JSON.stringify(AUTH);
+  sessionStorage.setItem(AUTH_KEY,serialized);
+  localStorage.setItem(AUTH_KEY,serialized);
+}
 let LAST_AUTH={...AUTH};
 function saveAuth(){
   if(!AUTH.userToken&&AUTH.providerToken&&!LAST_AUTH.providerToken&&!AUTH.adminToken&&LAST_AUTH.userToken)AUTH.userToken=LAST_AUTH.userToken;
@@ -866,6 +948,9 @@ async function api(path, body=null, token='', options={}){
   }
   const data=await res.json().catch(()=>({}));
   if(!res.ok){if(res.status===401&&token){for(const key of ['adminToken','providerToken','userToken'])if(AUTH[key]===token)AUTH[key]='';saveAuth();if(!activeAuthToken())scrubPrivateSessionState(S);}recordApiMetric(false,path,performance.now()-started,data.error||res.status);throw new Error(data.error || 'request_failed');}
+  if(path==='/api/provider-requests'&&data.token){
+   AUTH.providerToken=data.token;AUTH.activeRole='provider';saveAuth();
+  }
   recordApiMetric(true,path,performance.now()-started);
   return data;
  }finally{finishLoading();}
@@ -881,32 +966,38 @@ async function activateUserMode(){
  }
  const finishLoading=startTaskLoading(L('جارٍ فتح حساب المستخدم','Opening customer account'),220);
  const previousRole=AUTH.activeRole;
- AUTH.activeRole='user';saveAuth();
+ AUTH.activeRole='user';restoreStoredAccountContext(S,'user');S.admin=false;S.view='home';saveAuth();save();closeModal();render();window.scrollTo(0,0);
  try{
   mergeRemote(await api('/api/bootstrap',null,AUTH.userToken,{silentLoading:true}));
+  save();render();
  }catch(err){
-  AUTH.activeRole=previousRole;saveAuth();
-  showError(err);return false;
+  if(!AUTH.userToken){
+   AUTH.activeRole=previousRole;restoreStoredAccountContext(S,previousRole);saveAuth();
+   S.view=previousRole==='provider'&&AUTH.providerToken?'provider':'entry';save();render();showError(err);return false;
+  }
+  toast(L('تم فتح الحساب المحفوظ، وستتحدث البيانات عند عودة الاتصال.','Your saved account is open and will sync when the connection returns.'));
  }finally{
   finishLoading();
  }
- S.admin=false;S.view='home';save();closeModal();render();window.scrollTo(0,0);
  return true;
 }
 async function activateProviderMode(){
  if(!AUTH.providerToken){openProviderAccess();return false;}
  const finishLoading=startTaskLoading(L('جارٍ فتح حساب المزود','Opening provider account'),220);
  const previousRole=AUTH.activeRole;
- AUTH.activeRole='provider';saveAuth();
+ AUTH.activeRole='provider';restoreStoredAccountContext(S,'provider');S.admin=false;S.view='provider';S.providerTab=S.providerTab||'home';saveAuth();save();closeModal();render();window.scrollTo(0,0);
  try{
   mergeRemote(await api('/api/bootstrap',null,AUTH.providerToken,{silentLoading:true}));
+  save();render();
  }catch(err){
-  AUTH.activeRole=previousRole;saveAuth();
-  showError(err);return false;
+  if(!AUTH.providerToken){
+   AUTH.activeRole=previousRole;restoreStoredAccountContext(S,previousRole);saveAuth();
+   S.view=previousRole==='user'&&AUTH.userToken?'home':'entry';save();render();showError(err);return false;
+  }
+  toast(L('تم فتح الحساب المحفوظ، وستتحدث البيانات عند عودة الاتصال.','Your saved account is open and will sync when the connection returns.'));
  }finally{
   finishLoading();
  }
- S.admin=false;S.view='provider';S.providerTab=S.providerTab||'home';save();closeModal();render();window.scrollTo(0,0);
  return true;
 }
 function normalizeProvider(p){
@@ -1196,6 +1287,7 @@ const Adapter = {
     }catch(e){sessionStorage.removeItem(PRIVATE_STATE_KEY);return seedState();}
   },
   save(s){
+    persistAccountMemory(s);
     if(serverApiAvailable()){
       if(activeAuthToken())sessionStorage.setItem(PRIVATE_STATE_KEY,JSON.stringify(s));else sessionStorage.removeItem(PRIVATE_STATE_KEY);
     }
@@ -1242,6 +1334,7 @@ const Adapter = {
   _timer:null
 };
 let S = Adapter.load();
+restoreStoredAccountContext(S,AUTH.activeRole);
 const tr = key => (T[S.lang] && T[S.lang][key]) || T.ar[key] || key;
 const loc = obj => obj ? (S.lang==='ar' ? (obj.ar ?? obj.name ?? '') : (obj.en ?? obj.name ?? obj.ar ?? '')) : '';
 const L = (ar,en) => {
@@ -1961,11 +2054,13 @@ function startAccountAutoRefresh(){
 }
 async function boot(){
  const started=performance.now();
+ restoreStoredAccountContext(S,AUTH.activeRole);
  render();
  updateSyncBadge();
  const remote = await Adapter.loadRemote();
  if(remote){
   S = {...seedState(), ...remote};
+  restoreStoredAccountContext(S,AUTH.activeRole);
   Adapter.save(S);
   render();
   window.__khadamatiOnline = true;
@@ -2383,7 +2478,11 @@ function restoreServicesCategoryRail(){
 }
 function providerRequestDockHtml(){const p=getProvider(S.currentProviderId);if(!p||S.platform?.requestBoardEnabled===false)return '';const count=(S.customerRequests||[]).filter(r=>providerMatchScore(r,p)>0&&!r.acceptedProviderId&&r.offersOpen!==false&&!['cancelled','closed','archived'].includes(r.status)).length,subtitle=count?`${count} ${L('طلبات مطابقة لخدماتك','requests match your services')}`:L('لا توجد فرصة مطابقة الآن','No matching opportunity right now');return `<button class="provider-request-dock" data-action="openRequestBoard" aria-label="${L('فتح مركز فرص العمل','Open work opportunities')}"><span>${icon('briefcase')}</span><span class="provider-request-dock-copy"><b>${L('مركز فرص العمل','Work opportunities')}</b><em>${esc(subtitle)}</em></span><small>${count}</small><i>${dirFor(S.lang)==='rtl'?'←':'→'}</i></button>`;}
 function normalizeAuthenticatedView(){
- if(S.view==='provider'&&!getProvider(S.currentProviderId)&&!AUTH.providerToken){S.view='entry';S.entrySeen=false;S.splashSeen=true;}
+ if(S.view==='provider'&&!AUTH.providerToken){
+  AUTH.activeRole=AUTH.userToken?'user':'';saveAuth();
+  restoreStoredAccountContext(S,AUTH.activeRole);
+  S.view=AUTH.userToken?'home':'entry';S.entrySeen=!!AUTH.userToken;S.splashSeen=true;
+ }
  if(S.view==='admin'&&!AUTH.adminToken){S.admin=false;S.view=AUTH.userToken?'home':'entry';}
 }
 function render(){ normalizeAuthenticatedView();if(window.__khadamatiRenderedView!==undefined&&window.__khadamatiRenderedView!==S.view)clearToast();window.__khadamatiRenderedView=S.view;ensurePlatform(); scanExpiryNotifications(); document.documentElement.lang=S.lang; document.documentElement.dir=dirFor(S.lang); document.body.dataset.theme=S.theme||'light'; document.body.dataset.scale=S.platform.displayScale||'normal'; const app=document.getElementById('app'); if(S.view==='entry') app.innerHTML=renderEntry(); else if(S.view==='providerEntry') app.innerHTML=renderProviderEntry(); else if(S.admin && S.view==='admin') app.innerHTML=renderAdmin(); else if(S.view==='provider') app.innerHTML=renderProviderApp()+providerRequestDockHtml(); else if(S.view==='services') app.innerHTML=layout(renderServices()); else if(S.view==='search') app.innerHTML=layout(renderSearchV36()); else if(S.view==='favorites') app.innerHTML=layout(renderFavorites()); else if(S.view==='myAccount') app.innerHTML=layout(renderAccount()); else if(S.view==='help') app.innerHTML=layout(renderHelp()); else app.innerHTML=layout(renderHome()); bindDynamic(); localizeStaticDom(); startAdSlider(); restoreNavigationScroll(); restoreServicesCategoryRail(); if(S.view==='entry'&&!S.splashSeen&&!window.__khadamatiSplashTimer){window.__khadamatiSplashTimer=setTimeout(()=>{S.splashSeen=true;save();render();},650);} }
@@ -4330,8 +4429,9 @@ async function onClick(e){ const el=e.target.closest('[data-action]'); if(!el)re
  if(a==='providerMode'){await activateProviderMode();return;}
  if(a==='providerLogout'){
   if(ARRIVAL_WATCH_ID!=null){navigator.geolocation?.clearWatch(ARRIVAL_WATCH_ID);ARRIVAL_WATCH_ID=null;ARRIVAL_WATCH_REQUEST_ID='';}
-  AUTH.providerToken='';AUTH.activeRole=AUTH.userToken?'user':'';saveAuth();S.currentProviderId=null;
+  AUTH.providerToken='';forgetAccountMemory('provider');AUTH.activeRole=AUTH.userToken?'user':'';saveAuth();S.currentProviderId=null;
   if(AUTH.userToken){try{mergeRemote(await api('/api/bootstrap',null,AUTH.userToken));}catch(_){}}
+  restoreStoredAccountContext(S,AUTH.activeRole);
   S.view=AUTH.userToken?'home':'entry';save();render();window.scrollTo(0,0);return;
  }
  if(a==='openNotificationSettings'||(a==='openNotifications'&&el.classList.contains('menu-row'))){notificationPreferencesSheet();return;}
@@ -4476,7 +4576,7 @@ if(a==='customerLogin'){
  }
  return;
 }
-if(a==='customerLogout'){revokeAuthToken(AUTH.userToken);dropOfflineQueueFor('user');AUTH.userToken='';AUTH.activeRole=AUTH.providerToken?'provider':'';saveAuth();scrubPrivateSessionState(S);S.session={mode:'none',userId:''};S.user={name:'',phone:'',gov:S.platform.defaultGov||'مسقط',wilayah:'السيب',avatar:'',location:null,pinConfigured:false};S.view='entry';save();render();window.scrollTo(0,0);return;}
+if(a==='customerLogout'){revokeAuthToken(AUTH.userToken);dropOfflineQueueFor('user');AUTH.userToken='';AUTH.activeRole=AUTH.providerToken?'provider':'';forgetAccountMemory('user');saveAuth();scrubPrivateSessionState(S);S.session={mode:'none',userId:''};S.user={name:'',phone:'',gov:S.platform.defaultGov||'مسقط',wilayah:'السيب',avatar:'',location:null,pinConfigured:false};S.view='entry';save();render();window.scrollTo(0,0);return;}
  if(a==='openAppearance'){appearanceSheet();return;}
  if(a==='setTheme'){const choice=el.dataset.value||'light';S.theme=choice==='auto'?(matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light'):choice;document.body.dataset.theme=S.theme;const themeMeta=document.querySelector('meta[name="theme-color"]');if(themeMeta)themeMeta.content=S.theme==='dark'?'#07131f':'#071a2b';save();appearanceSheet();return;}
  if(a==='setDisplayScale'){S.platform.displayScale=el.dataset.value||'normal';save();document.body.dataset.scale=S.platform.displayScale;appearanceSheet();return;}

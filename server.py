@@ -70,7 +70,7 @@ def environment_flag(name, default=False):
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
-APP_RELEASE = os.environ.get("KHADAMATI_RELEASE", "v64").strip() or "v64"
+APP_RELEASE = os.environ.get("KHADAMATI_RELEASE", "v65").strip() or "v65"
 DEMO_DATA_ENABLED = environment_flag(
     "KHADAMATI_SEED_DEMO_DATA", APP_ENV in {"development", "test"}
 )
@@ -4015,7 +4015,13 @@ class Handler(SimpleHTTPRequestHandler):
                 )
             send_whatsapp(settings.get("adminWhatsapp"), f"طلب مزود جديد في خدماتي: {item['name']} - {item['phone']} - {len(item['services'])} خدمات")
             safe_item = provider_request_view(item)
-            return self.send_json({"ok": True, "request": safe_item}, 201)
+            token = issue_token({
+                "kind": "provider_pending",
+                "requestId": item["id"],
+                "name": item["name"],
+                "phone": item["phone"],
+            })
+            return self.send_json({"ok": True, "request": safe_item, "token": token}, 201)
         if path == "/api/reviews":
             return self.save_review(data)
         if path == "/api/complaints":
