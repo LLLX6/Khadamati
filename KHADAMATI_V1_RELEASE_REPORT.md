@@ -136,6 +136,11 @@ production، ولا يوجد ادعاء بسعة آلاف المستخدمين. 
 - Readiness: `/readyz`.
 - Auto Deploy: عند Commit.
 - الخطة المعرفة في Blueprint: `free`.
+- `/healthz`: ✅ HTTP 200 ويعلن `v1.0.0`.
+- `/api/bootstrap`: ✅ HTTP 200.
+- `/readyz`: ⚠️ HTTP 503 مع:
+  `database_path_not_configured` و`upload_path_not_configured`
+  و`backup_path_not_configured`.
 
 **قيد إنتاجي مهم:** لا يعلن `render.yaml` قرصًا دائمًا. يجب تأكيد قرص
 دائم أو قاعدة بيانات وتخزين ملفات دائمين من لوحة Render قبل استقبال
@@ -157,6 +162,13 @@ production، ولا يوجد ادعاء بسعة آلاف المستخدمين. 
 
 ## GitHub وRelease
 
-تُسجل حالة CI ودمج `main` ووسم `v1.0.0` وGitHub Release وZIP في بيانات
-الإصدار النهائية. الوسم هو المرجع الحاسم للـCommit النهائي، لأن ملفًا
-داخل Commit لا يمكنه تضمين Hash ذلك الـCommit ذاتيًا.
+- ✅ رُفع فرع الأرشيف وفرع الإصدار.
+- ✅ نجحت بوابة فرع الإصدار: التشغيل `30391158549`.
+- ✅ دُمج `main` بطريقة Fast Forward بعد نجاح الاختبارات.
+- ✅ نجحت بوابة `main`: التشغيل `30391689337`.
+- ✅ نجح نشر GitHub Pages: التشغيل `30391678918`.
+- ✅ نجح Smoke للرابط المنشور على الهاتف والكمبيوتر.
+- يُنشأ وسم `v1.0.0` وGitHub Release وZIP بعد Commit الإطلاق النهائي.
+
+الوسم هو المرجع الحاسم للـCommit النهائي، لأن ملفًا داخل Commit لا يمكنه
+تضمين Hash ذلك الـCommit ذاتيًا.
