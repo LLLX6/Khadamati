@@ -386,16 +386,27 @@ class RequestAgreementService:
             raise DomainError("agreement_not_found", 404)
         if int(version or 0) != int(agreement["version"]):
             raise DomainError("agreement_version_changed", 409)
-        column = (
-            "user_confirmed_version"
-            if actor_kind == "user"
-            else "provider_confirmed_version"
+        update_params = (
+            agreement["version"],
+            actor_kind,
+            actor_id,
+            iso(self.now),
+            request_id,
         )
-        self.con.execute(
-            f"""UPDATE request_agreements SET {column}=?,status='pending_confirmation',
-            updated_by_kind=?,updated_by_id=?,updated_at=? WHERE request_id=?""",
-            (agreement["version"], actor_kind, actor_id, iso(self.now), request_id),
-        )
+        if actor_kind == "user":
+            self.con.execute(
+                """UPDATE request_agreements SET user_confirmed_version=?,
+                status='pending_confirmation',updated_by_kind=?,updated_by_id=?,
+                updated_at=? WHERE request_id=?""",
+                update_params,
+            )
+        else:
+            self.con.execute(
+                """UPDATE request_agreements SET provider_confirmed_version=?,
+                status='pending_confirmation',updated_by_kind=?,updated_by_id=?,
+                updated_at=? WHERE request_id=?""",
+                update_params,
+            )
         agreement = self.get(request_id) or {}
         if agreement.get("userConfirmed") and agreement.get("providerConfirmed"):
             self.con.execute(
@@ -458,12 +469,18 @@ class ServiceAssetService:
         }
 
     def list_for_user(self, user_id: str, *, include_archived: bool = False) -> list[dict[str, Any]]:
-        condition = "" if include_archived else " AND active=1"
-        rows = self.con.execute(
-            f"""SELECT * FROM service_assets WHERE user_id=?{condition}
-            ORDER BY active DESC,updated_at DESC""",
-            (user_id,),
-        )
+        if include_archived:
+            rows = self.con.execute(
+                """SELECT * FROM service_assets WHERE user_id=?
+                ORDER BY active DESC,updated_at DESC""",
+                (user_id,),
+            )
+        else:
+            rows = self.con.execute(
+                """SELECT * FROM service_assets WHERE user_id=? AND active=1
+                ORDER BY active DESC,updated_at DESC""",
+                (user_id,),
+            )
         return [self._serialize(row) for row in rows]
 
     def get_for_user(self, asset_id: str, user_id: str) -> dict[str, Any]:

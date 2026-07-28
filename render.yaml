@@ -16,8 +16,8 @@ services:
       - key: KHADAMATI_ENV
         value: production
       - key: KHADAMATI_RELEASE
-        value: v66
-      - key: KHADAMATI_SEED_DEMO_DATA
+        value: v1.0.0
+      - key: KHADAMATI_SEED_SAMPLE_DATA
         value: false
       - key: KHADAMATI_PUBLIC_URL
         value: https://lllx6.github.io/Khadamati/

@@ -37,8 +37,10 @@ def check_environment(environment: dict[str, str], *, check_paths: bool = True) 
 
     if environment.get("KHADAMATI_ENV", "").strip().lower() != "production":
         error("environment_not_production", "KHADAMATI_ENV")
-    if truthy(environment.get("KHADAMATI_SEED_DEMO_DATA")):
-        error("demo_seed_must_be_disabled", "KHADAMATI_SEED_DEMO_DATA")
+    if truthy(environment.get("KHADAMATI_SEED_SAMPLE_DATA")) or truthy(
+        environment.get("KHADAMATI_SEED_DEMO_DATA")
+    ):
+        error("sample_seed_must_be_disabled", "KHADAMATI_SEED_SAMPLE_DATA")
     if environment.get("KHADAMATI_DEV_OTP_CODE", "").strip():
         error("development_otp_must_be_removed", "KHADAMATI_DEV_OTP_CODE")
 

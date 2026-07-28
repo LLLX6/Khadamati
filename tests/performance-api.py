@@ -91,7 +91,7 @@ def main() -> int:
                 "KHADAMATI_UPLOAD_DIR": str(Path(temp) / "uploads"),
                 "KHADAMATI_BACKUP_DIR": str(Path(temp) / "backups"),
                 "KHADAMATI_MEDIA_SIGNING_KEY": "performance-media-key-6200",
-                "KHADAMATI_SEED_DEMO_DATA": "false",
+            "KHADAMATI_SEED_SAMPLE_DATA": "false",
             }
         )
         process = subprocess.Popen(

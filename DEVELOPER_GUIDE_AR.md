@@ -7,7 +7,7 @@
 | الجزء | الملف | المسؤولية |
 |---|---|---|
 | واجهة التطبيق | `index.html` | الحالة المحلية، الترجمة، التنقل، العرض، النماذج وربط API |
-| تحسينات الإصدار | `assets/styles/khadamati-v55.css` | منظومة الألوان والمسافات والهاتف والتنقل التكيفي والبطاقات والمحادثة |
+| نظام التصميم | `assets/styles/khadamati-v1.css` | المصدر الموحد للألوان والمسافات والهاتف والتنقل والبطاقات والمحادثة |
 | نسخة GitHub Pages | `public/index.html` و`public/assets/` | مرآة الواجهة الثابتة المنشورة |
 | الخادم | `server.py` | الجلسات وAPI والتحقق والصور والتقارير والإشعارات |
 | منطق النطاق | `khadamati_domain.py` | الاشتراكات والصلاحيات والمطابقة والموافقة والدفع |
@@ -27,12 +27,12 @@
 
 - `renderEntry` و`renderProviderEntry`: بوابات البداية والدخول.
 - `layout` و`render`: الغلاف العام، الرأس، شريط الهاتف واختيار الشاشة.
-- `renderHome` و`renderServices` و`renderSearchV36`: رحلة اكتشاف الخدمة والمزود.
+- `renderHome` و`renderServices` و`renderSearch`: رحلة اكتشاف الخدمة والمزود.
 - `quickRequestForm` و`requestDraftFromForm`: إنشاء الطلب وموقعه وصوره.
 - `requestBoardSheet`: ساحة الطلبات والترشيحات.
 - `openRequestChat`: المحادثة والصور والصوت والموقع.
 - `renderAccount` و`renderProviderApp` و`renderAdmin`: مساحات الحسابات الثلاث.
-- `providerHomeV55` و`openProviderTools`: لوحة المزود اليومية وتجميع الأدوات الثانوية على الهاتف.
+- `providerHome` و`openProviderTools`: لوحة المزود اليومية وتجميع الأدوات الثانوية على الهاتف.
 - `openAdminTools`: تجميع عمليات الإدارة والمال والنظام مع إبقاء أهم خمسة أقسام ظاهرة مباشرة.
 - `onClick`: موزع الإجراءات. أي إجراء جديد يجب أن ينتهي بـ `return` بعد معالجته حتى لا يصل إلى مسار توافق قديم.
 - `normalizeProvider` و`normalizeRequestExtras`: قيم افتراضية للبيانات القديمة؛ حدّثهما عند إضافة حقل دائم.

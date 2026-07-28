@@ -12,7 +12,7 @@ from typing import Any, Callable, Iterable
 
 
 SUPPORT_EMAIL = os.environ.get("KHADAMATI_SUPPORT_EMAIL", "om.khadamati@gmail.com").strip()
-POLICY_VERSION = "2026-07-18.1"
+POLICY_VERSION = "2026-07-28.1"
 MIGRATION_KEY = "KHADAMATI_SUBSCRIPTION_MIGRATION_V1"
 RANKING_VERSION = "khadamati-ranking-v1"
 OMR = "OMR"
@@ -143,19 +143,19 @@ PLAN_ACCOUNT_LIMITS: dict[str, dict[str, dict[str, int]]] = {
         "company": {"maxServices": 6, "maxCategories": 3, "maxImages": 10, "maxWilayats": 5},
     },
     "basic_6m": {
-        "individual": {"maxServices": 6, "maxCategories": 2, "maxImages": 5, "maxWilayats": 10},
+        "individual": {"maxServices": 5, "maxCategories": 1, "maxImages": 5, "maxWilayats": 10},
         "company": {"maxServices": 8, "maxCategories": 4, "maxImages": 10, "maxWilayats": 10},
     },
     "basic_12m": {
-        "individual": {"maxServices": 6, "maxCategories": 2, "maxImages": 5, "maxWilayats": 10},
+        "individual": {"maxServices": 5, "maxCategories": 1, "maxImages": 5, "maxWilayats": 10},
         "company": {"maxServices": 8, "maxCategories": 4, "maxImages": 10, "maxWilayats": 10},
     },
     "professional_12m": {
-        "individual": {"maxServices": 10, "maxCategories": 3, "maxImages": 5, "maxWilayats": 25},
+        "individual": {"maxServices": 10, "maxCategories": 1, "maxImages": 5, "maxWilayats": 25},
         "company": {"maxServices": 12, "maxCategories": 4, "maxImages": 10, "maxWilayats": 25},
     },
     "business_12m": {
-        "individual": {"maxServices": 12, "maxCategories": 4, "maxImages": 5, "maxWilayats": 25},
+        "individual": {"maxServices": 20, "maxCategories": 1, "maxImages": 5, "maxWilayats": 25},
         "company": {"maxServices": 20, "maxCategories": 5, "maxImages": 10, "maxWilayats": 61},
     },
 }
@@ -266,12 +266,15 @@ class PlanCatalog:
         normalized_type = "company" if account_type == "company" else "individual"
         entitlements = plan.get("entitlements") if isinstance(plan.get("entitlements"), dict) else {}
         limits = entitlements.get("accountLimits", {}).get(normalized_type, {})
-        return {
+        result = {
             "maxServices": int(limits.get("maxServices") or plan.get("max_services") or 0),
             "maxCategories": int(limits.get("maxCategories") or plan.get("max_categories") or 0),
             "maxImages": int(limits.get("maxImages") or plan.get("max_images") or 0),
             "maxWilayats": int(limits.get("maxWilayats") or plan.get("max_wilayats") or 0),
         }
+        if normalized_type == "individual":
+            result["maxCategories"] = 1
+        return result
 
     @staticmethod
     def seed(con) -> None:

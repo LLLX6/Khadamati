@@ -87,8 +87,11 @@ def main() -> int:
 
     index_text = (ROOT / "index.html").read_text(encoding="utf-8")
     worker_text = (ROOT / "service-worker.js").read_text(encoding="utf-8")
-    app_version = re.search(r"const APP_VERSION\s*=\s*(\d+)", index_text)
-    cache_version = re.search(r"khadamati-app-shell-v(\d+)", worker_text)
+    semantic_version = r"(\d+(?:\.\d+){0,2})"
+    app_version = re.search(
+        rf"const APP_VERSION\s*=\s*['\"]?{semantic_version}['\"]?", index_text
+    )
+    cache_version = re.search(rf"khadamati-app-shell-v{semantic_version}", worker_text)
     if not app_version or not cache_version:
         errors.append({"type": "version_marker_missing"})
     elif app_version.group(1) != cache_version.group(1):
@@ -100,7 +103,7 @@ def main() -> int:
             }
         )
 
-    if (ROOT / "README.md").is_file():
+    if app_version and (ROOT / "README.md").is_file():
         readme_text = (ROOT / "README.md").read_text(encoding="utf-8")
         expected_heading = f"## الإصدار v{app_version.group(1)}"
         if expected_heading not in readme_text:

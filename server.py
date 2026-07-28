@@ -70,9 +70,10 @@ def environment_flag(name, default=False):
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
-APP_RELEASE = os.environ.get("KHADAMATI_RELEASE", "v66").strip() or "v66"
-DEMO_DATA_ENABLED = environment_flag(
-    "KHADAMATI_SEED_DEMO_DATA", APP_ENV in {"development", "test"}
+APP_RELEASE = os.environ.get("KHADAMATI_RELEASE", "v1.0.0").strip() or "v1.0.0"
+SAMPLE_DATA_ENABLED = environment_flag(
+    "KHADAMATI_SEED_SAMPLE_DATA",
+    environment_flag("KHADAMATI_SEED_DEMO_DATA", APP_ENV in {"development", "test"}),
 )
 INITIAL_ADMIN_CODE = (
     os.environ.get("KHADAMATI_ADMIN_CODE")
@@ -1049,7 +1050,7 @@ def init_db():
                     "UPDATE services SET icon=?, ar=?, en=? WHERE id=? AND category_id=?",
                     (s["icon"], s["ar"], s["en"], s["id"], c["id"]),
                 )
-        if DEMO_DATA_ENABLED:
+        if SAMPLE_DATA_ENABLED:
             for p in SEED_PROVIDERS:
                 con.execute(
                     """INSERT OR IGNORE INTO providers(id,name,phone,gov,wilayah,areas,bio,hours,status,active,verified,featured,
@@ -1090,7 +1091,7 @@ def init_db():
         con.execute("UPDATE packages SET max_services=5,max_images=15 WHERE id='company_year' AND max_services>5")
         migration_summary = run_subscription_migration_v1(con)
         log_event("database.subscription_migration", summary=migration_summary)
-        if DEMO_DATA_ENABLED and con.execute("SELECT COUNT(*) n FROM reviews").fetchone()["n"] == 0:
+        if SAMPLE_DATA_ENABLED and con.execute("SELECT COUNT(*) n FROM reviews").fetchone()["n"] == 0:
             con.execute(
                 """INSERT INTO reviews(
                 id,provider_id,rating,customer_name,phone,comment,approved,created_at)
@@ -1111,7 +1112,7 @@ def init_db():
                 "supportEmail": SUPPORT_EMAIL,
                 "policyVersion": POLICY_VERSION,
                 "currency": OMR,
-                "adminWhatsapp": "96890000000",
+                "adminWhatsapp": "",
                 "monthlyGoal": 500,
                 "acceptProviders": True,
                 "subscriptionsEnabled": False,
@@ -2662,10 +2663,16 @@ def get_bootstrap(session=None):
                     """SELECT id,account_kind,account_id,phone,attempts,expires_at,used_at,created_at
                     FROM password_recoveries ORDER BY created_at DESC LIMIT 120"""
                 ):
-                    account_table = "providers" if recovery["account_kind"] == "provider" else "app_users"
-                    account = con.execute(
-                        f"SELECT name FROM {account_table} WHERE id=?", (recovery["account_id"],)
-                    ).fetchone()
+                    if recovery["account_kind"] == "provider":
+                        account = con.execute(
+                            "SELECT name FROM providers WHERE id=?",
+                            (recovery["account_id"],),
+                        ).fetchone()
+                    else:
+                        account = con.execute(
+                            "SELECT name FROM app_users WHERE id=?",
+                            (recovery["account_id"],),
+                        ).fetchone()
                     recovery_items.append({
                         "id": recovery["id"],
                         "accountKind": recovery["account_kind"],
@@ -2974,6 +2981,33 @@ def upsert_provider(con, data):
         con, "foundation_12m", False
     )
     account_limits = PlanCatalog.account_limits(package, p["providerType"])
+    existing_services = existing_provider.get("services", [])
+    existing_categories = {
+        item.get("catId")
+        for item in existing_services
+        if isinstance(item, dict) and item.get("catId")
+    }
+    service_limit = max(
+        1,
+        int(account_limits.get("maxServices") or 1),
+        len(existing_services) if existing else 0,
+    )
+    category_limit = max(
+        1,
+        int(account_limits.get("maxCategories") or 1),
+        len(existing_categories) if existing else 0,
+    )
+    raw_services = data.get("services", existing_services)
+    p["services"] = normalized_provider_services(
+        con,
+        raw_services,
+        limit=service_limit,
+        category_limit=category_limit,
+        fallback_price=data.get("priceFrom", existing_provider.get("priceFrom", 0)),
+        default_areas=data.get("areas")
+        or existing_provider.get("areas")
+        or [data.get("wilayah") or existing_provider.get("wilayah", "")],
+    )
     image_limit = max(1, int(account_limits.get("maxImages") or 5))
     work_images = data.get("workImages") or existing_provider.get("workImages", [])
     if data.get("workImagesData"):
@@ -6254,19 +6288,19 @@ class Handler(SimpleHTTPRequestHandler):
                         "pinHash": payload.get("pinHash") or "",
                     }
                     services = payload.get("services") if isinstance(payload.get("services"), list) else []
-                    service_limit = 6 if payload.get("providerType") == "company" else 3
-                    provider["services"] = [
-                        {
-                            "id": svc.get("id") or slug("ps"),
-                            "catId": svc.get("catId", ""),
-                            "serviceId": svc.get("serviceId", ""),
-                            "priceFrom": float(svc.get("priceFrom") or payload.get("priceFrom") or 0),
-                            "active": bool(svc.get("active", True)),
-                            "areas": svc.get("areas") or [payload.get("wilayah", "")],
-                        }
-                        for svc in services[:service_limit]
-                        if isinstance(svc, dict) and svc.get("catId") and svc.get("serviceId")
-                    ]
+                    foundation = PlanCatalog.get(con, "foundation_12m", False) or {}
+                    limits = PlanCatalog.account_limits(
+                        foundation,
+                        "company" if payload.get("providerType") == "company" else "individual",
+                    )
+                    provider["services"] = normalized_provider_services(
+                        con,
+                        services,
+                        limit=max(1, int(limits.get("maxServices") or 1)),
+                        category_limit=max(1, int(limits.get("maxCategories") or 1)),
+                        fallback_price=payload.get("priceFrom") or 0,
+                        default_areas=[payload.get("wilayah", "")],
+                    )
                     service = payload.get("service", "")
                     if not provider["services"] and "|" in service:
                         cat_id, service_id = service.split("|", 1)
@@ -6387,10 +6421,16 @@ class Handler(SimpleHTTPRequestHandler):
                 ).fetchone()
                 if not recovery:
                     return self.send_json({"error": "recovery_not_found"}, 404)
-                account_table = "providers" if recovery["account_kind"] == "provider" else "app_users"
-                account = con.execute(
-                    f"SELECT name FROM {account_table} WHERE id=?", (recovery["account_id"],)
-                ).fetchone()
+                if recovery["account_kind"] == "provider":
+                    account = con.execute(
+                        "SELECT name FROM providers WHERE id=?",
+                        (recovery["account_id"],),
+                    ).fetchone()
+                else:
+                    account = con.execute(
+                        "SELECT name FROM app_users WHERE id=?",
+                        (recovery["account_id"],),
+                    ).fetchone()
                 if not account:
                     return self.send_json({"error": "account_not_found"}, 404)
                 temporary_code = f"{secrets.randbelow(1_000_000):06d}"

@@ -50,6 +50,19 @@ async function capture(page, name) {
 }
 
 async function clickUserNav(page, view) {
+  if (view === 'conversations') {
+    const conversations = page.locator('[data-action="openConversations"]:visible').first();
+    assert(await conversations.count(), 'The conversations entry point is missing from the header.');
+    await conversations.click();
+    return;
+  }
+  if (view === 'search') {
+    await clickUserNav(page, 'services');
+    const search = page.locator('[data-action="nav"][data-view="search"]:visible, .services-search-action:visible').first();
+    assert(await search.count(), 'The services page does not expose its search action.');
+    await search.click();
+    return;
+  }
   const bottomItem = page.locator(`.bottom-nav [data-action="nav"][data-view="${view}"]`).first();
   if (await bottomItem.count()) {
     if (await bottomItem.isVisible()) await bottomItem.click();
@@ -63,7 +76,12 @@ async function clickUserNav(page, view) {
 }
 
 async function clickFirstAction(page, action) {
-  const item = page.locator(`[data-action="${action}"]`).first();
+  let item = page.locator(`[data-action="${action}"]`).first();
+  if (!(await item.count()) && action === 'openRequestBoard') {
+    await clickUserNav(page, 'tasks');
+    item = page.locator(`[data-action="${action}"]`).first();
+  }
+  assert(await item.count(), `No accessible action exists for ${action}.`);
   if (await item.isVisible()) await item.click();
   else await item.evaluate(element => element.click());
 }
@@ -137,7 +155,7 @@ async function clickAdminTab(page, tab) {
   await page.waitForSelector('[data-action="openUserLogin"]');
   await capture(page, '00-entry');
   if (IS_MOBILE && VIEWPORT_HEIGHT > 700) {
-    const entryLayout = await page.locator('.entry-card-v35').evaluate(card => {
+  const entryLayout = await page.locator('.entry-card-focus').evaluate(card => {
       const cardBox = card.getBoundingClientRect();
       const utilities = card.querySelector('.entry-utilities')?.getBoundingClientRect();
       const trust = card.querySelector('.entry-trust-line')?.getBoundingClientRect();
@@ -163,7 +181,7 @@ async function clickAdminTab(page, tab) {
   await page.locator('[data-action="customerLogin"]').click();
   await page.waitForSelector('.role-onboarding');
   const onboardingImage = page.locator('.role-onboarding .onboarding-visual img');
-  assert(/assets\/onboarding\/v49\//.test(await onboardingImage.getAttribute('src')), 'The square role onboarding image is missing.');
+  assert(/assets\/onboarding\/core\//.test(await onboardingImage.getAttribute('src')), 'The square role onboarding image is missing.');
   await onboardingImage.evaluate(image => image.complete ? true : new Promise(resolve => image.addEventListener('load', () => resolve(true), { once: true })));
   assert(await onboardingImage.evaluate(image => image.naturalWidth >= 900 && image.naturalHeight >= 900 && Math.abs(image.naturalWidth - image.naturalHeight) <= 2), 'The onboarding image is not a high-resolution square launch asset.');
   assert(await onboardingImage.evaluate(image => getComputedStyle(image).objectFit === 'cover'), 'Mobile onboarding artwork must fill the square frame without side gaps.');
@@ -172,18 +190,18 @@ async function clickAdminTab(page, tab) {
     { role: 'guest', slides: ['guest-browse', 'guest-compare', 'guest-signin', 'guest-privacy'] },
     { role: 'provider', slides: ['provider-profile', 'provider-opportunity', 'provider-availability', 'provider-offer'] },
     { role: 'company', slides: ['company-profile', 'company-dispatch', 'company-analytics', 'company-team'] },
-  ].map(set => ({ ...set, slides: set.slides.map(name => `assets/onboarding/v49/${name}.webp`) }));
+  ].map(set => ({ ...set, slides: set.slides.map(name => `assets/onboarding/core/${name}.webp`) }));
   for (const set of onboardingSets) {
     assert(set.slides.length === 4, `${set.role} onboarding must contain four focused steps.`);
-    assert(set.slides.every(src => /assets\/onboarding\/v49\//.test(src)), `${set.role} onboarding is using an outdated image.`);
+    assert(set.slides.every(src => /assets\/onboarding\/core\//.test(src)), `${set.role} onboarding is using an outdated image.`);
     assert(new Set(set.slides).size === set.slides.length, `${set.role} onboarding repeats the same artwork.`);
   }
   assert(new Set(onboardingSets.flatMap(set => set.slides)).size === 16, 'Every onboarding state must use its own artwork.');
   const launchSources = [
     ...new Set(onboardingSets.flatMap(set => set.slides)),
-    'assets/ads/v45/home-services.webp',
-    'assets/ads/v45/nearby-services.webp',
-    'assets/ads/v45/business-services.webp',
+    'assets/ads/campaigns/home-services.webp',
+    'assets/ads/campaigns/nearby-services.webp',
+    'assets/ads/campaigns/business-services.webp',
   ];
   const launchHtml = await page.content();
   assert(launchSources.every(src => launchHtml.includes(src)), 'The production page is not wired to every current launch image.');
@@ -305,7 +323,7 @@ async function clickAdminTab(page, tab) {
   assert(providerContentMetrics.every(item => item.ok), `Provider card overlay is not readable or leaves too little portrait space: ${JSON.stringify(providerContentMetrics)}`);
   assert(await page.locator('.search-results-grid .provider-card-title-row .status.off').count() === 0, 'Unavailable providers must stay hidden from public search.');
   const firstProviderImage = page.locator('.search-results-grid .provider-listing .listing-media img').first();
-  assert(/assets\/providers\/omani-electrician-v53\.webp/.test(await firstProviderImage.getAttribute('src')), 'The launch provider card is still using a generated placeholder.');
+  assert(/assets\/providers\/omani-electrician\.webp/.test(await firstProviderImage.getAttribute('src')), 'The launch provider card is still using a generated placeholder.');
   const providerImageLoaded = await firstProviderImage.evaluate(image => image.complete
     ? image.naturalWidth >= 800
     : new Promise(resolve => {
@@ -322,17 +340,18 @@ async function clickAdminTab(page, tab) {
   assert(await page.locator('.request-board-guide').evaluate(element => element.getBoundingClientRect().right <= window.innerWidth + 1), 'Request board guidance overflows the mobile viewport.');
   await page.locator('.request-board-guide summary').click();
   const recommendationGuide = page.locator('.request-board-guide img');
-  assert(/assets\/onboarding\/v49\/user-matching\.webp/.test(await recommendationGuide.getAttribute('src')), 'Provider recommendation guidance artwork is missing.');
+  assert(/assets\/onboarding\/core\/user-matching\.webp/.test(await recommendationGuide.getAttribute('src')), 'Provider recommendation guidance artwork is missing.');
   await recommendationGuide.evaluate(image => image.complete ? true : new Promise(resolve => image.addEventListener('load', () => resolve(true), { once: true })));
   assert(await recommendationGuide.evaluate(image => image.naturalWidth >= 900 && image.naturalHeight >= 900), 'Provider recommendation guidance is not high resolution.');
   assert(await recommendationGuide.evaluate(image => getComputedStyle(image).objectFit === 'cover'), 'Provider recommendation artwork does not fill its square frame.');
   await page.locator('[data-action="closeModal"]').click();
   assert(await page.locator('#modalRoot .modal-backdrop').count() === 0, 'Closing the request board left a blocking modal layer.');
+  await clickUserNav(page, 'home');
   await page.locator('.direct-request-card [data-action="quickRequestForm"]').click();
   await page.waitForTimeout(150);
   if (await page.locator('.direct-request-guide').count()) {
     const directGuideImage = page.locator('.direct-request-guide img');
-    assert(/assets\/onboarding\/v49\/user-direct-request\.webp/.test(await directGuideImage.getAttribute('src')), 'Direct-request guidance artwork is missing.');
+    assert(/assets\/onboarding\/core\/user-direct-request\.webp/.test(await directGuideImage.getAttribute('src')), 'Direct-request guidance artwork is missing.');
     await page.locator('[data-action="continueDirectRequestGuide"]').click();
     await page.waitForTimeout(150);
   }
@@ -349,7 +368,7 @@ async function clickAdminTab(page, tab) {
   assert(Boolean(await page.locator('#qrCategory').inputValue()), 'Available category was not selected.');
   assert(Boolean(await page.locator('#qrService').inputValue()), 'Available service was not selected.');
   assert(await page.locator('.request-selection-strip').count(), 'The location step is missing the selected service summary.');
-  const requestReachability = await page.locator('.request-modal-v36').evaluate(modal => {
+  const requestReachability = await page.locator('.request-modal').evaluate(modal => {
     const body = modal.querySelector('.modal-body');
     const actions = modal.querySelector('.request-wizard-step.active .wizard-actions');
     return {
@@ -440,7 +459,7 @@ async function clickAdminTab(page, tab) {
   assert(await page.locator('#qrService').inputValue() === repeatSource.serviceValue, 'Repeat request lost the selected service.');
   assert(await page.locator('#qrGov').inputValue() === repeatSource.gov && await page.locator('#qrWilayah').inputValue() === repeatSource.wilayah, 'Repeat request lost the selected area.');
   assert(await page.locator('#qrIdempotencyKey').inputValue() !== repeatSource.idempotencyKey, 'Repeat request reused the old idempotency key.');
-  assert(await page.locator('#qrDate').inputValue() === '', 'Repeat request retained a stale appointment.');
+  assert(await page.locator('#qrDate, #qrTime').count() === 0, 'Direct request should not ask for appointment timing before an offer is selected.');
   await page.locator('[data-action="closeModal"]').click();
   await page.evaluate(() => {
     const backup = sessionStorage.getItem('KHADAMATI_REPEAT_TEST_BACKUP');
@@ -449,9 +468,9 @@ async function clickAdminTab(page, tab) {
   });
   await page.reload({ waitUntil: 'domcontentloaded' });
   await clickUserNav(page, 'myAccount');
-  assert(await page.locator('.loyalty-card-v40 [role="progressbar"]').count(), 'Clear loyalty progress bar is missing.');
-  assert(await page.locator('.loyalty-card-v40.is-points-only').count(), 'Loyalty must default to a points balance until management activates a campaign.');
-  assert(!/المكافأة التالية|next reward/i.test(await page.locator('.loyalty-card-v40').innerText()), 'Loyalty promises an unapproved fixed reward.');
+  assert(await page.locator('.loyalty-card-campaign [role="progressbar"]').count(), 'Clear loyalty progress bar is missing.');
+  assert(await page.locator('.loyalty-card-campaign.is-points-only').count(), 'Loyalty must default to a points balance until management activates a campaign.');
+  assert(!/المكافأة التالية|next reward/i.test(await page.locator('.loyalty-card-campaign').innerText()), 'Loyalty promises an unapproved fixed reward.');
   await page.locator('[data-action="openAppearance"]').click();
   await page.locator('[data-action="setTheme"][data-value="dark"]').click();
   assert(await page.locator('body').getAttribute('data-theme') === 'dark', 'Dark theme was not applied immediately.');
@@ -484,12 +503,12 @@ async function clickAdminTab(page, tab) {
   const individualCategory = String(await page.locator('#regService').inputValue()).split('|')[0];
   assert(await page.locator('#regServiceExtra1').getAttribute('data-cat-filter') === individualCategory, 'Individual additional services must stay inside the primary category.');
   await page.locator('#regAvatar').setInputFiles(path.join(__dirname, '..', 'app-icon-512.png'));
-  await page.waitForSelector('.image-editor-v57');
-  assert(await page.locator('.image-editor-v57 [data-action="cropZoomDelta"]').count() === 2, 'The modern image editor must provide zoom-in and zoom-out controls.');
-  assert(await page.locator('.image-editor-v57 [data-action="rotateCrop"]').count(), 'The modern image editor is missing rotation controls.');
+  await page.waitForSelector('.image-editor-modern');
+  assert(await page.locator('.image-editor-modern [data-action="cropZoomDelta"]').count() === 2, 'The modern image editor must provide zoom-in and zoom-out controls.');
+  assert(await page.locator('.image-editor-modern [data-action="rotateCrop"]').count(), 'The modern image editor is missing rotation controls.');
   assert(Number(await page.locator('#cropZoom').getAttribute('min')) < 1, 'The image editor cannot zoom out enough to show a full portrait.');
   await capture(page, '01f-image-editor');
-  await page.locator('.image-editor-v57 [data-action="closeImageEditor"]').click();
+  await page.locator('.image-editor-modern [data-action="closeImageEditor"]').click();
   assert(await page.locator('.image-input-previews[data-for="regAvatar"] [data-action="editSelectedImage"]').count(), 'Uploaded image preview is missing its edit action.');
   assert(await page.locator('.image-input-previews[data-for="regAvatar"] [data-action="removeSelectedImage"]').count(), 'Uploaded image preview is missing its delete action.');
   await page.locator('#regProviderType').selectOption('company');
@@ -541,7 +560,6 @@ async function clickAdminTab(page, tab) {
   }
   assert(await page.locator('.week-calendar').count(), 'Provider weekly calendar is missing.');
   assert(await page.locator('.quote-template-grid').count(), 'Provider quote templates are missing.');
-  assert(await page.locator('.provider-request-dock').count(), 'Fixed provider request dock is missing.');
   assert(await page.locator('.provider-topbar .provider-brand').isVisible(), 'Provider header identity is hidden.');
   assert(await page.locator('.provider-topbar .provider-brand > .brand-mark.image-mark').isVisible(), 'Provider header logo is hidden on a narrow phone.');
   if (VIEWPORT_WIDTH <= 430) {
@@ -553,8 +571,6 @@ async function clickAdminTab(page, tab) {
   const providerTopFits = await page.locator('.provider-topbar').evaluate(() => document.documentElement.scrollWidth <= window.innerWidth + 1);
   assert(providerTopFits, 'Provider top bar overflows the mobile viewport.');
   assert(await page.locator('.provider-top-actions > *').evaluateAll(items => items.every(item => { const box = item.getBoundingClientRect(); return box.left >= -1 && box.right <= window.innerWidth + 1; })), 'A provider header control leaves the mobile viewport.');
-  const dockBox = await page.locator('.provider-request-dock').boundingBox();
-  assert(dockBox && dockBox.x >= 0 && dockBox.x + dockBox.width <= VIEWPORT_WIDTH, 'Provider request dock is outside the viewport.');
   await capture(page, '02-provider-dashboard');
   await page.locator('.provider-top-actions [data-action="toggleLang"]').click();
   await page.waitForTimeout(150);
@@ -565,16 +581,6 @@ async function clickAdminTab(page, tab) {
     return rect.left >= -1 && rect.right <= window.innerWidth + 1 && (window.innerWidth > 940 || getComputedStyle(element).overflowX !== 'visible');
   });
   assert(providerNavFits, 'Provider English tabs are not contained in their horizontal scroller.');
-  const englishDockBox = await page.locator('.provider-request-dock').boundingBox();
-  assert(englishDockBox && englishDockBox.x >= 0 && englishDockBox.x + englishDockBox.width <= VIEWPORT_WIDTH, 'English Opportunities dock is outside the viewport.');
-  assert(await page.locator('.provider-request-dock').filter({ hasText: /Opportunities/i }).count(), 'English Opportunities label is missing.');
-  const providerDockContentFits = await page.locator('.provider-request-dock').evaluate(element => {
-    const icon = element.querySelector(':scope > span:first-child')?.getBoundingClientRect();
-    const copy = element.querySelector('.provider-request-dock-copy')?.getBoundingClientRect();
-    if (!icon || !copy) return false;
-    return copy.width > 80 && (copy.left >= icon.right - 1 || icon.left >= copy.right - 1);
-  });
-  assert(providerDockContentFits, 'Provider Opportunities icon overlaps its label.');
   await page.locator('.provider-status-toggle').click();
   await page.locator('.provider-status-toggle').click();
   await page.locator('.provider-status-toggle').click();
@@ -601,11 +607,9 @@ async function clickAdminTab(page, tab) {
   await page.locator('[data-action="closeModal"]').click();
 
   await page.locator('.side-nav [data-action="providerTab"][data-tab="leads"]').click();
-  await clickFirstAction(page, 'openRequestBoard');
   assert(await page.locator('.request-opportunity').count(), 'Provider request board is empty.');
   assert(await page.locator('.request-opportunity [data-action="providerAcceptRequest"]').count(), 'Matching provider cannot offer from the request board.');
   await capture(page, '02b-provider-opportunities');
-  await page.locator('[data-action="closeModal"]').click();
   await page.locator('[data-action="providerAcceptRequest"]').first().click();
   await page.locator('#offerPrice').fill('12');
   await page.locator('#offerDuration').fill('خلال ساعتين');
@@ -766,16 +770,15 @@ async function clickAdminTab(page, tab) {
   assert(await page.locator('[data-action="notificationCenterTab"][data-value="messages"]').count() === 0, 'Chats still appear inside the notification center.');
   await page.locator('.notification-center-sheet [data-action="closeModal"]').click();
   await page.locator('.provider-top-actions [data-action="openConversations"]').click();
-  await page.waitForSelector('.conversation-hub-sheet .conversation-card');
-  const providerConversation = page.locator('.conversation-card').first();
-  assert(await providerConversation.count(), 'Provider conversation hub is empty.');
+  await page.waitForSelector('.provider-workspace .conversation-page-list .conversation-card');
+  const providerConversation = page.locator('.provider-workspace .conversation-page-list .conversation-card').first();
+  assert(await providerConversation.count(), 'Provider conversation page is empty.');
   assert((await providerConversation.textContent()).includes('مستخدم الاختبار الآلي'), 'Provider conversation does not identify the customer.');
   await providerConversation.click();
   await page.waitForSelector('.chat-sheet #chatThread');
-  assert(await page.locator('.chat-profile-identity b').filter({ hasText: /مستخدم الاختبار/i }).count(), 'Provider conversation hub did not open the correct chat directly.');
+  assert(await page.locator('.chat-profile-identity b').filter({ hasText: /مستخدم الاختبار/i }).count(), 'Provider conversation page did not open the correct chat directly.');
   await page.locator('.chat-sheet [data-action="closeModalSoft"]').click();
-  assert(await page.locator('.conversation-hub-sheet').count(), 'Closing a chat did not return to the conversation hub.');
-  await page.locator('.conversation-hub-sheet [data-action="closeModal"]').click();
+  assert(await page.locator('.provider-workspace .conversation-page-list').count(), 'Closing a chat did not return to the provider conversation page.');
   await page.locator('.side-nav [data-action="providerTab"][data-tab="tasks"]').click();
   assert(await page.locator('.provider-active-jobs .provider-task-card').count(), 'Accepted request is missing from provider active jobs.');
   assert(await page.locator('.provider-active-jobs [data-action="providerAcceptRequest"]').count() === 0, 'Provider can still submit an offer after being selected.');
@@ -846,9 +849,9 @@ async function clickAdminTab(page, tab) {
   await page.waitForSelector('.provider-adaptive-nav');
   const directSupport = page.locator('.side-nav [data-action="providerTab"][data-tab="support"]').first();
   if (await directSupport.isVisible()) await directSupport.click();
-  else if (await page.locator('[data-action="openProviderTools"]').isVisible()) {
-    await page.locator('[data-action="openProviderTools"]').click();
-    await page.locator('[data-action="providerToolTab"][data-tab="support"]').click();
+  else if (await page.locator('.side-nav [data-action="providerTab"][data-tab="profile"]').count()) {
+    await page.locator('.side-nav [data-action="providerTab"][data-tab="profile"]').first().click();
+    await page.locator('[data-action="providerTab"][data-tab="support"]').first().click();
   }
   else if (await directSupport.count()) await directSupport.evaluate(element => element.click());
   else throw new Error('Provider support navigation is unavailable.');
@@ -858,7 +861,7 @@ async function clickAdminTab(page, tab) {
   await page.locator('[data-action="goBack"]').click();
   await page.locator('[data-action="enterGuest"]').click();
   if (await page.locator('.role-onboarding').count()) {
-    assert(/assets\/onboarding\/v49\/guest-browse\.webp/.test(await page.locator('.role-onboarding .onboarding-visual img').getAttribute('src')), 'Guest onboarding did not open its dedicated artwork.');
+    assert(/assets\/onboarding\/core\/guest-browse\.webp/.test(await page.locator('.role-onboarding .onboarding-visual img').getAttribute('src')), 'Guest onboarding did not open its dedicated artwork.');
     await page.locator('[data-action="skipOnboarding"]').click();
   }
   assert(await page.locator('.app-top [data-action="openNotifications"] .notification-badge').count() === 0, 'Guest must not inherit the previous user notification badge.');
@@ -869,7 +872,7 @@ async function clickAdminTab(page, tab) {
   await page.locator('[data-action="goBack"]').click();
   for (let i = 0; i < 6; i++) await page.locator('[data-action="brandHome"]').first().click();
   await page.waitForSelector('#adminCode');
-  await page.locator('#adminCode').fill('0000');
+  await page.locator('#adminCode').fill('UI-Test-4829');
   await page.locator('[data-action="adminLogin"]').click();
   await page.waitForSelector('.admin-shell');
   await page.locator('.admin-topbar [data-action="openAdminNotifications"]').click();

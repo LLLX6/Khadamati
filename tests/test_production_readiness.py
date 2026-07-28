@@ -13,7 +13,7 @@ class ProductionReadinessTests(unittest.TestCase):
         backups.mkdir()
         return {
             "KHADAMATI_ENV": "production",
-            "KHADAMATI_SEED_DEMO_DATA": "false",
+            "KHADAMATI_SEED_SAMPLE_DATA": "false",
             "KHADAMATI_PUBLIC_URL": "https://example.test/khadamati/",
             "KHADAMATI_ALLOWED_ORIGINS": "https://example.test",
             "KHADAMATI_DB_PATH": str(root / "khadamati.sqlite3"),
@@ -39,7 +39,7 @@ class ProductionReadinessTests(unittest.TestCase):
         result = check_environment(
             {
                 "KHADAMATI_ENV": "development",
-                "KHADAMATI_SEED_DEMO_DATA": "true",
+                "KHADAMATI_SEED_SAMPLE_DATA": "true",
                 "KHADAMATI_DEV_OTP_CODE": "123456",
                 "KHADAMATI_PUBLIC_URL": "http://localhost:8080",
                 "KHADAMATI_ALLOWED_ORIGINS": "http://localhost:8080",
@@ -49,7 +49,7 @@ class ProductionReadinessTests(unittest.TestCase):
         codes = {item["code"] for item in result["errors"]}
         self.assertFalse(result["ok"])
         self.assertIn("environment_not_production", codes)
-        self.assertIn("demo_seed_must_be_disabled", codes)
+        self.assertIn("sample_seed_must_be_disabled", codes)
         self.assertIn("development_otp_must_be_removed", codes)
         self.assertIn("persistent_path_required", codes)
 

@@ -232,7 +232,7 @@ class KhadamatiDomainTests(unittest.TestCase):
             provider_id = self.provider(str(index))
             self.activate(provider_id, "professional_12m", now)
             exact_ids.append(provider_id)
-        wrong_id = self.provider("299", cat="technology", service="computer_repair")
+        wrong_id = self.provider("299", cat="tech", service="pc")
         self.activate(wrong_id, "professional_12m", now)
         user_id = "domain-user-1"
         request_id = "domain-request-1"
@@ -358,19 +358,18 @@ class KhadamatiDomainTests(unittest.TestCase):
             services=[
                 {"catId": "cleaning", "serviceId": "home_cleaning"},
                 {"catId": "cleaning", "serviceId": "carpet_cleaning"},
-                {"catId": "technology", "serviceId": "computer_repair"},
+                {"catId": "cleaning", "serviceId": "sofa_cleaning"},
             ],
             areas=["السيب", "بوشر"],
         )
-        self.assertEqual(6, valid["maxServices"])
-        self.assertEqual(2, valid["maxCategories"])
+        self.assertEqual(5, valid["maxServices"])
+        self.assertEqual(1, valid["maxCategories"])
         with self.assertRaises(DomainError) as caught:
             entitlement.validate_profile(
                 provider_id,
                 services=[
                     {"catId": "cleaning", "serviceId": "home_cleaning"},
-                    {"catId": "technology", "serviceId": "computer_repair"},
-                    {"catId": "homecare", "serviceId": "electrician"},
+                    {"catId": "tech", "serviceId": "pc"},
                 ],
                 areas=["السيب"],
             )
@@ -402,6 +401,42 @@ class KhadamatiDomainTests(unittest.TestCase):
                 company["maxImages"],
             ),
         )
+
+    def test_provider_persistence_rejects_a_second_individual_category(self):
+        provider_id = self.provider("1053")
+        provider = server.row_provider(
+            self.con.execute("SELECT * FROM providers WHERE id=?", (provider_id,)).fetchone(),
+            private=True,
+        )
+        provider["services"] = [
+            {"catId": "homecare", "serviceId": "electrician", "active": True},
+            {"catId": "tech", "serviceId": "pc", "active": True},
+        ]
+        with self.assertRaises(DomainError) as caught:
+            server.upsert_provider(self.con, provider)
+        self.assertEqual("provider_category_limit", caught.exception.code)
+
+    def test_provider_persistence_grandfathers_existing_categories_without_data_loss(self):
+        provider_id = self.provider("1054")
+        legacy_services = [
+            {"catId": "homecare", "serviceId": "electrician", "active": True},
+            {"catId": "tech", "serviceId": "pc", "active": True},
+        ]
+        self.con.execute(
+            "UPDATE providers SET services=? WHERE id=?",
+            (json.dumps(legacy_services, ensure_ascii=False), provider_id),
+        )
+        provider = server.row_provider(
+            self.con.execute("SELECT * FROM providers WHERE id=?", (provider_id,)).fetchone(),
+            private=True,
+        )
+        provider["name"] = "مزود محفوظ بلا فقد بيانات"
+        server.upsert_provider(self.con, provider)
+        saved = server.row_provider(
+            self.con.execute("SELECT * FROM providers WHERE id=?", (provider_id,)).fetchone(),
+            private=True,
+        )
+        self.assertEqual(2, len(saved["services"]))
 
     def test_plan_seed_preserves_admin_account_limit_edits(self):
         plan = PlanCatalog.get(self.con, "basic_12m", False)
@@ -523,15 +558,15 @@ class KhadamatiDomainTests(unittest.TestCase):
             OTPService(self.con, environment=environment).request("96895550103", "login")
         self.assertEqual("otp_delivery_unavailable", caught.exception.code)
 
-    def test_production_database_does_not_seed_demo_profiles(self):
+    def test_production_database_does_not_seed_sample_profiles(self):
         with tempfile.TemporaryDirectory(prefix="khadamati-production-seed-") as temp:
             old_db = server.DB_PATH
             old_uploads = server.UPLOAD_DIR
-            old_demo = server.DEMO_DATA_ENABLED
+            old_sample = server.SAMPLE_DATA_ENABLED
             try:
                 server.DB_PATH = Path(temp) / "production.sqlite3"
                 server.UPLOAD_DIR = Path(temp) / "uploads"
-                server.DEMO_DATA_ENABLED = False
+                server.SAMPLE_DATA_ENABLED = False
                 server.init_db()
                 con = sqlite3.connect(server.DB_PATH)
                 try:
@@ -550,7 +585,7 @@ class KhadamatiDomainTests(unittest.TestCase):
             finally:
                 server.DB_PATH = old_db
                 server.UPLOAD_DIR = old_uploads
-                server.DEMO_DATA_ENABLED = old_demo
+                server.SAMPLE_DATA_ENABLED = old_sample
 
     def test_admin_bootstrap_contains_only_admin_notifications(self):
         admin_related = f"admin-scope-{os.urandom(4).hex()}"
