@@ -28,5 +28,8 @@ tests/__screens-*/
 tests/__debug*.png
 __screenshots-*/
 .pip-audit-cache*/
+.pip-audit-tool/
 v*-contact-sheet.jpg
 v*-mobile-contact-sheet.jpg
+artifacts/
+outputs/

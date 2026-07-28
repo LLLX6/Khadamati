@@ -16,7 +16,7 @@ services:
       - key: KHADAMATI_ENV
         value: production
       - key: KHADAMATI_RELEASE
-        value: v65
+        value: v66
       - key: KHADAMATI_SEED_DEMO_DATA
         value: false
       - key: KHADAMATI_PUBLIC_URL

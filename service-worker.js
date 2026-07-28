@@ -1,4 +1,4 @@
-const CACHE_NAME = 'khadamati-app-shell-v65-durable-accounts';
+const CACHE_NAME = 'khadamati-app-shell-v66-vision-2030';
 const SHELL = [
   './',
   './index.html',
@@ -15,6 +15,7 @@ const SHELL = [
   './assets/styles/khadamati-v63.css',
   './assets/styles/khadamati-v64.css',
   './assets/styles/khadamati-v65.css',
+  './assets/styles/khadamati-v66.css',
   './assets/scripts/khadamati-visuals-v56.js',
   './app-icon-192.png',
   './app-icon-512.png',

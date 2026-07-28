@@ -50,9 +50,16 @@ async function capture(page, name) {
 }
 
 async function clickUserNav(page, view) {
-  const item = page.locator(`.bottom-nav [data-action="nav"][data-view="${view}"]`).first();
-  if (await item.isVisible()) await item.click();
-  else await item.evaluate(element => element.click());
+  const bottomItem = page.locator(`.bottom-nav [data-action="nav"][data-view="${view}"]`).first();
+  if (await bottomItem.count()) {
+    if (await bottomItem.isVisible()) await bottomItem.click();
+    else await bottomItem.evaluate(element => element.click());
+    return;
+  }
+  const pageItem = page.locator(`[data-action="nav"][data-view="${view}"]`).first();
+  assert(await pageItem.count(), `No accessible navigation route exists for ${view}.`);
+  if (await pageItem.isVisible()) await pageItem.click();
+  else await pageItem.evaluate(element => element.click());
 }
 
 async function clickFirstAction(page, action) {
@@ -424,8 +431,10 @@ async function clickAdminTab(page, tab) {
   await page.reload({ waitUntil: 'domcontentloaded' });
   await clickUserNav(page, 'myAccount');
   const repeatButton = page.locator('[data-action="repeatRequest"]').first();
-  const repeatGroup = repeatButton.locator('xpath=ancestor::details');
-  if (!await repeatButton.isVisible()) await repeatGroup.locator('summary').click();
+  const repeatGroup = repeatButton.locator('xpath=ancestor::details[contains(@class,"requests-disclosure")][1]');
+  const repeatDetails = repeatButton.locator('xpath=ancestor::details[contains(@class,"task-secondary-details")][1]');
+  if (!await repeatGroup.evaluate(element => element.open)) await repeatGroup.locator(':scope > summary').click();
+  if (await repeatDetails.count() && !await repeatDetails.evaluate(element => element.open)) await repeatDetails.locator(':scope > summary').click();
   await repeatButton.click();
   assert(await page.locator('#qrEditId').inputValue() === '', 'Repeat request reused the old request identity.');
   assert(await page.locator('#qrService').inputValue() === repeatSource.serviceValue, 'Repeat request lost the selected service.');
@@ -441,6 +450,8 @@ async function clickAdminTab(page, tab) {
   await page.reload({ waitUntil: 'domcontentloaded' });
   await clickUserNav(page, 'myAccount');
   assert(await page.locator('.loyalty-card-v40 [role="progressbar"]').count(), 'Clear loyalty progress bar is missing.');
+  assert(await page.locator('.loyalty-card-v40.is-points-only').count(), 'Loyalty must default to a points balance until management activates a campaign.');
+  assert(!/المكافأة التالية|next reward/i.test(await page.locator('.loyalty-card-v40').innerText()), 'Loyalty promises an unapproved fixed reward.');
   await page.locator('[data-action="openAppearance"]').click();
   await page.locator('[data-action="setTheme"][data-value="dark"]').click();
   assert(await page.locator('body').getAttribute('data-theme') === 'dark', 'Dark theme was not applied immediately.');
@@ -611,7 +622,7 @@ async function clickAdminTab(page, tab) {
     assert(await page.locator('#modalRoot .notification-disclosure').count(), 'Unexpected modal blocked offer comparison.');
     await page.locator('#modalRoot [data-action="closeModal"]').first().click();
   }
-  await page.locator('.requests-disclosure').first().locator('summary').click();
+  await page.locator('.requests-disclosure').first().locator(':scope > summary').click();
   await page.locator('[data-action="compareRequestOffers"]').first().click();
   assert(await page.locator('.offer-card').count(), 'Offer comparison card is missing.');
   await capture(page, '04-offer-comparison');
@@ -622,22 +633,30 @@ async function clickAdminTab(page, tab) {
   assert(await page.locator('.chat-message.theirs').filter({ hasText: /شكراً لاختيار عرضي|Thank you for choosing my offer/i }).count(), 'Automatic provider welcome message is missing.');
   await page.locator('[data-action="closeModal"]').click();
 
-  await page.locator('.requests-disclosure').first().locator('summary').click();
+  await page.locator('.requests-disclosure').first().locator(':scope > summary').click();
   assert(await page.locator('.request-offer-summary').count() === 0, 'Offer comparison remained visible after selecting a provider.');
   assert(await page.locator('[data-action="compareRequestOffers"]').count() === 0, 'Compare action remained available after offer selection.');
   assert(await page.locator('[data-action="manageRequestContact"]').count(), 'Contact privacy control is missing after provider selection.');
   assert(await page.locator('[data-action="openRequestChat"]').count(), 'In-app chat did not remain available after provider selection.');
   assert(await page.locator('[data-action="requestWhatsapp"]').count() === 0, 'WhatsApp must stay hidden before customer consent.');
   assert(await page.locator('[data-action="requestCall"]').count() === 0, 'Phone calls must stay hidden before customer consent.');
-  await page.locator('[data-action="manageRequestContact"]').first().click();
+  assert(await page.locator('[data-action="startCustomerRequest"]').count() === 0, 'Work can start before both parties confirm the agreement.');
+  assert(await page.locator('[data-action="editRequestAgreement"]').count(), 'Accepted request does not guide the customer to confirm the agreement.');
+  const contactControl = page.locator('[data-action="manageRequestContact"]').first();
+  const contactDetails = contactControl.locator('xpath=ancestor::details[contains(@class,"task-secondary-details")][1]');
+  if (!await contactControl.isVisible() && await contactDetails.count()) await contactDetails.locator(':scope > summary').click();
+  await contactControl.click();
   assert(await page.locator('#contactAllowChat').isChecked(), 'In-app chat consent was not enabled by offer selection.');
   await page.locator('#contactAllowWhatsapp').check();
   await page.locator('#contactAllowCall').check();
   await page.locator('[data-action="saveRequestContactConsent"]').click();
-  await page.locator('.requests-disclosure').first().locator('summary').click();
+  await page.locator('.requests-disclosure').first().locator(':scope > summary').click();
   assert(await page.locator('[data-action="requestWhatsapp"]').count(), 'WhatsApp was not enabled after customer consent.');
   assert(await page.locator('[data-action="requestCall"]').count(), 'Phone calls were not enabled after customer consent.');
-  await page.locator('[data-action="openRequestChat"]').first().click();
+  const chatAction = page.locator('[data-action="openRequestChat"]').first();
+  const chatDetails = chatAction.locator('xpath=ancestor::details[contains(@class,"task-secondary-details")][1]');
+  if (!await chatAction.isVisible() && await chatDetails.count()) await chatDetails.locator(':scope > summary').click();
+  await chatAction.click();
   const chatViewportFit = await page.locator('.chat-sheet').evaluate(sheet => {
     const rect = sheet.getBoundingClientRect();
     const composer = sheet.querySelector('.chat-composer')?.getBoundingClientRect();
@@ -699,6 +718,28 @@ async function clickAdminTab(page, tab) {
   await page.locator('[data-action="closeModal"]').click();
   assert(await page.evaluate(() => !window.__khadamatiChatPoll), 'Chat automatic refresh continued after closing the conversation.');
 
+  await page.evaluate(() => {
+    const key = 'KHADAMATI_PRIVATE_STATE_V1';
+    const state = JSON.parse(sessionStorage.getItem(key) || '{}');
+    const request = state.customerRequests?.find(item => item.acceptedProviderId);
+    if (!request) throw new Error('Accepted request is missing before agreement check.');
+    request.status = 'appointmentConfirmed';
+    request.agreement = {
+      version: 1,
+      status: 'confirmed',
+      appointmentAt: '2026-08-18T15:30',
+      durationMinutes: 90,
+      priceAmount: 12,
+      locationText: `${request.gov || ''}، ${request.wilayah || ''}`,
+      userConfirmed: true,
+      providerConfirmed: true,
+      updatedAt: new Date().toISOString(),
+    };
+    sessionStorage.setItem(key, JSON.stringify(state));
+  });
+  await page.reload({ waitUntil: 'domcontentloaded' });
+  await clickUserNav(page, 'tasks');
+  assert(await page.locator('[data-action="startCustomerRequest"]').count() === 1, 'Confirmed agreement must expose exactly one start-work action.');
   await page.locator('[data-action="startCustomerRequest"]').first().click();
   await page.waitForFunction(() => {
     const card = document.querySelector('[data-request-card]');
@@ -710,11 +751,15 @@ async function clickAdminTab(page, tab) {
     'Request did not move to in-progress after work started.',
   );
 
+  const calendarAction = page.locator('[data-action="addRequestCalendar"]').first();
+  const calendarDetails = calendarAction.locator('xpath=ancestor::details[contains(@class,"task-secondary-details")][1]');
+  if (!await calendarAction.isVisible() && await calendarDetails.count()) await calendarDetails.locator(':scope > summary').click();
   const downloadPromise = page.waitForEvent('download');
-  await page.locator('[data-action="addRequestCalendar"]').first().click();
+  await calendarAction.click();
   const calendarDownload = await downloadPromise;
   assert((await calendarDownload.suggestedFilename()).endsWith('.ics'), 'Calendar export is not an ICS file.');
 
+  await clickUserNav(page, 'myAccount');
   await page.locator('.account-menu [data-action="providerMode"], .account-menu [data-action="nav"][data-view="provider"]').first().click();
   await page.locator('.provider-top-actions [data-action="openNotifications"]').click();
   assert(await page.locator('.notification-center-tab').count() === 2, 'Notification center must keep only requests and updates.');
@@ -734,7 +779,11 @@ async function clickAdminTab(page, tab) {
   await page.locator('.side-nav [data-action="providerTab"][data-tab="tasks"]').click();
   assert(await page.locator('.provider-active-jobs .provider-task-card').count(), 'Accepted request is missing from provider active jobs.');
   assert(await page.locator('.provider-active-jobs [data-action="providerAcceptRequest"]').count() === 0, 'Provider can still submit an offer after being selected.');
-  await page.locator('[data-action="openRequestChat"]').first().click();
+  assert(await page.locator('.provider-active-jobs [data-action="openCompletionEvidence"]').count() === 1, 'Provider active job must expose exactly one completion action.');
+  const providerChatAction = page.locator('.provider-active-jobs [data-action="openRequestChat"]').first();
+  const providerTaskDetails = providerChatAction.locator('xpath=ancestor::details[contains(@class,"task-secondary-details")][1]');
+  if (!await providerChatAction.isVisible() && await providerTaskDetails.count()) await providerTaskDetails.locator(':scope > summary').click();
+  await providerChatAction.click();
   assert(await page.locator('[data-action="providerCustomerWhatsapp"]').count(), 'Selected provider cannot use customer-approved WhatsApp.');
   assert(await page.locator('[data-action="providerCustomerCall"]').count(), 'Selected provider cannot use customer-approved calls.');
   await page.locator('#chatText').fill('رسالة متابعة من سالم البلوشي');
@@ -759,15 +808,15 @@ async function clickAdminTab(page, tab) {
   await capture(page, '07-provider-media');
 
   await page.locator('.provider-top-actions [data-action="switchAccountMode"]').click();
-  await page.locator('.app-top [data-action="openConversations"]').click();
-  await page.waitForSelector('.conversation-hub-sheet .conversation-card');
-  const userConversation = page.locator('.conversation-card').first();
+  await clickUserNav(page, 'conversations');
+  await page.waitForSelector('.conversation-page-list .conversation-card');
+  const userConversation = page.locator('.conversation-page-list .conversation-card').first();
   assert((await userConversation.textContent()).includes('سالم البلوشي'), 'User conversation does not identify the provider.');
   await userConversation.click();
   await page.waitForSelector('.chat-sheet #chatThread');
-  assert(await page.locator('.chat-profile-identity b').filter({ hasText: /سالم البلوشي/i }).count(), 'User conversation hub did not open the correct chat directly.');
+  assert(await page.locator('.chat-profile-identity b').filter({ hasText: /سالم البلوشي/i }).count(), 'User conversation page did not open the correct chat directly.');
   await page.locator('.chat-sheet [data-action="closeModalSoft"]').click();
-  await page.locator('.conversation-hub-sheet [data-action="closeModal"]').click();
+  assert(await page.locator('.conversation-page-list .conversation-card').count(), 'Closing the chat did not restore the user conversation page.');
   await clickUserNav(page, 'search');
   await page.waitForTimeout(600);
   if (await page.locator('#modalRoot .modal-backdrop.show').count()) {
@@ -867,6 +916,8 @@ async function clickAdminTab(page, tab) {
   assert(await page.locator('[data-action="openAssistant"]').count() === 0, 'The obsolete assistant test control is still visible in administration.');
   await clickAdminTab(page, 'settings');
   assert(await page.locator('.operations-settings').count(), 'Platform operations settings are missing.');
+  assert(await page.locator('[data-action="togglePlatformSetting"][data-key="loyaltyCampaignActive"]').count(), 'Management cannot activate or pause loyalty campaigns.');
+  assert(await page.locator('#setLoyaltyTarget').count(), 'Management cannot configure the loyalty campaign target.');
   await clickAdminTab(page, 'ads');
   await page.locator('#adImages').setInputFiles(path.join(__dirname, '..', 'app-icon-512.png'));
   await page.locator('[data-action="previewAdDraft"]').click();

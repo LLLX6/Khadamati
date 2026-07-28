@@ -70,7 +70,7 @@ def environment_flag(name, default=False):
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
-APP_RELEASE = os.environ.get("KHADAMATI_RELEASE", "v65").strip() or "v65"
+APP_RELEASE = os.environ.get("KHADAMATI_RELEASE", "v66").strip() or "v66"
 DEMO_DATA_ENABLED = environment_flag(
     "KHADAMATI_SEED_DEMO_DATA", APP_ENV in {"development", "test"}
 )
@@ -1128,6 +1128,13 @@ def init_db():
                 "maxHomeCategories": 6,
                 "maxPopularServices": 4,
                 "maxHomeProviders": 2,
+                "loyaltyEnabled": True,
+                "loyaltyCampaignActive": False,
+                "loyaltyTargetPoints": 100,
+                "loyaltyCampaignAr": "مكافأة خدماتي",
+                "loyaltyCampaignEn": "Khadamati reward",
+                "loyaltyCampaignNoteAr": "تحدد الإدارة تفاصيل المكافأة عند تفعيل الحملة.",
+                "loyaltyCampaignNoteEn": "Reward details are set by management when the campaign is active.",
             }),),
         )
         platform_row = con.execute("SELECT value FROM settings WHERE key='platform'").fetchone()
@@ -1139,6 +1146,13 @@ def init_db():
         platform_settings["currency"] = OMR
         platform_settings.setdefault("subscriptionGraceDays", 14)
         platform_settings.setdefault("expiryThresholds", [30, 14, 7, 1, 0])
+        platform_settings.setdefault("loyaltyEnabled", True)
+        platform_settings.setdefault("loyaltyCampaignActive", False)
+        platform_settings.setdefault("loyaltyTargetPoints", 100)
+        platform_settings.setdefault("loyaltyCampaignAr", "مكافأة خدماتي")
+        platform_settings.setdefault("loyaltyCampaignEn", "Khadamati reward")
+        platform_settings.setdefault("loyaltyCampaignNoteAr", "تحدد الإدارة تفاصيل المكافأة عند تفعيل الحملة.")
+        platform_settings.setdefault("loyaltyCampaignNoteEn", "Reward details are set by management when the campaign is active.")
         con.execute("UPDATE settings SET value=? WHERE key='platform'", (jdump(platform_settings),))
         if con.execute("SELECT COUNT(*) n FROM admin_users").fetchone()["n"] == 0 and INITIAL_ADMIN_CODE:
             con.execute(
@@ -2365,6 +2379,8 @@ def get_bootstrap(session=None):
             "nameAr", "nameEn", "defaultGov", "adIntervalSeconds", "displayScale",
             "uiMode", "maxHomeProviders", "maxPopularServices", "maxRequestMatches",
             "loyaltyEnabled", "requestBoardEnabled", "contactApprovalRequired",
+            "loyaltyCampaignActive", "loyaltyTargetPoints", "loyaltyCampaignAr",
+            "loyaltyCampaignEn", "loyaltyCampaignNoteAr", "loyaltyCampaignNoteEn",
             "subscriptionsEnabled", "paymentGatewayEnabled", "serviceAreas",
             "deviceNotifications", "mergeNotifications",
         }
