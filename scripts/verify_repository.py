@@ -6,7 +6,9 @@ import hashlib
 import json
 from pathlib import Path
 import re
-import subprocess
+import shutil
+# Required for one fixed, local Git inspection command.
+import subprocess  # nosec B404
 import sys
 
 
@@ -40,8 +42,12 @@ def digest(path: Path) -> str:
 
 
 def tracked_files() -> list[str]:
-    result = subprocess.run(
-        ["git", "ls-files", "--cached", "--others", "--exclude-standard", "-z"],
+    git_binary = shutil.which("git")
+    if not git_binary:
+        raise RuntimeError("Git executable is required to verify tracked files.")
+    # The executable is resolved locally and every argument is constant.
+    result = subprocess.run(  # nosec B603
+        [git_binary, "ls-files", "--cached", "--others", "--exclude-standard", "-z"],
         cwd=ROOT,
         check=True,
         capture_output=True,

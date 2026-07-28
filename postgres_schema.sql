@@ -322,7 +322,7 @@ ALTER TABLE leads ADD COLUMN IF NOT EXISTS service_name TEXT DEFAULT '';
 ALTER TABLE leads ADD COLUMN IF NOT EXISTS gov TEXT DEFAULT '';
 ALTER TABLE leads ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'open';
 
--- Khadamati subscription, consent, marketplace, and security domain (v41).
+-- Khadamati subscription, consent, marketplace, and security domain.
 ALTER TABLE providers ADD COLUMN IF NOT EXISTS before_after JSONB DEFAULT '[]';
 ALTER TABLE providers ADD COLUMN IF NOT EXISTS intro_video_url TEXT DEFAULT '';
 ALTER TABLE providers ADD COLUMN IF NOT EXISTS listing_enabled BOOLEAN NOT NULL DEFAULT TRUE;

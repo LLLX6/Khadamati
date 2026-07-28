@@ -57,7 +57,7 @@ def scalar(con: sqlite3.Connection, query: str) -> int:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("database", type=Path)
-    parser.add_argument("--allow-demo-data", action="store_true")
+    parser.add_argument("--allow-sample-data", action="store_true")
     args = parser.parse_args()
     database = args.database.resolve()
     if not database.is_file():
@@ -85,7 +85,7 @@ def main() -> int:
             ),
         }
         orphans = {name: scalar(con, query) for name, query in ORPHAN_CHECKS.items()}
-        demo_rows = scalar(
+        sample_rows = scalar(
             con,
             """SELECT COUNT(*) FROM providers
             WHERE id IN ('p1','p2','p3','p4','p5','p6',
@@ -101,8 +101,8 @@ def main() -> int:
         errors.append("duplicate_identity")
     if any(orphans.values()):
         errors.append("orphan_records")
-    if demo_rows and not args.allow_demo_data:
-        errors.append("demo_provider_rows_present")
+    if sample_rows and not args.allow_sample_data:
+        errors.append("sample_provider_rows_present")
 
     result = {
         "ok": not errors,
@@ -112,7 +112,7 @@ def main() -> int:
         "tables": tables,
         "duplicates": duplicates,
         "orphans": orphans,
-        "demoProviderRows": demo_rows,
+        "sampleProviderRows": sample_rows,
         "errors": errors,
     }
     print(json.dumps(result, ensure_ascii=False, indent=2))

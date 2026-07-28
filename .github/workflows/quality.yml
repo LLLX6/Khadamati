@@ -29,12 +29,14 @@ jobs:
         run: python -m pip install -r requirements.txt
       - name: Audit Python dependencies
         run: |
-          python -m pip install pip-audit==2.10.1
+          python -m pip install pip-audit==2.10.1 bandit==1.8.6
           python -m pip_audit -r requirements.txt --no-deps --disable-pip
+      - name: Scan Python source
+        run: python -m bandit -q -r server.py khadamati_domain.py khadamati_workflow.py scripts -x scripts/__pycache__
       - name: Verify repository
         run: python scripts/verify_repository.py
       - name: Compile Python
-        run: python -m py_compile server.py khadamati_domain.py export_khadamati_data.py tests/*.py scripts/*.py
+        run: python -m py_compile server.py khadamati_domain.py khadamati_workflow.py export_khadamati_data.py tests/*.py scripts/*.py
       - name: Unit tests
         run: python -m unittest discover -s tests -p "test_*.py" -v
       - name: Security API tests
@@ -62,7 +64,11 @@ jobs:
         run: npx playwright install --with-deps chromium
       - name: Check JavaScript syntax
         run: npm run check:js
-      - name: Mobile UI smoke test
-        run: npm run test:ui
+      - name: Responsive UI smoke matrix
+        run: |
+          for size in "320 740" "375 812" "390 844" "430 932" "1280 800"; do
+            set -- $size
+            KHADAMATI_VIEWPORT_WIDTH="$1" KHADAMATI_VIEWPORT_HEIGHT="$2" npm run test:ui
+          done
       - name: Local launch performance
         run: npm run test:performance

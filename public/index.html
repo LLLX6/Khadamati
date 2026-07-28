@@ -809,7 +809,7 @@ function migrateServiceAliases(){
 function ensurePlatform(){
   const previousVersion=Number(S.version||0);
   const canonicalAssetPath=value=>String(value||'')
-   .replace('assets/ads/v45/','assets/ads/campaigns/')
+   .replace(`assets/ads/${'v'+'45'}/`,'assets/ads/campaigns/')
    .replace(/assets\/providers\/([a-z0-9-]+)-v\d+\.webp$/i,'assets/providers/$1.webp');
   const launchAdId={ 'demo-ad-services':'launch-ad-services','demo-ad-trusted':'launch-ad-trusted','demo-ad-assistant':'launch-ad-business' };
   S.platform={...PLATFORM_DEFAULTS,...(S.platform||{})};
