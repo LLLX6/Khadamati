@@ -566,7 +566,7 @@ async function clickAdminTab(page, tab) {
   await page.locator('.image-editor-modern [data-action="closeImageEditor"]').click();
   assert(await page.locator('.image-input-previews[data-for="regAvatar"] [data-action="editSelectedImage"]').count(), 'Uploaded image preview is missing its edit action.');
   assert(await page.locator('.image-input-previews[data-for="regAvatar"] [data-action="removeSelectedImage"]').count(), 'Uploaded image preview is missing its delete action.');
-  await page.locator('#regProviderType').selectOption('company');
+  await page.locator('[data-action="setProviderRegisterType"][data-value="company"]').click();
   assert(await page.locator('[data-action="addRegistrationSubservice"]').isVisible(), 'Company registration must offer plan-limited services.');
   await page.locator('[data-action="addRegistrationSubservice"]').click();
   assert(await page.locator('#providerRegisterForm .registration-subservice.show').count() === 3, 'Company add-service should reveal one optional field at a time while preserving existing choices.');
@@ -576,7 +576,7 @@ async function clickAdminTab(page, tab) {
   await page.locator('[data-action="openProviderAccess"][data-mode="register"]').click();
   const registrationHasArabic = async () => page.locator('#providerRegisterForm').evaluate(form => [...form.querySelectorAll('label,button,option,[placeholder],.account-type-note,.upload-hint,h3')].some(element => /[\u0600-\u06ff]/.test((element.getAttribute('placeholder') || element.textContent || '').trim())));
   assert(!(await registrationHasArabic()), 'English individual-provider registration still contains Arabic interface labels.');
-  await page.locator('#regProviderType').selectOption('company');
+  await page.locator('[data-action="setProviderRegisterType"][data-value="company"]').click();
   assert(!(await registrationHasArabic()), 'English company registration still contains Arabic interface labels.');
   assert(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth + 1), 'English provider registration overflows horizontally.');
   await page.locator('#modalRoot [data-action="closeModal"]').click();
@@ -773,7 +773,7 @@ async function clickAdminTab(page, tab) {
   await page.waitForSelector('.voice-ready:not(:empty)');
   assert(await page.locator('[data-action="reRecordChatAudio"]').count() === 1, 'Voice preview cannot be re-recorded.');
   await page.locator('[data-action="sendChatAudio"]').click();
-  await page.waitForSelector('.chat-message.mine audio');
+  await page.waitForSelector('.chat-message.mine .voice-note-player');
   await capture(page, '05-request-chat', { fullPage: false });
   await page.locator('[data-action="closeModal"]').click();
   assert(await page.evaluate(() => !window.__khadamatiChatPoll), 'Chat automatic refresh continued after closing the conversation.');

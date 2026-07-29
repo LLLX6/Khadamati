@@ -7141,11 +7141,16 @@ class Handler(SimpleHTTPRequestHandler):
                     account_kind = recovery["account_kind"]
                 if account_kind not in {"user", "provider"} or not account_id:
                     return self.send_json({"error": "invalid_recovery_account"}, 400)
-                table = "providers" if account_kind == "provider" else "app_users"
-                account = con.execute(
-                    f"SELECT id,name,phone FROM {table} WHERE id=?",
-                    (account_id,),
-                ).fetchone()
+                if account_kind == "provider":
+                    account = con.execute(
+                        "SELECT id,name,phone FROM providers WHERE id=?",
+                        (account_id,),
+                    ).fetchone()
+                else:
+                    account = con.execute(
+                        "SELECT id,name,phone FROM app_users WHERE id=?",
+                        (account_id,),
+                    ).fetchone()
                 if not account:
                     return self.send_json({"error": "account_not_found"}, 404)
                 temporary_code = f"{secrets.randbelow(1_000_000):06d}"
