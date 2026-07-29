@@ -1,6 +1,7 @@
 {
   "name": "خدماتي | Khadamati App",
   "short_name": "خدماتي",
+  "version": "1.0.1",
   "id": "./",
   "start_url": "./",
   "scope": "./",

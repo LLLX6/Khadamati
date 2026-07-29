@@ -109,6 +109,76 @@ def main():
         for item in scoped_admin.get("notifications", [])
     ), "Admin session received account-scoped notifications"
 
+    catalog_category = "smoke-catalog"
+    catalog_service = "smoke-service"
+    status, catalog_saved = request(
+        "/api/admin/catalog",
+        {
+            "action": "save_category",
+            "categoryId": catalog_category,
+            "ar": "قسم فحص",
+            "en": "Smoke category",
+            "icon": "grid",
+        },
+        admin_token,
+    )
+    expect(status, catalog_saved, {200}, "Catalog category creation failed")
+    status, catalog_service_saved = request(
+        "/api/admin/catalog",
+        {
+            "action": "save_service",
+            "categoryId": catalog_category,
+            "serviceId": catalog_service,
+            "ar": "خدمة فحص",
+            "en": "Smoke service",
+            "icon": "tools",
+        },
+        admin_token,
+    )
+    expect(status, catalog_service_saved, {200}, "Catalog service creation failed")
+    status, catalog_paused = request(
+        "/api/admin/catalog",
+        {
+            "action": "set_service_active",
+            "categoryId": catalog_category,
+            "serviceId": catalog_service,
+            "active": False,
+        },
+        admin_token,
+    )
+    expect(status, catalog_paused, {200}, "Catalog service pause failed")
+    paused_category = next(
+        item
+        for item in catalog_paused["categories"]
+        if item["id"] == catalog_category
+    )
+    assert next(
+        item for item in paused_category["services"] if item["id"] == catalog_service
+    )["active"] is False, "Paused catalog state was not persisted"
+    status, catalog_deleted = request(
+        "/api/admin/catalog",
+        {
+            "action": "delete_service",
+            "categoryId": catalog_category,
+            "serviceId": catalog_service,
+        },
+        admin_token,
+    )
+    expect(status, catalog_deleted, {200}, "Unused catalog service deletion failed")
+    status, catalog_category_deleted = request(
+        "/api/admin/catalog",
+        {"action": "delete_category", "categoryId": catalog_category},
+        admin_token,
+    )
+    expect(
+        status, catalog_category_deleted, {200},
+        "Unused catalog category deletion failed",
+    )
+    assert not any(
+        item["id"] == catalog_category
+        for item in catalog_category_deleted["categories"]
+    ), "Deleted catalog category remained visible"
+
     status, headers, report_csv = raw_request("/api/reports/summary.csv?lang=ar", admin_token)
     assert status == 200 and report_csv.startswith(b"\xef\xbb\xbf"), "Arabic CSV report is not UTF-8 BOM encoded"
     decoded_report = report_csv.decode("utf-8-sig")
@@ -440,6 +510,32 @@ def main():
     assert duplicate_create["request"]["id"] == request_id, (
         "Idempotent retry created a different request"
     )
+    delete_payload = dict(request_payload)
+    delete_payload["idempotencyKey"] = "smoke-request-delete-1"
+    delete_payload["note"] = "طلب مستقل لاختبار الحذف الآمن"
+    status, delete_created = request(
+        "/api/user/requests", delete_payload, user_token
+    )
+    expect(status, delete_created, {201}, "Deletable request creation failed")
+    delete_request_id = delete_created["request"]["id"]
+    status, deleted_request = request(
+        "/api/user/requests",
+        {"id": delete_request_id, "action": "delete"},
+        user_token,
+    )
+    expect(status, deleted_request, {200}, "Request deletion failed")
+    status, user_after_delete = request("/api/bootstrap", token=user_token)
+    expect(status, user_after_delete, {200}, "User refresh after deletion failed")
+    assert not any(
+        item.get("id") == delete_request_id
+        for item in user_after_delete.get("customerRequests", [])
+    ), "Deleted request remained in user requests"
+    status, public_after_delete = request("/api/bootstrap")
+    expect(status, public_after_delete, {200}, "Public refresh after deletion failed")
+    assert not any(
+        item.get("id") == delete_request_id
+        for item in public_after_delete.get("marketplaceRequests", [])
+    ), "Deleted request remained on the public request board"
     assert created.get("matchedProviders", 0) >= 1, "Exact matching returned no providers"
     assert created.get("notifiedProviders", 0) >= 1, (
         "Matching request was saved but not delivered to an eligible provider"
@@ -663,6 +759,16 @@ def main():
     assert not consent.get("whatsapp") and not consent.get("call"), (
         "Phone channels opened without separate customer consent"
     )
+    status, accepted_delete = request(
+        "/api/user/requests",
+        {"id": request_id, "action": "delete"},
+        user_token,
+    )
+    expect(
+        status, accepted_delete, {409},
+        "Accepted request deletion was not rejected",
+    )
+    assert accepted_delete.get("error") == "accepted_request_cannot_be_deleted"
     welcome = selected["request"].get("messages", [])[-1]
     assert welcome.get("sender") == "provider" and welcome.get("systemGenerated"), (
         "Provider welcome message was not created"

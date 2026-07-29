@@ -70,7 +70,7 @@ def environment_flag(name, default=False):
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
-APP_RELEASE = os.environ.get("KHADAMATI_RELEASE", "v1.0.0").strip() or "v1.0.0"
+APP_RELEASE = os.environ.get("KHADAMATI_RELEASE", "v1.0.1").strip() or "v1.0.1"
 SAMPLE_DATA_ENABLED = environment_flag(
     "KHADAMATI_SEED_SAMPLE_DATA",
     environment_flag("KHADAMATI_SEED_DEMO_DATA", APP_ENV in {"development", "test"}),
@@ -360,7 +360,8 @@ def normalized_provider_services(
             continue
         exists = con.execute(
             """SELECT s.id FROM services s JOIN categories c ON c.id=s.category_id
-            WHERE s.id=? AND s.category_id=? AND s.active=1 AND c.active=1""",
+            WHERE s.id=? AND s.category_id=? AND s.active=1 AND c.active=1
+            AND COALESCE(s.deleted_at,'')='' AND COALESCE(c.deleted_at,'')=''""",
             (service_id, cat_id),
         ).fetchone()
         if not exists:
@@ -1032,6 +1033,8 @@ def init_db():
         ensure_column(con, "reviews", "moderation_reason", "TEXT DEFAULT ''")
         ensure_column(con, "complaints", "request_id", "TEXT DEFAULT ''")
         ensure_column(con, "complaints", "user_id", "TEXT DEFAULT ''")
+        ensure_column(con, "categories", "deleted_at", "TEXT DEFAULT ''")
+        ensure_column(con, "services", "deleted_at", "TEXT DEFAULT ''")
         for c in SEED_CATEGORIES:
             con.execute(
                 "INSERT OR IGNORE INTO categories(id,icon,ar,en,active) VALUES(?,?,?,?,?)",
@@ -2318,15 +2321,63 @@ def run_domain_maintenance(con):
     return {"stateChanges": len(state_changes), "releasedRequests": len(released)}
 
 
+def catalog_snapshot(con):
+    categories = []
+    for category in con.execute(
+        """SELECT id,icon,ar,en,active FROM categories
+        WHERE COALESCE(deleted_at,'')='' ORDER BY rowid"""
+    ):
+        item = dict(category)
+        item["active"] = bool(item["active"])
+        item["services"] = [
+            dict(service) | {"active": bool(service["active"])}
+            for service in con.execute(
+                """SELECT id,icon,ar,en,active FROM services
+                WHERE category_id=? AND COALESCE(deleted_at,'')='' ORDER BY rowid""",
+                (category["id"],),
+            )
+        ]
+        categories.append(item)
+    return categories
+
+
+def catalog_reference_count(con, category_id, service_id=""):
+    service_value = f"{category_id}|{service_id}" if service_id else ""
+    request_sql = (
+        "SELECT COUNT(*) n FROM customer_requests "
+        "WHERE status!='deleted' AND service_value=?"
+        if service_id
+        else "SELECT COUNT(*) n FROM customer_requests "
+        "WHERE status!='deleted' AND service_value LIKE ?"
+    )
+    request_value = service_value if service_id else f"{category_id}|%"
+    count = int(con.execute(request_sql, (request_value,)).fetchone()["n"] or 0)
+    lead_sql = (
+        "SELECT COUNT(*) n FROM leads WHERE status!='deleted' AND service_value=?"
+        if service_id
+        else "SELECT COUNT(*) n FROM leads WHERE status!='deleted' AND service_value LIKE ?"
+    )
+    count += int(con.execute(lead_sql, (request_value,)).fetchone()["n"] or 0)
+    for row in con.execute("SELECT services FROM providers"):
+        for item in jload(row["services"], []):
+            if not isinstance(item, dict) or item.get("catId") != category_id:
+                continue
+            if not service_id or item.get("serviceId") == service_id:
+                count += 1
+    for row in con.execute("SELECT payload FROM provider_requests"):
+        payload = jload(row["payload"], {})
+        for item in payload.get("services", []) if isinstance(payload, dict) else []:
+            if not isinstance(item, dict) or item.get("catId") != category_id:
+                continue
+            if not service_id or item.get("serviceId") == service_id:
+                count += 1
+    return count
+
+
 def get_bootstrap(session=None):
     with db() as con:
         maintenance = run_domain_maintenance(con)
-        categories = []
-        for c in con.execute("SELECT * FROM categories ORDER BY rowid"):
-            cd = dict(c)
-            cd["active"] = bool(cd["active"])
-            cd["services"] = [dict(s) | {"active": bool(s["active"])} for s in con.execute("SELECT id,icon,ar,en,active FROM services WHERE category_id=? ORDER BY rowid", (c["id"],))]
-            categories.append(cd)
+        categories = catalog_snapshot(con)
         is_admin = bool(session and session.get("kind") == "admin")
         is_provider = bool(session and session.get("kind") == "provider")
         is_pending_provider = bool(session and session.get("kind") == "provider_pending")
@@ -2431,7 +2482,10 @@ def get_bootstrap(session=None):
             complaints, subscriptions, payments, audits, leads = [], [], [], [], []
         all_customer_requests = [
             row_customer_request(r, sign_private=bool(is_admin or is_provider or is_user))
-            for r in con.execute("SELECT * FROM customer_requests ORDER BY created_at DESC LIMIT 300")
+            for r in con.execute(
+                """SELECT * FROM customer_requests
+                WHERE status!='deleted' ORDER BY created_at DESC LIMIT 300"""
+            )
         ]
         marketplace_requests = [
             marketplace_request(item, include_note=is_user)
@@ -2588,7 +2642,9 @@ def get_bootstrap(session=None):
             "qualityAverage": round(con.execute("SELECT COALESCE(AVG(quality_score),0) n FROM providers").fetchone()["n"], 1),
             "whatsappLogs": con.execute("SELECT COUNT(*) n FROM whatsapp_logs").fetchone()["n"],
             "users": con.execute("SELECT COUNT(*) n FROM app_users WHERE status='active'").fetchone()["n"],
-            "customerRequests": con.execute("SELECT COUNT(*) n FROM customer_requests").fetchone()["n"],
+            "customerRequests": con.execute(
+                "SELECT COUNT(*) n FROM customer_requests WHERE status!='deleted'"
+            ).fetchone()["n"],
             "unavailableRequests": con.execute(
                 "SELECT COUNT(*) n FROM customer_requests WHERE status='unavailable'"
             ).fetchone()["n"],
@@ -4391,6 +4447,10 @@ class Handler(SimpleHTTPRequestHandler):
                     if action in ("cancel", "delete", "pause", "archive"):
                         if action == "archive" and not current["accepted_provider_id"]:
                             return self.send_json({"error": "accepted_provider_required"}, 409)
+                        if action == "delete" and current["accepted_provider_id"]:
+                            return self.send_json(
+                                {"error": "accepted_request_cannot_be_deleted"}, 409
+                            )
                         next_status = {
                             "cancel": "cancelled", "delete": "deleted", "pause": "paused",
                             "archive": "archived",
@@ -4408,6 +4468,34 @@ class Handler(SimpleHTTPRequestHandler):
                             from_status=current["status"],
                             to_status=next_status,
                         )
+                        if action == "delete":
+                            con.execute(
+                                "DELETE FROM request_dispatches WHERE request_id=?",
+                                (request_id,),
+                            )
+                            con.execute(
+                                """UPDATE request_provider_suggestions
+                                SET status='deleted',deleted_at=CURRENT_TIMESTAMP,
+                                updated_at=CURRENT_TIMESTAMP WHERE request_id=?""",
+                                (request_id,),
+                            )
+                            con.execute(
+                                """UPDATE contact_consents SET status='revoked',
+                                revoked_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP
+                                WHERE request_id=?""",
+                                (request_id,),
+                            )
+                            con.execute(
+                                "DELETE FROM app_notifications WHERE related_id=?",
+                                (request_id,),
+                            )
+                            log_audit(
+                                con, session, "request.deleted", request_id,
+                                current["service_value"],
+                            )
+                            return self.send_json(
+                                {"ok": True, "status": next_status, "id": request_id}
+                            )
                         create_notification(
                             con, "admin", "", "تم تحديث طلب",
                             f"الطلب {request_id}", type_="request", related_id=request_id,
@@ -4453,7 +4541,8 @@ class Handler(SimpleHTTPRequestHandler):
                 cat_id, service_id = service_value.split("|", 1)
                 service_row = con.execute(
                     """SELECT s.ar,s.en FROM services s JOIN categories c ON c.id=s.category_id
-                    WHERE s.id=? AND s.category_id=? AND s.active=1 AND c.active=1""",
+                    WHERE s.id=? AND s.category_id=? AND s.active=1 AND c.active=1
+                    AND COALESCE(s.deleted_at,'')='' AND COALESCE(c.deleted_at,'')=''""",
                     (safe_text(service_id, 80), safe_text(cat_id, 80)),
                 ).fetchone()
                 if not service_row:
@@ -6150,6 +6239,7 @@ class Handler(SimpleHTTPRequestHandler):
             "/api/admin/contact-consents": "manage_consent",
             "/api/admin/recovery-code": "manage_admins",
             "/api/admin/settings": "manage_settings",
+            "/api/admin/catalog": "manage_settings",
             "/api/admin/users": "manage_admins",
             "/api/admin/test-whatsapp": "manage_settings",
             "/api/admin/ads": "manage_settings",
@@ -6158,6 +6248,131 @@ class Handler(SimpleHTTPRequestHandler):
         if not session:
             return
         with db() as con:
+            if path == "/api/admin/catalog":
+                action = safe_text(data.get("action"), 40)
+                category_id = safe_text(data.get("categoryId") or data.get("id"), 80)
+                service_id = safe_text(data.get("serviceId"), 80)
+                valid_id = re.compile(r"^[A-Za-z0-9_-]{1,80}$")
+                if not category_id or not valid_id.fullmatch(category_id):
+                    return self.send_json({"error": "invalid_catalog_id"}, 400)
+                if action in {
+                    "save_service", "set_service_active", "delete_service"
+                } and (not service_id or not valid_id.fullmatch(service_id)):
+                    return self.send_json({"error": "invalid_catalog_id"}, 400)
+                if action == "save_category":
+                    name_ar = safe_text(data.get("ar"), 100)
+                    name_en = safe_text(data.get("en"), 100)
+                    if not name_ar or not name_en:
+                        return self.send_json({"error": "catalog_name_required"}, 400)
+                    con.execute(
+                        """INSERT INTO categories(id,icon,ar,en,active,deleted_at)
+                        VALUES(?,?,?,?,1,'') ON CONFLICT(id) DO UPDATE SET
+                        icon=excluded.icon,ar=excluded.ar,en=excluded.en,
+                        deleted_at=''""",
+                        (
+                            category_id, safe_text(data.get("icon"), 80),
+                            name_ar, name_en,
+                        ),
+                    )
+                    log_audit(
+                        con, session, "catalog.category.saved", category_id, name_ar
+                    )
+                elif action == "set_category_active":
+                    active = data.get("active")
+                    if active not in (True, False, 0, 1):
+                        return self.send_json({"error": "invalid_boolean"}, 400)
+                    result = con.execute(
+                        """UPDATE categories SET active=? WHERE id=?
+                        AND COALESCE(deleted_at,'')=''""",
+                        (int(bool(active)), category_id),
+                    )
+                    if result.rowcount != 1:
+                        return self.send_json({"error": "category_not_found"}, 404)
+                    log_audit(
+                        con, session, "catalog.category.active", category_id,
+                        "1" if active else "0",
+                    )
+                elif action == "delete_category":
+                    if catalog_reference_count(con, category_id):
+                        return self.send_json({"error": "catalog_item_in_use"}, 409)
+                    result = con.execute(
+                        """UPDATE categories SET active=0,
+                        deleted_at=CURRENT_TIMESTAMP WHERE id=?
+                        AND COALESCE(deleted_at,'')=''""",
+                        (category_id,),
+                    )
+                    if result.rowcount != 1:
+                        return self.send_json({"error": "category_not_found"}, 404)
+                    con.execute(
+                        """UPDATE services SET active=0,
+                        deleted_at=CURRENT_TIMESTAMP WHERE category_id=?""",
+                        (category_id,),
+                    )
+                    log_audit(
+                        con, session, "catalog.category.deleted", category_id, ""
+                    )
+                elif action == "save_service":
+                    category = con.execute(
+                        """SELECT id FROM categories WHERE id=?
+                        AND COALESCE(deleted_at,'')=''""",
+                        (category_id,),
+                    ).fetchone()
+                    if not category:
+                        return self.send_json({"error": "category_not_found"}, 404)
+                    name_ar = safe_text(data.get("ar"), 100)
+                    name_en = safe_text(data.get("en"), 100)
+                    if not name_ar or not name_en:
+                        return self.send_json({"error": "catalog_name_required"}, 400)
+                    con.execute(
+                        """INSERT INTO services(
+                        id,category_id,icon,ar,en,active,deleted_at)
+                        VALUES(?,?,?,?,?,1,'') ON CONFLICT(id,category_id)
+                        DO UPDATE SET icon=excluded.icon,ar=excluded.ar,
+                        en=excluded.en,deleted_at=''""",
+                        (
+                            service_id, category_id,
+                            safe_text(data.get("icon"), 80), name_ar, name_en,
+                        ),
+                    )
+                    log_audit(
+                        con, session, "catalog.service.saved",
+                        f"{category_id}|{service_id}", name_ar,
+                    )
+                elif action == "set_service_active":
+                    active = data.get("active")
+                    if active not in (True, False, 0, 1):
+                        return self.send_json({"error": "invalid_boolean"}, 400)
+                    result = con.execute(
+                        """UPDATE services SET active=? WHERE id=? AND category_id=?
+                        AND COALESCE(deleted_at,'')=''""",
+                        (int(bool(active)), service_id, category_id),
+                    )
+                    if result.rowcount != 1:
+                        return self.send_json({"error": "service_not_found"}, 404)
+                    log_audit(
+                        con, session, "catalog.service.active",
+                        f"{category_id}|{service_id}", "1" if active else "0",
+                    )
+                elif action == "delete_service":
+                    if catalog_reference_count(con, category_id, service_id):
+                        return self.send_json({"error": "catalog_item_in_use"}, 409)
+                    result = con.execute(
+                        """UPDATE services SET active=0,
+                        deleted_at=CURRENT_TIMESTAMP WHERE id=? AND category_id=?
+                        AND COALESCE(deleted_at,'')=''""",
+                        (service_id, category_id),
+                    )
+                    if result.rowcount != 1:
+                        return self.send_json({"error": "service_not_found"}, 404)
+                    log_audit(
+                        con, session, "catalog.service.deleted",
+                        f"{category_id}|{service_id}", "",
+                    )
+                else:
+                    return self.send_json({"error": "invalid_catalog_action"}, 400)
+                return self.send_json(
+                    {"ok": True, "categories": catalog_snapshot(con)}
+                )
             if path == "/api/admin/providers":
                 p = upsert_provider(con, data)
                 log_audit(con, session, "provider.upserted", p["id"], p.get("name", ""))

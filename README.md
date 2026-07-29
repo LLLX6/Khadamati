@@ -1,6 +1,6 @@
 # خدماتي | Khadamati App
 
-## الإصدار v1.0.0
+## الإصدار v1.0.1
 
 منصة عُمانية ثنائية اللغة تربط طالب الخدمة بالمزود أو الشركة، وتدير الطلب والعروض والمحادثة والاشتراك من واجهة مهيأة للهاتف أولًا.
 
@@ -92,7 +92,7 @@ http://127.0.0.1:8080
 | المتغير | الغرض |
 |---|---|
 | `KHADAMATI_ENV` | `development` أو `test` أو `production` |
-| `KHADAMATI_RELEASE` | رقم الإصدار، حاليًا `v1.0.0` |
+| `KHADAMATI_RELEASE` | رقم الإصدار، حاليًا `v1.0.1` |
 | `KHADAMATI_PUBLIC_URL` | رابط الواجهة العامة |
 | `KHADAMATI_ALLOWED_ORIGINS` | قائمة CORS المسموحة |
 | `KHADAMATI_DB_PATH` | مسار قاعدة SQLite الدائم |

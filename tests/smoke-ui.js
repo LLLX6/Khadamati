@@ -76,14 +76,22 @@ async function clickUserNav(page, view) {
 }
 
 async function clickFirstAction(page, action) {
-  let item = page.locator(`[data-action="${action}"]`).first();
-  if (!(await item.count()) && action === 'openRequestBoard') {
-    await clickUserNav(page, 'tasks');
-    item = page.locator(`[data-action="${action}"]`).first();
-  }
+  const item = page.locator(`[data-action="${action}"]`).first();
   assert(await item.count(), `No accessible action exists for ${action}.`);
   if (await item.isVisible()) await item.click();
   else await item.evaluate(element => element.click());
+}
+
+async function revealRequestAction(page, action) {
+  const item = page.locator(`[data-action="${action}"]`).first();
+  assert(await item.count(), `No request action exists for ${action}.`);
+  await item.evaluate(element => {
+    for (let parent = element.parentElement; parent; parent = parent.parentElement) {
+      if (parent.tagName === 'DETAILS') parent.open = true;
+    }
+  });
+  assert(await item.isVisible(), `Request action ${action} stayed hidden after opening its accordions.`);
+  return item;
 }
 
 async function clickAdminTab(page, tab) {
@@ -214,6 +222,9 @@ async function clickAdminTab(page, tab) {
   assert(await page.locator('#toastRoot .toast').count() === 0, 'A validation toast remained visible after successful sign-in.');
   const persistedUserAuth = await page.evaluate(() => JSON.parse(localStorage.getItem('KHADAMATI_AUTH_V3') || '{}'));
   assert(persistedUserAuth.userToken === 'ui-user-token', 'User authentication was not persisted for the next app launch.');
+  const userNavOrder = await page.locator('.bottom-nav [data-action="nav"]').evaluateAll(items => items.map(item => item.dataset.view));
+  assert(JSON.stringify(userNavOrder) === JSON.stringify(['home', 'services', 'tasks', 'requestBoard', 'myAccount']), `User bottom navigation order is incorrect: ${userNavOrder.join(', ')}`);
+  assert((await page.locator('.app-brand .brand-word > span').textContent()).trim() === 'خدماتي', 'The Arabic app name is missing from the signed-in header.');
 
   assert((await page.locator('.clean-grid .category-tile').count()) <= 6, 'Home must show no more than six categories.');
   assert(await page.locator('main.view > .home-ad.ad-slider').count(), 'Advertisement slider must be the first home block.');
@@ -334,8 +345,9 @@ async function clickAdminTab(page, tab) {
   await capture(page, '01b-progressive-search');
   await clickUserNav(page, 'home');
 
-  await clickFirstAction(page, 'openRequestBoard');
-  assert(await page.locator('.request-board-sheet').count(), 'Request board did not open.');
+  await clickUserNav(page, 'requestBoard');
+  assert(await page.locator('.request-board-view').count(), 'The standalone request board did not open.');
+  assert(await page.locator('.bottom-nav [data-view="requestBoard"][aria-current="page"]').count(), 'Request board is not represented as its own active bottom-navigation destination.');
   assert(await page.locator('.request-board-guide').count(), 'Request board guidance is missing.');
   assert(await page.locator('.request-board-guide').evaluate(element => element.getBoundingClientRect().right <= window.innerWidth + 1), 'Request board guidance overflows the mobile viewport.');
   await page.locator('.request-board-guide summary').click();
@@ -344,8 +356,6 @@ async function clickAdminTab(page, tab) {
   await recommendationGuide.evaluate(image => image.complete ? true : new Promise(resolve => image.addEventListener('load', () => resolve(true), { once: true })));
   assert(await recommendationGuide.evaluate(image => image.naturalWidth >= 900 && image.naturalHeight >= 900), 'Provider recommendation guidance is not high resolution.');
   assert(await recommendationGuide.evaluate(image => getComputedStyle(image).objectFit === 'cover'), 'Provider recommendation artwork does not fill its square frame.');
-  await page.locator('[data-action="closeModal"]').click();
-  assert(await page.locator('#modalRoot .modal-backdrop').count() === 0, 'Closing the request board left a blocking modal layer.');
   await clickUserNav(page, 'home');
   await page.locator('.direct-request-card [data-action="quickRequestForm"]').click();
   await page.waitForTimeout(150);
@@ -412,9 +422,8 @@ async function clickAdminTab(page, tab) {
   await capture(page, '01g-direct-review');
   await page.locator('[data-action="saveQuickRequest"]').click();
   await page.waitForSelector('.active-request-home');
-  await clickFirstAction(page, 'openRequestBoard');
+  await clickUserNav(page, 'requestBoard');
   assert(await page.locator('.request-opportunity').count(), 'New request is missing from the request board.');
-  await page.locator('[data-action="closeModal"]').click();
   await clickUserNav(page, 'myAccount');
   assert(await page.locator('.app-back:visible').count() === 1, 'My Account shows a duplicate back control.');
   assert(await page.locator('.account-profile-card [data-action="editAccount"] svg').count() === 1, 'Account edit action is not using the familiar edit icon.');
@@ -425,6 +434,15 @@ async function clickAdminTab(page, tab) {
   assert(await page.locator('.requests-disclosure[open] .request-card').count(), 'Created request is missing from the active request section.');
   assert(await page.locator('.requests-disclosure[open] .request-created-meta').count(), 'Request date and time are missing from the customer request card.');
   assert(await page.locator('.requests-disclosure[open] [data-action="repeatRequest"]').count() === 0, 'An active request should not offer a duplicate repeat action.');
+  const requestItem = page.locator('.requests-disclosure[open] .request-item-disclosure').first();
+  await requestItem.locator(':scope > summary').click();
+  const requestStatusShape = await requestItem.locator('.request-status').first().evaluate(element => {
+    const style = getComputedStyle(element);
+    return { radius: parseFloat(style.borderRadius), width: element.getBoundingClientRect().width, height: element.getBoundingClientRect().height };
+  });
+  assert(requestStatusShape.radius <= 10 && requestStatusShape.width > requestStatusShape.height, `Request status is not a framed rectangular label: ${JSON.stringify(requestStatusShape)}`);
+  const passportFits = await requestItem.locator('.task-passport > span').evaluateAll(items => items.length === 3 && items.every(item => item.scrollWidth <= item.clientWidth + 1 && item.querySelector('b')?.scrollWidth <= item.querySelector('b')?.clientWidth + 1));
+  assert(passportFits, 'Location, timing, or priority text is cramped inside the request summary.');
   await page.locator('.requests-disclosure summary').first().click();
   const repeatSource = await page.evaluate(() => {
     const key = 'KHADAMATI_PRIVATE_STATE_V1';
@@ -449,11 +467,7 @@ async function clickAdminTab(page, tab) {
   assert(repeatSource, 'Could not prepare the isolated repeat-request behavior check.');
   await page.reload({ waitUntil: 'domcontentloaded' });
   await clickUserNav(page, 'myAccount');
-  const repeatButton = page.locator('[data-action="repeatRequest"]').first();
-  const repeatGroup = repeatButton.locator('xpath=ancestor::details[contains(@class,"requests-disclosure")][1]');
-  const repeatDetails = repeatButton.locator('xpath=ancestor::details[contains(@class,"task-secondary-details")][1]');
-  if (!await repeatGroup.evaluate(element => element.open)) await repeatGroup.locator(':scope > summary').click();
-  if (await repeatDetails.count() && !await repeatDetails.evaluate(element => element.open)) await repeatDetails.locator(':scope > summary').click();
+  const repeatButton = await revealRequestAction(page, 'repeatRequest');
   await repeatButton.click();
   assert(await page.locator('#qrEditId').inputValue() === '', 'Repeat request reused the old request identity.');
   assert(await page.locator('#qrService').inputValue() === repeatSource.serviceValue, 'Repeat request lost the selected service.');
@@ -626,8 +640,8 @@ async function clickAdminTab(page, tab) {
     assert(await page.locator('#modalRoot .notification-disclosure').count(), 'Unexpected modal blocked offer comparison.');
     await page.locator('#modalRoot [data-action="closeModal"]').first().click();
   }
-  await page.locator('.requests-disclosure').first().locator(':scope > summary').click();
-  await page.locator('[data-action="compareRequestOffers"]').first().click();
+  const compareOffers = await revealRequestAction(page, 'compareRequestOffers');
+  await compareOffers.click();
   assert(await page.locator('.offer-card').count(), 'Offer comparison card is missing.');
   await capture(page, '04-offer-comparison');
   await page.locator('[data-action="acceptRequestOffer"]').first().click();
@@ -637,7 +651,7 @@ async function clickAdminTab(page, tab) {
   assert(await page.locator('.chat-message.theirs').filter({ hasText: /شكراً لاختيار عرضي|Thank you for choosing my offer/i }).count(), 'Automatic provider welcome message is missing.');
   await page.locator('[data-action="closeModal"]').click();
 
-  await page.locator('.requests-disclosure').first().locator(':scope > summary').click();
+  await revealRequestAction(page, 'manageRequestContact');
   assert(await page.locator('.request-offer-summary').count() === 0, 'Offer comparison remained visible after selecting a provider.');
   assert(await page.locator('[data-action="compareRequestOffers"]').count() === 0, 'Compare action remained available after offer selection.');
   assert(await page.locator('[data-action="manageRequestContact"]').count(), 'Contact privacy control is missing after provider selection.');
@@ -646,20 +660,17 @@ async function clickAdminTab(page, tab) {
   assert(await page.locator('[data-action="requestCall"]').count() === 0, 'Phone calls must stay hidden before customer consent.');
   assert(await page.locator('[data-action="startCustomerRequest"]').count() === 0, 'Work can start before both parties confirm the agreement.');
   assert(await page.locator('[data-action="editRequestAgreement"]').count(), 'Accepted request does not guide the customer to confirm the agreement.');
-  const contactControl = page.locator('[data-action="manageRequestContact"]').first();
-  const contactDetails = contactControl.locator('xpath=ancestor::details[contains(@class,"task-secondary-details")][1]');
-  if (!await contactControl.isVisible() && await contactDetails.count()) await contactDetails.locator(':scope > summary').click();
+  const contactControl = await revealRequestAction(page, 'manageRequestContact');
   await contactControl.click();
   assert(await page.locator('#contactAllowChat').isChecked(), 'In-app chat consent was not enabled by offer selection.');
   await page.locator('#contactAllowWhatsapp').check();
   await page.locator('#contactAllowCall').check();
   await page.locator('[data-action="saveRequestContactConsent"]').click();
-  await page.locator('.requests-disclosure').first().locator(':scope > summary').click();
+  await page.waitForSelector('.contact-consent-sheet', { state: 'detached' });
+  await revealRequestAction(page, 'openRequestChat');
   assert(await page.locator('[data-action="requestWhatsapp"]').count(), 'WhatsApp was not enabled after customer consent.');
   assert(await page.locator('[data-action="requestCall"]').count(), 'Phone calls were not enabled after customer consent.');
-  const chatAction = page.locator('[data-action="openRequestChat"]').first();
-  const chatDetails = chatAction.locator('xpath=ancestor::details[contains(@class,"task-secondary-details")][1]');
-  if (!await chatAction.isVisible() && await chatDetails.count()) await chatDetails.locator(':scope > summary').click();
+  const chatAction = await revealRequestAction(page, 'openRequestChat');
   await chatAction.click();
   const chatViewportFit = await page.locator('.chat-sheet').evaluate(sheet => {
     const rect = sheet.getBoundingClientRect();
@@ -744,7 +755,8 @@ async function clickAdminTab(page, tab) {
   await page.reload({ waitUntil: 'domcontentloaded' });
   await clickUserNav(page, 'tasks');
   assert(await page.locator('[data-action="startCustomerRequest"]').count() === 1, 'Confirmed agreement must expose exactly one start-work action.');
-  await page.locator('[data-action="startCustomerRequest"]').first().click();
+  const startWork = await revealRequestAction(page, 'startCustomerRequest');
+  await startWork.click();
   await page.waitForFunction(() => {
     const card = document.querySelector('[data-request-card]');
     return card && /قيد التنفيذ|In progress/i.test(card.textContent || '');
@@ -755,9 +767,7 @@ async function clickAdminTab(page, tab) {
     'Request did not move to in-progress after work started.',
   );
 
-  const calendarAction = page.locator('[data-action="addRequestCalendar"]').first();
-  const calendarDetails = calendarAction.locator('xpath=ancestor::details[contains(@class,"task-secondary-details")][1]');
-  if (!await calendarAction.isVisible() && await calendarDetails.count()) await calendarDetails.locator(':scope > summary').click();
+  const calendarAction = await revealRequestAction(page, 'addRequestCalendar');
   const downloadPromise = page.waitForEvent('download');
   await calendarAction.click();
   const calendarDownload = await downloadPromise;
@@ -793,11 +803,9 @@ async function clickAdminTab(page, tab) {
   await page.locator('[data-action="sendChatMessage"]').click();
   await page.waitForSelector('.chat-message.mine');
   await page.locator('[data-action="closeModal"]').click();
-  await page.locator('[data-action="openArrivalTracking"]').first().click();
-  await page.locator('[data-action="updateProviderArrival"][data-status="onTheWay"]').click();
-  await page.waitForSelector('.arrival-card');
-  await capture(page, '06-arrival-tracking');
-  await page.locator('[data-action="closeModal"]').click();
+  assert(await page.locator('[data-action="openArrivalTracking"]').count() === 0, 'Removed provider-arrival tracking is still exposed in active jobs.');
+  assert(await page.locator('[data-action="updateProviderArrival"]').count() === 0, 'Removed provider-arrival controls are still exposed.');
+  await capture(page, '06-provider-active-jobs');
 
   await page.locator('.side-nav [data-action="providerTab"][data-tab="profile"]').click();
   await page.locator('#ppBeforeImage').setInputFiles(path.join(__dirname, '..', 'app-icon-192.png'));
@@ -929,6 +937,8 @@ async function clickAdminTab(page, tab) {
   await page.locator('[data-action="closeModal"]').click();
   await clickAdminTab(page, 'categoryAdmin');
   assert(await page.locator('.admin-category-visual .kh-subject-art').count() >= 9, 'Management does not show the semantic category artwork.');
+  assert(await page.locator('[data-action="toggleCat"]').count() && await page.locator('[data-action="deleteCat"]').count(), 'Category management must expose separate pause and delete controls.');
+  assert(await page.locator('[data-action="toggleSvc"]').count() && await page.locator('[data-action="deleteSvc"]').count(), 'Service management must expose separate pause and delete controls.');
   const managedPictograms = await page.locator('.admin-category-visual .kh-subject-art').evaluateAll(items => items.map(item => item.dataset.pictogram));
   assert(managedPictograms.length >= 100 && managedPictograms.every(Boolean), 'Some managed categories or services do not have subject artwork.');
   await page.locator('[data-action="catForm"]').first().click();
