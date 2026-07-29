@@ -526,6 +526,7 @@ async function clickAdminTab(page, tab) {
   assert(await page.locator('.loyalty-card-campaign [role="progressbar"]').count(), 'Clear loyalty progress bar is missing.');
   assert(await page.locator('.loyalty-card-campaign.is-points-only').count(), 'Loyalty must default to a points balance until management activates a campaign.');
   assert(!/المكافأة التالية|next reward/i.test(await page.locator('.loyalty-card-campaign').innerText()), 'Loyalty promises an unapproved fixed reward.');
+  await page.locator('details.account-disclosure:has([data-action="openAppearance"]) > summary').click();
   await page.locator('[data-action="openAppearance"]').click();
   await page.locator('[data-action="setTheme"][data-value="dark"]').click();
   assert(await page.locator('body').getAttribute('data-theme') === 'dark', 'Dark theme was not applied immediately.');
@@ -819,6 +820,7 @@ async function clickAdminTab(page, tab) {
   assert((await calendarDownload.suggestedFilename()).endsWith('.ics'), 'Calendar export is not an ICS file.');
 
   await clickUserNav(page, 'myAccount');
+  await page.locator('details.account-disclosure:has([data-action="providerMode"]) > summary').click();
   await page.locator('.account-menu [data-action="providerMode"], .account-menu [data-action="nav"][data-view="provider"]').first().click();
   await page.locator('.provider-top-actions [data-action="openNotifications"]').click();
   assert(await page.locator('.notification-center-tab').count() === 2, 'Notification center must keep only requests and updates.');
@@ -898,6 +900,7 @@ async function clickAdminTab(page, tab) {
   assert(await page.locator('.provider-detail-sheet').count(), 'Closing the provider map must restore the same provider profile.');
   await page.locator('[data-action="closeModal"]').click();
   await clickUserNav(page, 'myAccount');
+  await page.locator('details.account-disclosure:has([data-action="providerMode"]) > summary').click();
   await page.locator('.account-menu [data-action="providerMode"], .account-menu [data-action="nav"][data-view="provider"]').first().click();
   await page.waitForSelector('.provider-adaptive-nav');
   const directSupport = page.locator('.side-nav [data-action="providerTab"][data-tab="support"]').first();

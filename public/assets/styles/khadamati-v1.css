@@ -6043,6 +6043,11 @@ summary:focus-visible{
 .voice-ready .voice-note-player{flex:1 1 auto;width:auto;padding:3px 6px}
 .voice-ready .voice-note-toggle{width:29px!important;min-width:29px!important;height:29px!important}
 .voice-ready .voice-note-time{font-size:.56rem}
+.chat-composer.has-voice>.chat-icon-btn,
+.chat-composer.has-voice>.pill-btn{display:none!important}
+.chat-composer.has-voice>.chat-input-shell{grid-column:1/-1;min-height:42px}
+.chat-composer.has-voice .chat-record-state{inset-inline:0!important;bottom:0}
+.chat-composer.has-voice .voice-ready{min-width:0}
 .recording-pill.show{
   min-height:36px;
   border-radius:18px;

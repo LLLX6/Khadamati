@@ -1054,7 +1054,7 @@ function ensurePlatform(){
 }
 function sessionMode(){ return S.session?.mode||'none'; }
 function isGuest(){ return sessionMode()==='guest'; }
-function isRegisteredUser(){ return sessionMode()==='registered' && !!S.user?.phone; }
+function isRegisteredUser(){ return sessionMode()==='registered' && !!S.session?.userId && !!AUTH.userToken; }
 function userDisplayName(){ return S.user?.name||L('مستخدم خدماتي','Khadamati user'); }
 function notificationTargetMatch(n,target,id=''){
  if(n.target===target){
