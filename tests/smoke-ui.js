@@ -43,10 +43,13 @@ function assert(value, message) {
   if (!value) throw new Error(message);
 }
 
-async function capture(page, name) {
+async function capture(page, name, options = {}) {
   if (!SCREENSHOT_DIR) return;
   fs.mkdirSync(SCREENSHOT_DIR, { recursive: true });
-  await page.screenshot({ path: path.join(SCREENSHOT_DIR, `${name}.png`), fullPage: true });
+  await page.screenshot({
+    path: path.join(SCREENSHOT_DIR, `${name}.png`),
+    fullPage: options.fullPage !== false,
+  });
 }
 
 async function clickUserNav(page, view) {
@@ -64,12 +67,14 @@ async function clickUserNav(page, view) {
     return;
   }
   const bottomItem = page.locator(`.bottom-nav [data-action="nav"][data-view="${view}"]`).first();
+  await bottomItem.waitFor({ state: 'attached', timeout: 8000 }).catch(() => {});
   if (await bottomItem.count()) {
     if (await bottomItem.isVisible()) await bottomItem.click();
     else await bottomItem.evaluate(element => element.click());
     return;
   }
   const pageItem = page.locator(`[data-action="nav"][data-view="${view}"]`).first();
+  await pageItem.waitFor({ state: 'attached', timeout: 3000 }).catch(() => {});
   assert(await pageItem.count(), `No accessible navigation route exists for ${view}.`);
   if (await pageItem.isVisible()) await pageItem.click();
   else await pageItem.evaluate(element => element.click());
@@ -131,8 +136,28 @@ async function clickAdminTab(page, tab) {
     }
   });
 
+  const mockRewardCampaign = {
+    id: 'ui-campaign',
+    nameAr: 'مكافأة النشاط',
+    nameEn: 'Activity reward',
+    descriptionAr: 'أكمل الطلبات المؤكدة وتابع تقدمك.',
+    descriptionEn: 'Complete confirmed requests and track your progress.',
+    audience: 'user',
+    rewardType: 'custom',
+    rewardLabelAr: 'مكافأة تحددها الإدارة',
+    rewardLabelEn: 'Management-defined reward',
+    metric: 'completed_requests',
+    target: 8,
+    status: 'active',
+    effectiveStatus: 'active',
+    countdownEnabled: true,
+    startsAt: '2026-01-01T00:00:00Z',
+    endsAt: '2027-01-01T00:00:00Z',
+    cycleMode: 'cap',
+  };
+
   // Keep the visual smoke test deterministic while still exercising authenticated UI paths.
-  await page.route('**/api/**', async route => {
+  await context.route('**/api/**', async route => {
     const url = new URL(route.request().url());
     const json = body => route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(body) });
     if (url.pathname === '/api/users/login') {
@@ -141,6 +166,14 @@ async function clickAdminTab(page, tab) {
     if (url.pathname === '/api/provider/login') {
       return json({ token: 'ui-provider-token', provider: { id: 'p1', name: 'سالم البلوشي', phone: '96891234567', gov: 'مسقط', wilayah: 'السيب', areas: ['السيب'], bio: 'كهربائي منازل بخبرة وعناية', hours: 'الأحد - الخميس: 8:00 ص - 8:00 م', status: 'available', active: true, verified: true, featured: true, mapVisible: true, location: { lat: 23.61, lng: 58.24, updatedAt: '2026-07-18T08:00:00Z' }, packageId: 'professional_12m', subscriptionState: 'active', services: [{ id: 'p1s1', catId: 'homecare', serviceId: 'electrician', priceFrom: 8, active: true, areas: ['السيب'] }], workImages: ['app-icon-512.png', 'app-icon-192.png'], documents: [], rating: 4.9, reviews: 12, qualityScore: 94, pinConfigured: true } });
     }
+    if (url.pathname === '/api/auth/refresh' || url.pathname === '/api/auth/persist') {
+      const payload = route.request().postDataJSON();
+      const kind = payload.kind;
+      if (kind === 'provider') return json({ token: 'ui-provider-token', sessionKind: 'provider', session: { kind: 'provider', providerId: 'p1', name: 'سالم البلوشي' } });
+      if (kind === 'user') return json({ token: 'ui-user-token', sessionKind: 'user', session: { kind: 'user', userId: 'ui-user', name: 'مستخدم الاختبار الآلي' } });
+      if (kind === 'admin') return json({ token: 'ui-admin-token', sessionKind: 'admin', session: { kind: 'admin', id: 'ui-admin', role: 'super_admin' } });
+    }
+    if (url.pathname === '/api/auth/logout') return json({ ok: true, revoked: true });
     if (url.pathname === '/api/provider/profile') return json({});
     if (url.pathname === '/api/provider/quote-templates') {
       const payload = route.request().postDataJSON();
@@ -148,7 +181,8 @@ async function clickAdminTab(page, tab) {
     }
     if (url.pathname === '/api/provider/support') return json({ ok: true, notificationId: 'ui-provider-support' });
     if (url.pathname === '/api/admin/login') return json({ token: 'ui-admin-token', user: { id: 'ui-admin', name: 'إدارة خدماتي', role: 'super_admin' } });
-    if (url.pathname === '/api/bootstrap' || url.pathname === '/api/admin/session') return json({});
+    if (url.pathname === '/api/admin/session') return json({ adminEntities: { rewardCampaigns: [mockRewardCampaign], campaignEligibility: [] } });
+    if (url.pathname === '/api/bootstrap') return json({});
     if (url.pathname === '/api/push/public-key') return json({ publicKey: '' });
     return route.fulfill({ status: 503, contentType: 'application/json', body: JSON.stringify({ error: 'request_failed' }) });
   });
@@ -220,8 +254,10 @@ async function clickAdminTab(page, tab) {
   await capture(page, '00b-user-onboarding');
   await page.locator('[data-action="skipOnboarding"]').click();
   assert(await page.locator('#toastRoot .toast').count() === 0, 'A validation toast remained visible after successful sign-in.');
-  const persistedUserAuth = await page.evaluate(() => JSON.parse(localStorage.getItem('KHADAMATI_AUTH_V3') || '{}'));
+  const persistedUserAuth = await page.evaluate(() => JSON.parse(sessionStorage.getItem('KHADAMATI_AUTH_V3') || '{}'));
   assert(persistedUserAuth.userToken === 'ui-user-token', 'User authentication was not persisted for the next app launch.');
+  const rememberedUser = await page.evaluate(() => JSON.parse(localStorage.getItem('KHADAMATI_ACCOUNT_MEMORY_V1') || '{}'));
+  assert(rememberedUser.user?.id === 'ui-user', 'The device did not retain the safe user account identity.');
   const userNavOrder = await page.locator('.bottom-nav [data-action="nav"]').evaluateAll(items => items.map(item => item.dataset.view));
   assert(JSON.stringify(userNavOrder) === JSON.stringify(['home', 'services', 'tasks', 'requestBoard', 'myAccount']), `User bottom navigation order is incorrect: ${userNavOrder.join(', ')}`);
   assert((await page.locator('.app-brand .brand-word > span').textContent()).trim() === 'خدماتي', 'The Arabic app name is missing from the signed-in header.');
@@ -411,7 +447,12 @@ async function clickAdminTab(page, tab) {
   await page.locator('.request-map-picker .leaflet-live-map').click({ position: { x: 170, y: 170 } });
   await page.waitForFunction(() => Boolean(document.querySelector('#mapPickLat')?.value && document.querySelector('#mapPickLng')?.value));
   await page.locator('[data-action="usePickedRequestLocation"]').click();
-  assert(await page.locator('.request-wizard[data-step="2"]').count(), 'Map selection should resume at the location step.');
+  const mapResumeState = await page.evaluate(() => ({
+    wizardStep: document.querySelector('.request-wizard')?.dataset.step || '',
+    mapOpen: Boolean(document.querySelector('.request-map-picker')),
+    modalClass: document.querySelector('#modalRoot .modal')?.className || '',
+  }));
+  assert(mapResumeState.wizardStep === '2' && !mapResumeState.mapOpen, `Map selection should resume at the location step: ${JSON.stringify(mapResumeState)}`);
   assert(await page.locator('#qrService').inputValue() === selectedServiceBeforeMap, 'Map selection lost the chosen service.');
   assert(Boolean(await page.locator('#qrLocation').inputValue()), 'Selected map point was not saved to the request.');
   await page.locator('[data-action="requestWizardNext"][data-step="3"]:visible').click();
@@ -545,7 +586,7 @@ async function clickAdminTab(page, tab) {
   await page.locator('[data-action="providerLogin"]').click();
   await page.waitForSelector('.role-onboarding');
   await page.locator('[data-action="skipOnboarding"]').click();
-  const dualRoleAuth = await page.evaluate(() => JSON.parse(localStorage.getItem('KHADAMATI_AUTH_V3') || '{}'));
+  const dualRoleAuth = await page.evaluate(() => JSON.parse(sessionStorage.getItem('KHADAMATI_AUTH_V3') || '{}'));
   assert(dualRoleAuth.providerToken === 'ui-provider-token' && dualRoleAuth.userToken === 'ui-user-token', 'Provider sign-in discarded the existing user session on the same device.');
   assert(dualRoleAuth.activeRole === 'provider', 'Provider sign-in did not activate the provider session context.');
   const accountMemory = await page.evaluate(() => JSON.parse(localStorage.getItem('KHADAMATI_ACCOUNT_MEMORY_V1') || '{}'));
@@ -631,7 +672,7 @@ async function clickAdminTab(page, tab) {
   await page.locator('[data-action="submitProviderOffer"]').click();
   await page.waitForSelector('#modalRoot .modal-backdrop', { state: 'detached' });
   await page.locator('.provider-top-actions [data-action="switchAccountMode"]').click();
-  const customerModeAuth = await page.evaluate(() => JSON.parse(localStorage.getItem('KHADAMATI_AUTH_V3') || '{}'));
+  const customerModeAuth = await page.evaluate(() => JSON.parse(sessionStorage.getItem('KHADAMATI_AUTH_V3') || '{}'));
   assert(customerModeAuth.activeRole === 'user' && customerModeAuth.userToken === 'ui-user-token', 'Returning from provider mode did not restore the customer session.');
   await clickUserNav(page, 'myAccount');
   assert(await page.locator('.request-offer-summary').count(), 'Offer comparison summary is missing.');
@@ -704,8 +745,11 @@ async function clickAdminTab(page, tab) {
     mimeType: 'image/png',
     buffer: fs.readFileSync(chatImagePath),
   });
-  await page.locator('#chatText').fill('صورة توضيحية');
-  await page.locator('[data-action="sendChatMessage"]').click();
+  await page.waitForSelector('.chat-image-preview-sheet');
+  assert(await page.locator('.chat-image-preview-sheet img').count() === 1, 'Selected chat image has no preview.');
+  assert(await page.locator('.chat-message.mine img').count() === 0, 'Chat image was sent before confirmation.');
+  await page.locator('#chatImageCaption').fill('صورة توضيحية');
+  await page.locator('[data-action="confirmChatImage"]').click();
   await page.waitForFunction(() => Boolean(document.querySelector('.chat-message.mine img')), null, { timeout: 15000 }).catch(() => {});
   const imageMessageState = await page.evaluate(() => ({
     imageCount: document.querySelectorAll('.chat-message.mine img').length,
@@ -727,9 +771,10 @@ async function clickAdminTab(page, tab) {
   await page.waitForTimeout(900);
   await page.locator('[data-action="toggleChatRecording"]').click();
   await page.waitForSelector('.voice-ready:not(:empty)');
-  await page.locator('[data-action="sendChatMessage"]').click();
+  assert(await page.locator('[data-action="reRecordChatAudio"]').count() === 1, 'Voice preview cannot be re-recorded.');
+  await page.locator('[data-action="sendChatAudio"]').click();
   await page.waitForSelector('.chat-message.mine audio');
-  await capture(page, '05-request-chat');
+  await capture(page, '05-request-chat', { fullPage: false });
   await page.locator('[data-action="closeModal"]').click();
   assert(await page.evaluate(() => !window.__khadamatiChatPoll), 'Chat automatic refresh continued after closing the conversation.');
 
@@ -925,10 +970,16 @@ async function clickAdminTab(page, tab) {
   await clickAdminTab(page, 'assistant');
   assert(await page.locator('.subscription-command h2').filter({ hasText: /ساحة الطلبات|Request marketplace/i }).count(), 'The obsolete assistant health page was not replaced by the request marketplace.');
   assert(await page.locator('[data-action="openAssistant"]').count() === 0, 'The obsolete assistant test control is still visible in administration.');
+  await clickAdminTab(page, 'campaigns');
+  assert(await page.locator('.campaign-admin-card').count() === 1, 'Reward campaigns are missing from management.');
+  assert(await page.locator('[data-action="setRewardCampaignStatus"]').count() >= 1, 'Management cannot activate or pause reward campaigns.');
+  await page.locator('[data-action="campaignForm"]').first().click();
+  assert(await page.locator('#campaignAudience').count() && await page.locator('#campaignTarget').count(), 'Reward campaign editor is incomplete.');
+  await page.locator('[data-action="closeModal"]').click();
   await clickAdminTab(page, 'settings');
   assert(await page.locator('.operations-settings').count(), 'Platform operations settings are missing.');
-  assert(await page.locator('[data-action="togglePlatformSetting"][data-key="loyaltyCampaignActive"]').count(), 'Management cannot activate or pause loyalty campaigns.');
-  assert(await page.locator('#setLoyaltyTarget').count(), 'Management cannot configure the loyalty campaign target.');
+  assert(await page.locator('[data-action="togglePlatformSetting"][data-key="loyaltyEnabled"]').count(), 'Management cannot activate or pause loyalty.');
+  assert(await page.locator('#setLoyaltyTargetRequests').count(), 'Management cannot configure the loyalty campaign target.');
   await clickAdminTab(page, 'ads');
   await page.locator('#adImages').setInputFiles(path.join(__dirname, '..', 'app-icon-512.png'));
   await page.locator('[data-action="previewAdDraft"]').click();

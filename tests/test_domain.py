@@ -30,6 +30,16 @@ from khadamati_domain import (  # noqa: E402
     RequestMarketplace,
     SubscriptionService,
 )
+from khadamati_locations import (  # noqa: E402
+    LocationCatalogService,
+    location_snapshot,
+    resolve_area,
+)
+from khadamati_rewards import (  # noqa: E402
+    RewardCampaignService,
+    loyalty_summary,
+    record_loyalty_transaction,
+)
 from khadamati_workflow import (  # noqa: E402
     CompletionEvidenceService,
     RequestAgreementService,
@@ -801,6 +811,141 @@ class KhadamatiDomainTests(unittest.TestCase):
             self.con, now=datetime(2026, 8, 1, 8, tzinfo=UTC)
         ).schedule(request_id)
         self.assertNotIn(provider_id, {item["providerId"] for item in ranked})
+
+    def test_reward_campaign_uses_server_progress_and_single_eligibility(self):
+        user_id = self.user("801")
+        self.customer_request("801", user_id, status="closed")
+        self.customer_request("802", user_id, status="completed")
+        now = datetime(2026, 8, 1, 8, tzinfo=UTC)
+        service = RewardCampaignService(self.con, now=now)
+        service.save(
+            "test-campaign-user",
+            {
+                "nameAr": "حملة العملاء",
+                "nameEn": "Customer campaign",
+                "descriptionAr": "أكمل طلبين للتأهل",
+                "descriptionEn": "Complete two requests to qualify",
+                "audience": "user",
+                "rewardType": "draw",
+                "rewardLabelAr": "سحب تحدده الإدارة",
+                "rewardLabelEn": "Management-defined draw",
+                "metric": "completed_requests",
+                "target": 2,
+                "startsAt": (now - timedelta(hours=1)).isoformat(),
+                "endsAt": (now + timedelta(days=2)).isoformat(),
+                "status": "active",
+            },
+        )
+        first = service.for_subject("user", user_id)
+        second = service.for_subject("user", user_id)
+        self.assertEqual(1, len(first))
+        self.assertEqual(2, first[0]["progress"])
+        self.assertTrue(first[0]["eligible"])
+        self.assertEqual(first, second)
+        count = self.con.execute(
+            """SELECT COUNT(*) n FROM campaign_eligibility
+            WHERE campaign_id=? AND subject_id=?""",
+            ("test-campaign-user", user_id),
+        ).fetchone()["n"]
+        self.assertEqual(1, count)
+        service.update_status("test-campaign-user", "paused")
+        self.assertEqual([], service.for_subject("user", user_id))
+
+    def test_loyalty_target_recalculates_without_duplicate_points(self):
+        user_id = self.user("803")
+        for suffix in ("803", "804", "805"):
+            self.customer_request(suffix, user_id, status="closed")
+        self.assertTrue(
+            record_loyalty_transaction(
+                self.con, user_id, 10, "completed_request", "test:loyalty:803"
+            )
+        )
+        self.assertFalse(
+            record_loyalty_transaction(
+                self.con, user_id, 10, "completed_request", "test:loyalty:803"
+            )
+        )
+        capped = loyalty_summary(self.con, user_id, target=8, cycle_mode="cap")
+        smaller = loyalty_summary(self.con, user_id, target=3, cycle_mode="cap")
+        repeating = loyalty_summary(
+            self.con, user_id, target=2, cycle_mode="repeat"
+        )
+        self.assertEqual(3, capped["completedRequests"])
+        self.assertEqual(37.5, capped["percent"])
+        self.assertEqual(100, smaller["percent"])
+        self.assertEqual(1, repeating["progress"])
+        self.assertEqual(1, repeating["completedCycles"])
+        self.assertEqual(10, capped["points"])
+
+    def test_location_catalog_reverse_lookup_and_safe_pause(self):
+        service = LocationCatalogService(self.con)
+        area = resolve_area(self.con, 23.6703, 58.1891)
+        self.assertIsNotNone(area)
+        self.assertEqual("muscat", area["governorateId"])
+        self.assertEqual("muscat-seeb", area["wilayahId"])
+        service.apply(
+            {
+                "action": "set_wilayat_active",
+                "id": "muscat-seeb",
+                "active": False,
+            }
+        )
+        active = location_snapshot(self.con)
+        muscat = next(item for item in active if item["id"] == "muscat")
+        self.assertNotIn("muscat-seeb", {item["id"] for item in muscat["w"]})
+        historic = location_snapshot(self.con, include_inactive=True)
+        historic_muscat = next(item for item in historic if item["id"] == "muscat")
+        paused = next(
+            item for item in historic_muscat["w"] if item["id"] == "muscat-seeb"
+        )
+        self.assertFalse(paused["active"])
+
+    def test_location_catalog_rejects_duplicates_and_in_use_deletion(self):
+        service = LocationCatalogService(self.con)
+        service.apply(
+            {
+                "action": "save_governorate",
+                "id": "test-governorate",
+                "ar": "محافظة اختبار",
+                "en": "Test Governorate",
+                "sortOrder": 90,
+            }
+        )
+        service.apply(
+            {
+                "action": "save_wilayat",
+                "id": "test-governorate-test-wilayat",
+                "governorateId": "test-governorate",
+                "ar": "ولاية اختبار",
+                "en": "Test Wilayat",
+                "lat": 23.5,
+                "lng": 58.1,
+            }
+        )
+        with self.assertRaises(DomainError) as duplicate:
+            service.apply(
+                {
+                    "action": "save_wilayat",
+                    "id": "test-governorate-other",
+                    "governorateId": "test-governorate",
+                    "ar": "ولاية اختبار",
+                    "en": "Another Wilayat",
+                }
+            )
+        self.assertEqual("wilayat_already_exists", duplicate.exception.code)
+        user_id = self.user("806")
+        self.con.execute(
+            "UPDATE app_users SET gov=?,wilayah=? WHERE id=?",
+            ("محافظة اختبار", "ولاية اختبار", user_id),
+        )
+        with self.assertRaises(DomainError) as in_use:
+            service.apply(
+                {
+                    "action": "delete_wilayat",
+                    "id": "test-governorate-test-wilayat",
+                }
+            )
+        self.assertEqual("location_in_use", in_use.exception.code)
 
 
 if __name__ == "__main__":
