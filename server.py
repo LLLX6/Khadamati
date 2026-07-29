@@ -6705,6 +6705,7 @@ class Handler(SimpleHTTPRequestHandler):
             "/api/admin/provider-status": "manage_providers",
             "/api/admin/provider-delete": "manage_providers",
             "/api/admin/request-decision": "review_requests",
+            "/api/admin/customer-request-action": "review_requests",
             "/api/admin/review-status": "manage_quality",
             "/api/admin/complaint-status": "manage_quality",
             "/api/admin/packages": "manage_subscriptions",
@@ -6727,6 +6728,79 @@ class Handler(SimpleHTTPRequestHandler):
         if not session:
             return
         with db() as con:
+            if path == "/api/admin/customer-request-action":
+                request_id = safe_text(data.get("id"), 120)
+                action = safe_text(data.get("action"), 24)
+                if action not in {"pause", "resume", "close", "urgent", "normal"}:
+                    return self.send_json({"error": "invalid_request_action"}, 400)
+                request_row = con.execute(
+                    "SELECT * FROM customer_requests WHERE id=?", (request_id,)
+                ).fetchone()
+                if not request_row:
+                    return self.send_json({"error": "not_found"}, 404)
+                current_status = request_row["status"] or "matching"
+                terminal = {"closed", "archived", "cancelled", "deleted"}
+                offer_states = {"received", "matching", "viewed", "unavailable", "paused"}
+                if action in {"pause", "resume"} and current_status not in offer_states:
+                    return self.send_json({"error": "request_action_not_allowed"}, 409)
+                if action == "pause":
+                    con.execute(
+                        """UPDATE customer_requests SET status='paused',offers_open=0,
+                        updated_at=CURRENT_TIMESTAMP WHERE id=?""",
+                        (request_id,),
+                    )
+                elif action == "resume":
+                    con.execute(
+                        """UPDATE customer_requests SET status='matching',offers_open=1,waitlisted=0,
+                        updated_at=CURRENT_TIMESTAMP WHERE id=?""",
+                        (request_id,),
+                    )
+                elif action == "close":
+                    if current_status in terminal:
+                        return self.send_json({"error": "request_already_closed"}, 409)
+                    con.execute(
+                        """UPDATE customer_requests SET status='closed',offers_open=0,
+                        updated_at=CURRENT_TIMESTAMP WHERE id=?""",
+                        (request_id,),
+                    )
+                else:
+                    con.execute(
+                        """UPDATE customer_requests SET urgency=?,updated_at=CURRENT_TIMESTAMP
+                        WHERE id=?""",
+                        ("urgent" if action == "urgent" else "normal", request_id),
+                    )
+                user_id = request_row["user_id"] or ""
+                if user_id and action in {"pause", "resume", "close"}:
+                    title = {
+                        "pause": "تم إيقاف استقبال العروض مؤقتاً",
+                        "resume": "تم استئناف استقبال العروض",
+                        "close": "تم إغلاق الطلب",
+                    }[action]
+                    create_notification(
+                        con,
+                        "user",
+                        user_id,
+                        title,
+                        request_row["service_name"] or "طلب خدمة",
+                        type_="request",
+                        related_id=request_id,
+                        priority="normal",
+                        action_text="فتح الطلب",
+                        action_route=f"user:request:{request_id}",
+                    )
+                log_audit(
+                    con,
+                    session,
+                    f"customer_request.{action}",
+                    request_id,
+                    current_status,
+                )
+                updated = con.execute(
+                    "SELECT * FROM customer_requests WHERE id=?", (request_id,)
+                ).fetchone()
+                return self.send_json(
+                    {"ok": True, "request": row_customer_request(updated, True)}
+                )
             if path == "/api/admin/locations":
                 try:
                     result = LocationCatalogService(con).apply(data)
