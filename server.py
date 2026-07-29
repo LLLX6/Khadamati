@@ -4795,16 +4795,32 @@ class Handler(SimpleHTTPRequestHandler):
                 avatar = user_row["avatar"] or ""
                 if data.get("avatarData"):
                     avatar = save_upload_data(user_id, data["avatarData"], "avatar", IMAGE_MIMES, 2_500_000)
+                phone = normalize_phone(data.get("phone", user_row["phone"]))
+                if len(phone) != 11 or not phone.startswith("968"):
+                    return self.send_json({"error": "valid_phone_required"}, 400)
+                duplicate = con.execute(
+                    "SELECT id FROM app_users WHERE phone=? AND id<>?",
+                    (phone, user_id),
+                ).fetchone()
+                if duplicate:
+                    return self.send_json({"error": "phone_already_registered"}, 409)
+                if (
+                    phone != user_row["phone"]
+                    and user_row["pin_hash"]
+                    and not verify_secret(data.get("currentPin", ""), user_row["pin_hash"])
+                ):
+                    return self.send_json({"error": "current_pin_incorrect"}, 403)
                 try:
                     location = normalized_location(data.get("location"))
                 except DomainError as err:
                     return self.send_domain_error(err)
                 con.execute(
-                    """UPDATE app_users SET name=?,gov=?,wilayah=?,avatar=?,
+                    """UPDATE app_users SET name=?,phone=?,gov=?,wilayah=?,avatar=?,
                     latitude=COALESCE(?,latitude),longitude=COALESCE(?,longitude),gender=?
                     WHERE id=?""",
                     (
                         str(data.get("name", user_row["name"]) or "").strip()[:80],
+                        phone,
                         str(data.get("gov", user_row["gov"]) or "").strip()[:80],
                         str(data.get("wilayah", user_row["wilayah"]) or "").strip()[:80],
                         avatar, location.get("lat"), location.get("lng"),
@@ -7110,45 +7126,66 @@ class Handler(SimpleHTTPRequestHandler):
                 return self.send_json({"ok": True})
             if path == "/api/admin/recovery-code":
                 recovery_id = safe_text(data.get("id"), 120)
-                recovery = con.execute(
-                    """SELECT * FROM password_recoveries
-                    WHERE id=? AND COALESCE(used_at,'')=''""",
-                    (recovery_id,),
+                account_id = safe_text(data.get("accountId"), 120)
+                account_kind = safe_text(data.get("accountKind"), 24)
+                recovery = None
+                if recovery_id:
+                    recovery = con.execute(
+                        """SELECT * FROM password_recoveries
+                        WHERE id=? AND COALESCE(used_at,'')=''""",
+                        (recovery_id,),
+                    ).fetchone()
+                    if not recovery:
+                        return self.send_json({"error": "recovery_not_found"}, 404)
+                    account_id = recovery["account_id"]
+                    account_kind = recovery["account_kind"]
+                if account_kind not in {"user", "provider"} or not account_id:
+                    return self.send_json({"error": "invalid_recovery_account"}, 400)
+                table = "providers" if account_kind == "provider" else "app_users"
+                account = con.execute(
+                    f"SELECT id,name,phone FROM {table} WHERE id=?",
+                    (account_id,),
                 ).fetchone()
-                if not recovery:
-                    return self.send_json({"error": "recovery_not_found"}, 404)
-                if recovery["account_kind"] == "provider":
-                    account = con.execute(
-                        "SELECT name FROM providers WHERE id=?",
-                        (recovery["account_id"],),
-                    ).fetchone()
-                else:
-                    account = con.execute(
-                        "SELECT name FROM app_users WHERE id=?",
-                        (recovery["account_id"],),
-                    ).fetchone()
                 if not account:
                     return self.send_json({"error": "account_not_found"}, 404)
                 temporary_code = f"{secrets.randbelow(1_000_000):06d}"
                 expires_at = iso_datetime(minutes=10)
-                con.execute(
-                    """UPDATE password_recoveries SET code_hash=?,attempts=0,expires_at=?
-                    WHERE id=?""",
-                    (hash_pin(temporary_code), expires_at, recovery_id),
-                )
+                if recovery:
+                    con.execute(
+                        """UPDATE password_recoveries SET code_hash=?,attempts=0,expires_at=?
+                        WHERE id=?""",
+                        (hash_pin(temporary_code), expires_at, recovery_id),
+                    )
+                    phone = recovery["phone"]
+                else:
+                    recovery_id = slug("rcv")
+                    phone = account["phone"]
+                    con.execute(
+                        """INSERT INTO password_recoveries(
+                        id,account_kind,account_id,phone,code_hash,expires_at)
+                        VALUES(?,?,?,?,?,?)""",
+                        (
+                            recovery_id,
+                            account_kind,
+                            account_id,
+                            phone,
+                            hash_pin(temporary_code),
+                            expires_at,
+                        ),
+                    )
                 message = (
                     f"مرحباً {account['name']}، رمز التحقق المؤقت لاستعادة حساب خدماتي هو: "
                     f"{temporary_code}. صالح لمدة 10 دقائق. لا تشاركه مع أي شخص آخر."
                 )
-                log_audit(con, session, "recovery.code.issued", recovery_id, recovery["account_id"])
+                log_audit(con, session, "recovery.code.issued", recovery_id, account_id)
                 return self.send_json({
                     "ok": True,
                     "recoveryId": recovery_id,
                     "temporaryCode": temporary_code,
                     "expiresAt": expires_at,
-                    "phone": recovery["phone"],
+                    "phone": phone,
                     "name": account["name"],
-                    "accountKind": recovery["account_kind"],
+                    "accountKind": account_kind,
                     "whatsappMessage": message,
                 })
             if path == "/api/admin/packages":
