@@ -492,9 +492,119 @@ CREATE TABLE IF NOT EXISTS webhook_events (
   processed BOOLEAN NOT NULL DEFAULT FALSE, created_at TIMESTAMPTZ DEFAULT now()
 );
 
+CREATE TABLE IF NOT EXISTS community_listings (
+  id TEXT PRIMARY KEY,
+  kind TEXT NOT NULL CHECK (kind IN ('wanted','package')),
+  owner_kind TEXT NOT NULL CHECK (owner_kind IN ('user','provider','company')),
+  owner_id TEXT NOT NULL,
+  title TEXT NOT NULL,
+  description TEXT NOT NULL DEFAULT '',
+  category_id TEXT NOT NULL,
+  service_value TEXT NOT NULL,
+  budget_min NUMERIC NOT NULL DEFAULT 0,
+  budget_max NUMERIC NOT NULL DEFAULT 0,
+  price_amount NUMERIC NOT NULL DEFAULT 0,
+  billing_period TEXT NOT NULL DEFAULT 'one_time',
+  duration_text TEXT DEFAULT '',
+  gov TEXT DEFAULT '',
+  wilayah TEXT DEFAULT '',
+  latitude DOUBLE PRECISION,
+  longitude DOUBLE PRECISION,
+  location_text TEXT DEFAULT '',
+  image_path TEXT DEFAULT '',
+  details JSONB NOT NULL DEFAULT '{}',
+  contact_channels JSONB NOT NULL DEFAULT '["app"]',
+  status TEXT NOT NULL DEFAULT 'draft',
+  moderation_note TEXT DEFAULT '',
+  billing_status TEXT NOT NULL DEFAULT 'included',
+  featured BOOLEAN NOT NULL DEFAULT FALSE,
+  expires_at TIMESTAMPTZ,
+  published_at TIMESTAMPTZ,
+  closed_at TIMESTAMPTZ,
+  deleted_at TIMESTAMPTZ,
+  request_id TEXT DEFAULT '',
+  idempotency_key TEXT NOT NULL,
+  created_at TIMESTAMPTZ DEFAULT now(),
+  updated_at TIMESTAMPTZ DEFAULT now(),
+  UNIQUE(owner_kind, owner_id, idempotency_key)
+);
+
+CREATE TABLE IF NOT EXISTS community_offers (
+  id TEXT PRIMARY KEY,
+  listing_id TEXT NOT NULL REFERENCES community_listings(id),
+  provider_id TEXT NOT NULL,
+  amount NUMERIC NOT NULL DEFAULT 0,
+  duration_text TEXT DEFAULT '',
+  note TEXT DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'sent',
+  request_id TEXT DEFAULT '',
+  idempotency_key TEXT NOT NULL,
+  created_at TIMESTAMPTZ DEFAULT now(),
+  updated_at TIMESTAMPTZ DEFAULT now(),
+  UNIQUE(listing_id, provider_id),
+  UNIQUE(provider_id, idempotency_key)
+);
+
+CREATE TABLE IF NOT EXISTS community_orders (
+  id TEXT PRIMARY KEY,
+  listing_id TEXT NOT NULL REFERENCES community_listings(id),
+  user_id TEXT NOT NULL,
+  request_id TEXT DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'created',
+  snapshot JSONB NOT NULL DEFAULT '{}',
+  idempotency_key TEXT NOT NULL,
+  created_at TIMESTAMPTZ DEFAULT now(),
+  updated_at TIMESTAMPTZ DEFAULT now(),
+  UNIQUE(user_id, idempotency_key)
+);
+
+CREATE TABLE IF NOT EXISTS community_favorites (
+  id TEXT PRIMARY KEY,
+  account_kind TEXT NOT NULL,
+  account_id TEXT NOT NULL,
+  listing_id TEXT NOT NULL REFERENCES community_listings(id),
+  created_at TIMESTAMPTZ DEFAULT now(),
+  UNIQUE(account_kind, account_id, listing_id)
+);
+
+CREATE TABLE IF NOT EXISTS community_reports (
+  id TEXT PRIMARY KEY,
+  listing_id TEXT NOT NULL REFERENCES community_listings(id),
+  reporter_kind TEXT NOT NULL,
+  reporter_id TEXT NOT NULL,
+  reason TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'open',
+  resolution TEXT DEFAULT '',
+  created_at TIMESTAMPTZ DEFAULT now(),
+  updated_at TIMESTAMPTZ DEFAULT now(),
+  UNIQUE(listing_id, reporter_kind, reporter_id)
+);
+
+CREATE TABLE IF NOT EXISTS community_events (
+  id TEXT PRIMARY KEY,
+  listing_id TEXT NOT NULL REFERENCES community_listings(id),
+  actor_kind TEXT NOT NULL,
+  actor_id TEXT DEFAULT '',
+  action TEXT NOT NULL,
+  detail JSONB NOT NULL DEFAULT '{}',
+  created_at TIMESTAMPTZ DEFAULT now()
+);
+
 CREATE INDEX IF NOT EXISTS idx_dispatch_release ON request_dispatches(status, release_at, wave);
 CREATE INDEX IF NOT EXISTS idx_dispatch_provider ON request_dispatches(provider_id, status, notified_at);
 CREATE INDEX IF NOT EXISTS idx_consent_lookup ON contact_consents(request_id, provider_id, channel, status);
 CREATE INDEX IF NOT EXISTS idx_subscription_provider ON subscriptions(provider_id, status, end_date);
 CREATE INDEX IF NOT EXISTS idx_payment_subscription ON payments(subscription_id, status);
 CREATE INDEX IF NOT EXISTS idx_otp_phone ON otp_challenges(phone, purpose, created_at);
+CREATE INDEX IF NOT EXISTS idx_community_feed
+  ON community_listings(kind, status, featured, created_at);
+CREATE INDEX IF NOT EXISTS idx_community_owner
+  ON community_listings(owner_kind, owner_id, status, updated_at);
+CREATE INDEX IF NOT EXISTS idx_community_service
+  ON community_listings(service_value, status, expires_at);
+CREATE INDEX IF NOT EXISTS idx_community_expiry
+  ON community_listings(status, expires_at);
+CREATE INDEX IF NOT EXISTS idx_community_offer_listing
+  ON community_offers(listing_id, status, updated_at);
+CREATE INDEX IF NOT EXISTS idx_community_reports_status
+  ON community_reports(status, created_at);

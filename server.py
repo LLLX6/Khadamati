@@ -1,7 +1,7 @@
 from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
 import http.client
 from http.cookies import SimpleCookie
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, quote, urlparse
 from pathlib import Path
 from datetime import datetime, timedelta, UTC
 from contextlib import contextmanager
@@ -61,6 +61,13 @@ from khadamati_rewards import (
     loyalty_summary,
     record_loyalty_transaction,
 )
+from khadamati_community import (
+    CommunityService,
+    community_settings,
+    install_community_schema,
+    run_community_maintenance,
+    save_community_settings,
+)
 
 try:
     from pywebpush import WebPushException, webpush
@@ -83,7 +90,7 @@ def environment_flag(name, default=False):
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
-APP_RELEASE = os.environ.get("KHADAMATI_RELEASE", "v1.0.2").strip() or "v1.0.2"
+APP_RELEASE = os.environ.get("KHADAMATI_RELEASE", "v1.1.0").strip() or "v1.1.0"
 SAMPLE_DATA_ENABLED = environment_flag(
     "KHADAMATI_SEED_SAMPLE_DATA",
     environment_flag("KHADAMATI_SEED_DEMO_DATA", APP_ENV in {"development", "test"}),
@@ -130,6 +137,7 @@ JSON_LIMITS = {
     "/api/request/collaboration": 10_000_000,
     "/api/request/workflow": 14_000_000,
     "/api/service-assets": 4_000_000,
+    "/api/community": 8_000_000,
     "/api/admin/ads": 6_000_000,
 }
 
@@ -145,6 +153,7 @@ ALL_PERMISSIONS = [
     "manage_team",
     "manage_consent",
     "manage_campaigns",
+    "manage_community",
     "manage_audit",
     "backup",
 ]
@@ -153,11 +162,11 @@ ROLE_PERMISSIONS = {
     "admin": [
         "view_reports", "manage_providers", "review_requests", "manage_quality",
         "manage_subscriptions", "manage_finance", "manage_settings", "manage_team",
-        "manage_consent", "manage_campaigns", "manage_audit", "backup",
+        "manage_consent", "manage_campaigns", "manage_community", "manage_audit", "backup",
     ],
     "owner": ALL_PERMISSIONS,
-    "manager": ["view_reports", "manage_providers", "review_requests", "manage_quality", "manage_subscriptions", "manage_finance", "manage_team", "manage_consent", "backup"],
-    "support": ["view_reports", "review_requests", "manage_quality"],
+    "manager": ["view_reports", "manage_providers", "review_requests", "manage_quality", "manage_subscriptions", "manage_finance", "manage_team", "manage_consent", "manage_community", "backup"],
+    "support": ["view_reports", "review_requests", "manage_quality", "manage_community"],
     "finance": ["view_reports", "manage_subscriptions", "manage_finance", "backup"],
     "user": [],
     "provider": [],
@@ -1063,6 +1072,7 @@ def init_db():
         ensure_column(con, "services", "deleted_at", "TEXT DEFAULT ''")
         install_reward_schema(con)
         install_location_schema(con)
+        install_community_schema(con)
         for c in SEED_CATEGORIES:
             con.execute(
                 "INSERT OR IGNORE INTO categories(id,icon,ar,en,active) VALUES(?,?,?,?,?)",
@@ -1169,6 +1179,12 @@ def init_db():
                 "loyaltyCampaignEn": "Khadamati reward",
                 "loyaltyCampaignNoteAr": "تحدد الإدارة تفاصيل المكافأة عند تفعيل الحملة.",
                 "loyaltyCampaignNoteEn": "Reward details are set by management when the campaign is active.",
+                "communityEnabled": True,
+                "communityModerationRequired": False,
+                "communityWantedExpiryDays": 30,
+                "communityPackageExpiryDays": 30,
+                "communityFirstPackageFreeDays": 30,
+                "communityRenewalFee": 2,
             }),),
         )
         platform_row = con.execute("SELECT value FROM settings WHERE key='platform'").fetchone()
@@ -1189,6 +1205,8 @@ def init_db():
         platform_settings.setdefault("loyaltyCampaignEn", "Khadamati reward")
         platform_settings.setdefault("loyaltyCampaignNoteAr", "تحدد الإدارة تفاصيل المكافأة عند تفعيل الحملة.")
         platform_settings.setdefault("loyaltyCampaignNoteEn", "Reward details are set by management when the campaign is active.")
+        for key, value in community_settings(con).items():
+            platform_settings.setdefault(key, value)
         con.execute("UPDATE settings SET value=? WHERE key='platform'", (jdump(platform_settings),))
         if con.execute("SELECT COUNT(*) n FROM admin_users").fetchone()["n"] == 0 and INITIAL_ADMIN_CODE:
             con.execute(
@@ -1923,6 +1941,29 @@ def row_customer_request(r, sign_private=False):
     return d
 
 
+def community_snapshot_view(snapshot):
+    """Expose community media through the same safe URL rules as provider cards."""
+    result = dict(snapshot or {})
+    listings = []
+    for raw in result.get("listings", []):
+        item = dict(raw)
+        item["imageUrl"] = image_url(item.pop("imagePath", ""))
+        owner = dict(item.get("owner") or {})
+        owner["imageUrl"] = image_url(owner.pop("imagePath", ""))
+        item["owner"] = owner
+        offers = []
+        for raw_offer in item.get("offers", []):
+            offer = dict(raw_offer)
+            provider = dict(offer.get("provider") or {})
+            provider["imageUrl"] = image_url(provider.pop("imagePath", ""))
+            offer["provider"] = provider
+            offers.append(offer)
+        item["offers"] = offers
+        listings.append(item)
+    result["listings"] = listings
+    return result
+
+
 def request_with_workflow(con, item, *, asset_visible=False):
     """Attach private workflow details after request-level authorization."""
     result = attach_workflow_data(con, item, asset_visible=asset_visible)
@@ -2580,6 +2621,33 @@ def catalog_reference_count(con, category_id, service_id=""):
 def get_bootstrap(session=None):
     with db() as con:
         maintenance = run_domain_maintenance(con)
+        community_maintenance = run_community_maintenance(con)
+        for item in community_maintenance["warnings"]:
+            target_kind = "user" if item["owner_kind"] == "user" else "provider"
+            create_notification(
+                con,
+                target_kind,
+                item["owner_id"],
+                "إعلانك في المجتمع أوشك على الانتهاء",
+                f"{item['title']} • بقي أقل من 3 أيام",
+                type_="community",
+                related_id=item["id"],
+                action_text="فتح الإعلان",
+                action_route=f"{target_kind}:community:{item['id']}",
+            )
+        for item in community_maintenance["expired"]:
+            target_kind = "user" if item["owner_kind"] == "user" else "provider"
+            create_notification(
+                con,
+                target_kind,
+                item["owner_id"],
+                "انتهى إعلانك في المجتمع",
+                item["title"],
+                type_="community",
+                related_id=item["id"],
+                action_text="مراجعة الإعلان",
+                action_route=f"{target_kind}:community:{item['id']}",
+            )
         categories = catalog_snapshot(con)
         is_admin = bool(session and session.get("kind") == "admin")
         is_provider = bool(session and session.get("kind") == "provider")
@@ -2639,6 +2707,9 @@ def get_bootstrap(session=None):
             "loyaltyTargetRequests", "loyaltyCycleMode",
             "subscriptionsEnabled", "paymentGatewayEnabled", "serviceAreas",
             "deviceNotifications", "mergeNotifications",
+            "communityEnabled", "communityModerationRequired",
+            "communityWantedExpiryDays", "communityPackageExpiryDays",
+            "communityFirstPackageFreeDays", "communityRenewalFee",
         }
         settings = platform_settings if is_admin else {
             key: value for key, value in platform_settings.items() if key in public_setting_keys
@@ -3035,6 +3106,7 @@ def get_bootstrap(session=None):
             reward_campaigns = reward_service.for_subject(
                 subject_kind, session["providerId"]
             )
+        community = community_snapshot_view(CommunityService(con).snapshot(session))
         data = {
             "categories": categories,
             "providers": providers,
@@ -3055,6 +3127,11 @@ def get_bootstrap(session=None):
             "locationCatalog": location_catalog,
             "rewardCampaigns": reward_campaigns,
             "loyaltySummary": user_loyalty,
+            "communityListings": community.get("listings", []),
+            "communitySettings": community.get("settings", {}),
+            "communityFavorites": community.get("favorites", []),
+            "communityStats": community.get("stats", {}),
+            "communityReports": community.get("reports", []) if is_admin else [],
             "serverTime": datetime.now(UTC).isoformat(),
             "serviceAvailability": service_availability_snapshot(con),
             "providerInsights": provider_operational_insights(
@@ -3073,7 +3150,10 @@ def get_bootstrap(session=None):
             "reports": reports,
             "financialMetrics": financial_metrics,
             "adminEntities": admin_entities,
-            "maintenance": maintenance if is_admin else {},
+            "maintenance": {
+                **maintenance,
+                "community": community_maintenance,
+            } if is_admin else {},
             "integrations": {
                 "whatsappConfigured": whatsapp_configured(),
                 "paymentConfigured": PaymentAdapter(con).configured,
@@ -4551,6 +4631,8 @@ class Handler(SimpleHTTPRequestHandler):
             return self.request_workflow(data)
         if path == "/api/service-assets":
             return self.service_assets(data)
+        if path == "/api/community":
+            return self.community_post(data)
         if path == "/api/notifications/action":
             return self.notification_action(data)
         if path == "/api/recovery/request":
@@ -4781,6 +4863,494 @@ class Handler(SimpleHTTPRequestHandler):
         if session_kind != "admin":
             safe_item.pop("phone", None)
         return self.send_json({"ok": True, "lead": safe_item}, 200 if exists else 201)
+
+    def create_community_request(
+        self,
+        con,
+        session,
+        listing,
+        provider_id,
+        *,
+        amount,
+        duration_text,
+        offer_note="",
+        source_kind,
+        source_id,
+        whatsapp=False,
+        language="ar",
+    ):
+        user = con.execute(
+            "SELECT * FROM app_users WHERE id=? AND status='active'",
+            (session["userId"],),
+        ).fetchone()
+        provider = con.execute(
+            """SELECT * FROM providers WHERE id=? AND active=1 AND verified=1
+            AND status NOT IN ('deleted','unavailable')
+            AND COALESCE(request_enabled,1)=1""",
+            (provider_id,),
+        ).fetchone()
+        if not user:
+            raise DomainError("user_not_found", 404)
+        if not provider:
+            raise DomainError("community_provider_not_eligible", 403)
+        service_value = listing["service_value"]
+        category_id, service_id = service_value.split("|", 1)
+        service = con.execute(
+            """SELECT s.ar,s.en FROM services s
+            WHERE s.id=? AND s.category_id=?""",
+            (service_id, category_id),
+        ).fetchone()
+        language = "en" if safe_text(language, 5).lower() == "en" else "ar"
+        service_name = (
+            (service[language] if service else "")
+            or (service["ar"] if service else "")
+            or listing["title"]
+            or service_value
+        )
+        request_id = slug("req")
+        now = datetime.now(UTC).isoformat()
+        snapshot = {
+            "source": "community",
+            "kind": source_kind,
+            "listingId": listing["id"],
+            "sourceId": source_id,
+            "title": listing["title"],
+            "description": listing["description"],
+            "serviceValue": service_value,
+            "priceAmount": float(amount or 0),
+            "durationText": duration_text,
+            "billingPeriod": listing["billing_period"],
+        }
+        offer = {
+            "id": source_id,
+            "providerId": provider_id,
+            "amount": float(amount or 0),
+            "duration": duration_text,
+            "durationText": duration_text,
+            "note": offer_note,
+            "status": "accepted",
+            "source": "community",
+            "createdAt": now,
+        }
+        if language == "en":
+            welcome_text = (
+                f"Hello {user['name'] or 'Khadamati customer'}, this is "
+                f"{provider['name']}. Your chat about “{listing['title']}” is now open. "
+                "We can confirm the details and schedule here."
+            )
+        else:
+            welcome_text = (
+                f"مرحباً {user['name'] or 'عميل خدماتي'}، معك {provider['name']}. "
+                f"تم فتح المحادثة بخصوص «{listing['title']}». "
+                "يمكننا تأكيد التفاصيل والموعد هنا."
+            )
+        message = {
+            "id": slug("msg"),
+            "sender": "provider",
+            "senderId": provider_id,
+            "text": welcome_text,
+            "image": "",
+            "audio": "",
+            "location": None,
+            "systemGenerated": True,
+            "communitySnapshot": snapshot,
+            "createdAt": now,
+        }
+        channels = jload(listing["contact_channels"], ["app"])
+        whatsapp_enabled = bool(whatsapp and "whatsapp" in channels)
+        consent = {
+            "chat": True,
+            "whatsapp": whatsapp_enabled,
+            "call": False,
+        }
+        image_paths = [listing["image_path"]] if listing["image_path"] else []
+        con.execute(
+            """
+            INSERT INTO customer_requests(
+              id,user_id,customer_name,phone,service_value,service_name,gov,wilayah,
+              latitude,longitude,urgency,schedule_type,requested_at,budget_min,budget_max,
+              location_text,note,images,status,accepted_provider_id,matching_provider_ids,
+              declined_provider_ids,offers,messages,contact_consent,waitlisted,offers_open,
+              updated_at
+            ) VALUES(
+              :id,:user_id,:customer_name,:phone,:service_value,:service_name,:gov,:wilayah,
+              :latitude,:longitude,'normal','agreement',:requested_at,:budget_min,:budget_max,
+              :location_text,:note,:images,'accepted',:provider_id,:matching_provider_ids,
+              '[]',:offers,:messages,:contact_consent,0,0,CURRENT_TIMESTAMP
+            )
+            """,
+            {
+                "id": request_id,
+                "user_id": user["id"],
+                "customer_name": user["name"] or "",
+                "phone": user["phone"] or "",
+                "service_value": service_value,
+                "service_name": service_name,
+                "gov": listing["gov"] or user["gov"] or "",
+                "wilayah": listing["wilayah"] or user["wilayah"] or "",
+                "latitude": listing["latitude"],
+                "longitude": listing["longitude"],
+                "requested_at": now,
+                "budget_min": float(amount or 0),
+                "budget_max": float(amount or 0),
+                "location_text": listing["location_text"] or "",
+                "note": listing["description"] or "",
+                "images": jdump(image_paths),
+                "provider_id": provider_id,
+                "matching_provider_ids": jdump([provider_id]),
+                "offers": jdump([offer]),
+                "messages": jdump([message]),
+                "contact_consent": jdump(consent),
+            },
+        )
+        RequestLifecycleService(con).record(
+            request_id,
+            "community_request_created",
+            actor_kind="user",
+            actor_id=user["id"],
+            to_status="accepted",
+            detail=snapshot,
+        )
+        consent_service = ContactConsentService(con)
+        consent_service.set_channel(
+            request_id, user["id"], provider_id, "chat", True
+        )
+        consent_service.set_channel(
+            request_id, user["id"], provider_id, "whatsapp", whatsapp_enabled
+        )
+        consent_service.set_channel(
+            request_id, user["id"], provider_id, "call", False
+        )
+        create_notification(
+            con,
+            "provider",
+            provider_id,
+            "طلب جديد من المجتمع",
+            f"{service_name} • {listing['title']}",
+            type_="community",
+            related_id=request_id,
+            priority="high",
+            action_text="فتح المهمة",
+            action_route=f"provider:tasks:{request_id}",
+        )
+        create_notification(
+            con,
+            "user",
+            user["id"],
+            f"بدأت المحادثة مع {provider['name']}",
+            f"{service_name} • {listing['title']}",
+            type_="chat",
+            related_id=request_id,
+            priority="high",
+            action_text="فتح المحادثة",
+            action_route=f"user:chat:{request_id}",
+        )
+        create_notification(
+            con,
+            "admin",
+            "",
+            "طلب جديد من المجتمع",
+            f"{service_name} • {provider['name']}",
+            type_="community",
+            related_id=request_id,
+            action_text="فتح الطلب",
+            action_route=f"admin:request:{request_id}",
+        )
+        whatsapp_url = ""
+        if whatsapp_enabled and provider["phone"]:
+            whatsapp_message = (
+                f"مرحباً {provider['name']}، أرسلت طلب «{listing['title']}» "
+                f"عبر مجتمع خدماتي. رقم الطلب: {request_id}"
+            )
+            whatsapp_url = (
+                f"https://wa.me/{normalize_phone(provider['phone'])}"
+                f"?text={quote(whatsapp_message)}"
+            )
+        return {
+            "requestId": request_id,
+            "route": f"user:chat:{request_id}",
+            "whatsappUrl": whatsapp_url,
+        }
+
+    def community_post(self, data):
+        session = self.session()
+        if not session or session.get("kind") not in {"user", "provider", "admin"}:
+            return self.send_json({"error": "auth_required"}, 401)
+        action = safe_text(data.get("action"), 50)
+        with db() as con:
+            service = CommunityService(con)
+            if action == "save":
+                if session["kind"] not in {"user", "provider"}:
+                    return self.send_json({"error": "account_auth_required"}, 403)
+                owner_id = session.get("userId") or session.get("providerId")
+                listing_id = safe_text(data.get("id"), 120) or slug("community")
+                image_path = ""
+                if data.get("imageData"):
+                    image_path = save_upload_data(
+                        owner_id,
+                        data["imageData"],
+                        f"{listing_id}-cover",
+                        IMAGE_MIMES,
+                        3_000_000,
+                    )
+                item = service.save(
+                    session,
+                    data,
+                    listing_id=listing_id,
+                    image_path=image_path,
+                )
+                if item["status"] == "pending_review":
+                    create_notification(
+                        con,
+                        "admin",
+                        "",
+                        "إعلان مجتمع يحتاج مراجعة",
+                        item["title"],
+                        type_="community",
+                        related_id=item["id"],
+                        priority="high",
+                        action_text="مراجعة الإعلان",
+                        action_route=f"admin:community:{item['id']}",
+                    )
+                return self.send_json(
+                    {
+                        "ok": True,
+                        "listing": community_snapshot_view(
+                            {"listings": [item]}
+                        )["listings"][0],
+                    },
+                    200 if data.get("id") else 201,
+                )
+            if action == "owner_action":
+                if session["kind"] not in {"user", "provider"}:
+                    return self.send_json({"error": "account_auth_required"}, 403)
+                item = service.owner_action(
+                    session,
+                    safe_text(data.get("listingId"), 120),
+                    safe_text(data.get("ownerAction"), 30),
+                )
+                if item["status"] == "pending_payment":
+                    create_notification(
+                        con,
+                        "admin",
+                        "",
+                        "طلب تجديد إعلان باقة",
+                        item["title"],
+                        type_="community",
+                        related_id=item["id"],
+                        action_text="مراجعة التجديد",
+                        action_route=f"admin:community:{item['id']}",
+                    )
+                return self.send_json(
+                    {
+                        "ok": True,
+                        "listing": community_snapshot_view(
+                            {"listings": [item]}
+                        )["listings"][0],
+                    }
+                )
+            if action == "offer":
+                if session["kind"] != "provider":
+                    return self.send_json(
+                        {"error": "provider_auth_required"}, 401
+                    )
+                offer = service.offer(
+                    session,
+                    safe_text(data.get("listingId"), 120),
+                    data,
+                    offer_id=slug("community_offer"),
+                )
+                listing = service._get(offer["listingId"])
+                create_notification(
+                    con,
+                    "user",
+                    listing["owner_id"],
+                    "وصلك عرض جديد",
+                    f"{listing['title']} • {offer['amount']:.3f} ر.ع",
+                    type_="community",
+                    related_id=listing["id"],
+                    priority="high",
+                    action_text="عرض التفاصيل",
+                    action_route=f"user:community:{listing['id']}",
+                )
+                return self.send_json({"ok": True, "offer": offer}, 201)
+            if action == "accept_offer":
+                if session["kind"] != "user":
+                    return self.send_json({"error": "user_auth_required"}, 401)
+                con.execute("BEGIN IMMEDIATE")
+                result = service.accept_offer(
+                    session,
+                    safe_text(data.get("listingId"), 120),
+                    safe_text(data.get("offerId"), 120),
+                )
+                if result["duplicate"]:
+                    return self.send_json(
+                        {
+                            "ok": True,
+                            "duplicate": True,
+                            "requestId": result["requestId"],
+                            "route": f"user:chat:{result['requestId']}",
+                        }
+                    )
+                listing = result["listing"]
+                offer = result["offer"]
+                created = self.create_community_request(
+                    con,
+                    session,
+                    listing,
+                    offer["provider_id"],
+                    amount=offer["amount"],
+                    duration_text=offer["duration_text"],
+                    offer_note=offer["note"],
+                    source_kind="wanted",
+                    source_id=offer["id"],
+                    whatsapp=bool(data.get("useWhatsapp")),
+                    language=data.get("language", "ar"),
+                )
+                service.complete_offer_acceptance(
+                    listing["id"], offer["id"], created["requestId"]
+                )
+                return self.send_json({"ok": True, **created}, 201)
+            if action == "request_package":
+                if session["kind"] != "user":
+                    return self.send_json({"error": "user_auth_required"}, 401)
+                con.execute("BEGIN IMMEDIATE")
+                listing_id = safe_text(data.get("listingId"), 120)
+                started = service.begin_package_order(
+                    session,
+                    listing_id,
+                    safe_text(data.get("idempotencyKey"), 160),
+                    order_id=slug("community_order"),
+                )
+                existing_request = (
+                    started["order"]["request_id"]
+                    if isinstance(started["order"], sqlite3.Row)
+                    else started["order"].get("request_id", "")
+                )
+                if started["duplicate"] and existing_request:
+                    return self.send_json(
+                        {
+                            "ok": True,
+                            "duplicate": True,
+                            "requestId": existing_request,
+                            "route": f"user:chat:{existing_request}",
+                        }
+                    )
+                listing = started["listing"]
+                order_id = (
+                    started["order"]["id"]
+                    if isinstance(started["order"], sqlite3.Row)
+                    else started["order"].get("id")
+                )
+                created = self.create_community_request(
+                    con,
+                    session,
+                    listing,
+                    listing["owner_id"],
+                    amount=listing["price_amount"],
+                    duration_text=listing["duration_text"],
+                    source_kind="package",
+                    source_id=order_id,
+                    whatsapp=bool(data.get("useWhatsapp")),
+                    language=data.get("language", "ar"),
+                )
+                service.complete_package_order(
+                    order_id, created["requestId"], listing_id
+                )
+                return self.send_json({"ok": True, **created}, 201)
+            if action == "favorite":
+                enabled = service.favorite(
+                    session,
+                    safe_text(data.get("listingId"), 120),
+                    bool(data.get("enabled")),
+                    row_id=slug("community_favorite"),
+                )
+                return self.send_json({"ok": True, "enabled": enabled})
+            if action == "report":
+                report = service.report(
+                    session,
+                    safe_text(data.get("listingId"), 120),
+                    safe_text(data.get("reason"), 500),
+                    report_id=slug("community_report"),
+                )
+                create_notification(
+                    con,
+                    "admin",
+                    "",
+                    "بلاغ جديد في المجتمع",
+                    report["reason"],
+                    type_="community",
+                    related_id=report["listingId"],
+                    priority="high",
+                    action_text="فتح البلاغ",
+                    action_route=f"admin:community:{report['listingId']}",
+                )
+                return self.send_json({"ok": True, "report": report}, 201)
+            if action in {"settings", "moderate", "resolve_report"}:
+                if not has_permission(session, "manage_community"):
+                    return self.send_json(
+                        {
+                            "error": "permission_denied",
+                            "permission": "manage_community",
+                        },
+                        403,
+                    )
+                if action == "settings":
+                    settings = save_community_settings(con, data)
+                    log_audit(
+                        con, session, "community.settings.updated", "community", ""
+                    )
+                    return self.send_json({"ok": True, "settings": settings})
+                if action == "moderate":
+                    item = service.moderate(
+                        session,
+                        safe_text(data.get("listingId"), 120),
+                        safe_text(data.get("moderationAction"), 30),
+                        safe_text(data.get("note"), 500),
+                    )
+                    target_kind = (
+                        "user" if item["ownerKind"] == "user" else "provider"
+                    )
+                    create_notification(
+                        con,
+                        target_kind,
+                        item["ownerId"],
+                        "تم تحديث إعلانك في المجتمع",
+                        item["title"],
+                        type_="community",
+                        related_id=item["id"],
+                        action_text="فتح الإعلان",
+                        action_route=f"{target_kind}:community:{item['id']}",
+                    )
+                    log_audit(
+                        con,
+                        session,
+                        f"community.{safe_text(data.get('moderationAction'), 30)}",
+                        "community_listing",
+                        item["id"],
+                    )
+                    return self.send_json(
+                        {
+                            "ok": True,
+                            "listing": community_snapshot_view(
+                                {"listings": [item]}
+                            )["listings"][0],
+                        }
+                    )
+                service.resolve_report(
+                    session,
+                    safe_text(data.get("reportId"), 120),
+                    safe_text(data.get("resolution"), 500),
+                )
+                log_audit(
+                    con,
+                    session,
+                    "community.report.resolved",
+                    "community_report",
+                    safe_text(data.get("reportId"), 120),
+                )
+                return self.send_json({"ok": True})
+            return self.send_json({"error": "invalid_community_action"}, 400)
 
     def user_post(self, path, data):
         session = self.require_user()
