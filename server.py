@@ -1,5 +1,6 @@
 from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
 import http.client
+from http.cookies import SimpleCookie
 from urllib.parse import parse_qs, urlparse
 from pathlib import Path
 from datetime import datetime, timedelta, UTC
@@ -48,6 +49,18 @@ from khadamati_workflow import (
     attach_workflow_data,
     install_workflow_schema,
 )
+from khadamati_locations import (
+    LocationCatalogService,
+    install_location_schema,
+    location_snapshot,
+    resolve_area,
+)
+from khadamati_rewards import (
+    RewardCampaignService,
+    install_reward_schema,
+    loyalty_summary,
+    record_loyalty_transaction,
+)
 
 try:
     from pywebpush import WebPushException, webpush
@@ -70,7 +83,7 @@ def environment_flag(name, default=False):
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
-APP_RELEASE = os.environ.get("KHADAMATI_RELEASE", "v1.0.1").strip() or "v1.0.1"
+APP_RELEASE = os.environ.get("KHADAMATI_RELEASE", "v1.0.2").strip() or "v1.0.2"
 SAMPLE_DATA_ENABLED = environment_flag(
     "KHADAMATI_SEED_SAMPLE_DATA",
     environment_flag("KHADAMATI_SEED_DEMO_DATA", APP_ENV in {"development", "test"}),
@@ -83,6 +96,7 @@ INITIAL_ADMIN_CODE = (
 )
 DEFAULT_ALLOWED_ORIGINS = {
     "https://lllx6.github.io",
+    "https://khadamati-app-api.onrender.com",
     "http://127.0.0.1:8080",
     "http://localhost:8080",
 }
@@ -92,6 +106,9 @@ ALLOWED_ORIGINS = {
     if item.strip()
 }
 SESSION_DAYS = int(os.environ.get("KHADAMATI_SESSION_DAYS", "30"))
+ACCESS_TOKEN_MINUTES = max(
+    5, int(os.environ.get("KHADAMATI_ACCESS_TOKEN_MINUTES", "30"))
+)
 PUBLIC_APP_URL = os.environ.get("KHADAMATI_PUBLIC_URL", "https://lllx6.github.io/Khadamati/").rstrip("/") + "/"
 LOGIN_MAX_ATTEMPTS = max(3, int(os.environ.get("KHADAMATI_LOGIN_MAX_ATTEMPTS", "5")))
 LOGIN_LOCK_MINUTES = max(1, int(os.environ.get("KHADAMATI_LOGIN_LOCK_MINUTES", "15")))
@@ -970,6 +987,15 @@ def init_db():
         ensure_column(con, "app_users", "location_updated_at", "TEXT DEFAULT ''")
         ensure_column(con, "app_users", "updated_at", "TEXT DEFAULT ''")
         ensure_column(con, "app_users", "gender", "TEXT DEFAULT 'not_specified'")
+        ensure_column(con, "auth_sessions", "refresh_hash", "TEXT DEFAULT ''")
+        ensure_column(con, "auth_sessions", "access_expires_at", "TEXT DEFAULT ''")
+        ensure_column(con, "auth_sessions", "device_id", "TEXT DEFAULT ''")
+        ensure_column(con, "auth_sessions", "last_used_at", "TEXT DEFAULT ''")
+        ensure_column(con, "auth_sessions", "refreshed_at", "TEXT DEFAULT ''")
+        con.execute(
+            """CREATE UNIQUE INDEX IF NOT EXISTS idx_auth_refresh_hash
+            ON auth_sessions(refresh_hash) WHERE refresh_hash!=''"""
+        )
         ensure_column(con, "customer_requests", "offers", "TEXT DEFAULT '[]'")
         ensure_column(con, "customer_requests", "messages", "TEXT DEFAULT '[]'")
         ensure_column(con, "customer_requests", "arrival", "TEXT DEFAULT '{}'")
@@ -1035,6 +1061,8 @@ def init_db():
         ensure_column(con, "complaints", "user_id", "TEXT DEFAULT ''")
         ensure_column(con, "categories", "deleted_at", "TEXT DEFAULT ''")
         ensure_column(con, "services", "deleted_at", "TEXT DEFAULT ''")
+        install_reward_schema(con)
+        install_location_schema(con)
         for c in SEED_CATEGORIES:
             con.execute(
                 "INSERT OR IGNORE INTO categories(id,icon,ar,en,active) VALUES(?,?,?,?,?)",
@@ -1135,6 +1163,8 @@ def init_db():
                 "loyaltyEnabled": True,
                 "loyaltyCampaignActive": False,
                 "loyaltyTargetPoints": 100,
+                "loyaltyTargetRequests": 8,
+                "loyaltyCycleMode": "cap",
                 "loyaltyCampaignAr": "مكافأة خدماتي",
                 "loyaltyCampaignEn": "Khadamati reward",
                 "loyaltyCampaignNoteAr": "تحدد الإدارة تفاصيل المكافأة عند تفعيل الحملة.",
@@ -1153,6 +1183,8 @@ def init_db():
         platform_settings.setdefault("loyaltyEnabled", True)
         platform_settings.setdefault("loyaltyCampaignActive", False)
         platform_settings.setdefault("loyaltyTargetPoints", 100)
+        platform_settings.setdefault("loyaltyTargetRequests", 8)
+        platform_settings.setdefault("loyaltyCycleMode", "cap")
         platform_settings.setdefault("loyaltyCampaignAr", "مكافأة خدماتي")
         platform_settings.setdefault("loyaltyCampaignEn", "Khadamati reward")
         platform_settings.setdefault("loyaltyCampaignNoteAr", "تحدد الإدارة تفاصيل المكافأة عند تفعيل الحملة.")
@@ -1519,14 +1551,171 @@ def admin_public(r):
     return d
 
 
-def issue_token(session):
-    token = secrets.token_urlsafe(32)
+REFRESH_COOKIE_NAMES = {
+    "user": "khadamati_user_refresh",
+    "provider": "khadamati_provider_refresh",
+    "provider_pending": "khadamati_provider_refresh",
+    "admin": "khadamati_admin_refresh",
+}
+
+
+def issue_session_tokens(session, *, device_id=""):
+    access_token = secrets.token_urlsafe(32)
+    refresh_token = secrets.token_urlsafe(48)
+    session_id = slug("ses")
     with db() as con:
         con.execute(
-            "INSERT INTO auth_sessions(id,token_hash,session_json,expires_at) VALUES(?,?,?,?)",
-            (slug("ses"), hash_secret(token), jdump(session), iso_datetime(days=SESSION_DAYS)),
+            """INSERT INTO auth_sessions(
+            id,token_hash,refresh_hash,session_json,expires_at,
+            access_expires_at,device_id,last_used_at,refreshed_at)
+            VALUES(?,?,?,?,?,?,?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)""",
+            (
+                session_id,
+                hash_secret(access_token),
+                hash_secret(refresh_token),
+                jdump(session),
+                iso_datetime(days=SESSION_DAYS),
+                iso_datetime(minutes=ACCESS_TOKEN_MINUTES),
+                safe_text(device_id, 120),
+            ),
         )
-    return token
+    return {
+        "token": access_token,
+        "refreshToken": refresh_token,
+        "sessionId": session_id,
+        "kind": session.get("kind", ""),
+        "accessExpiresAt": iso_datetime(minutes=ACCESS_TOKEN_MINUTES),
+        "refreshExpiresAt": iso_datetime(days=SESSION_DAYS),
+    }
+
+
+def issue_token(session):
+    """Compatibility wrapper for callers that only consume an access token."""
+    return issue_session_tokens(session)["token"]
+
+
+def _cookie_values(headers):
+    cookie = SimpleCookie()
+    try:
+        cookie.load(str(headers.get("Cookie", "") or ""))
+    except Exception:
+        return {}
+    return {key: morsel.value for key, morsel in cookie.items()}
+
+
+def _session_not_expired(value):
+    try:
+        expires_at = datetime.fromisoformat(str(value or "").replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    if expires_at.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=UTC)
+    return expires_at > datetime.now(UTC)
+
+
+def refresh_session(headers, requested_kind):
+    requested_kind = safe_text(requested_kind, 40)
+    cookie_kind = "provider" if requested_kind == "provider_pending" else requested_kind
+    cookie_name = REFRESH_COOKIE_NAMES.get(cookie_kind)
+    refresh_token = _cookie_values(headers).get(cookie_name, "") if cookie_name else ""
+    if not refresh_token:
+        raise DomainError("refresh_session_required", 401)
+    with db() as con:
+        row = con.execute(
+            """SELECT * FROM auth_sessions
+            WHERE refresh_hash=? AND revoked=0""",
+            (hash_secret(refresh_token),),
+        ).fetchone()
+        if not row or not _session_not_expired(row["expires_at"]):
+            if row:
+                con.execute(
+                    "UPDATE auth_sessions SET revoked=1 WHERE id=?", (row["id"],)
+                )
+            raise DomainError("session_expired", 401)
+        stored = jload(row["session_json"], None)
+        stored_kind = stored.get("kind") if isinstance(stored, dict) else ""
+        if requested_kind == "provider":
+            kind_matches = stored_kind in {"provider", "provider_pending"}
+        else:
+            kind_matches = stored_kind == requested_kind
+        if not kind_matches:
+            raise DomainError("session_kind_mismatch", 403)
+        session = validated_session(con, stored)
+        if not session:
+            con.execute(
+                "UPDATE auth_sessions SET revoked=1 WHERE id=?", (row["id"],)
+            )
+            raise DomainError("session_expired", 401)
+        access_token = secrets.token_urlsafe(32)
+        next_refresh = secrets.token_urlsafe(48)
+        access_expires_at = iso_datetime(minutes=ACCESS_TOKEN_MINUTES)
+        refresh_expires_at = iso_datetime(days=SESSION_DAYS)
+        con.execute(
+            """UPDATE auth_sessions
+            SET token_hash=?,refresh_hash=?,session_json=?,expires_at=?,
+                access_expires_at=?,last_used_at=CURRENT_TIMESTAMP,
+                refreshed_at=CURRENT_TIMESTAMP
+            WHERE id=?""",
+            (
+                hash_secret(access_token),
+                hash_secret(next_refresh),
+                jdump(session),
+                refresh_expires_at,
+                access_expires_at,
+                row["id"],
+            ),
+        )
+    return {
+        "token": access_token,
+        "refreshToken": next_refresh,
+        "session": session,
+        "kind": session["kind"],
+        "accessExpiresAt": access_expires_at,
+        "refreshExpiresAt": refresh_expires_at,
+    }
+
+
+def persist_access_session(headers, requested_kind=""):
+    authorization = str(headers.get("Authorization", "") or "")
+    if not authorization.startswith("Bearer "):
+        raise DomainError("authentication_required", 401)
+    token = authorization[7:].strip()
+    with db() as con:
+        row = con.execute(
+            """SELECT * FROM auth_sessions
+            WHERE token_hash=? AND revoked=0""",
+            (hash_secret(token),),
+        ).fetchone()
+        if not row or not _session_not_expired(row["expires_at"]):
+            raise DomainError("session_expired", 401)
+        session = validated_session(con, jload(row["session_json"], None))
+        if not session:
+            raise DomainError("session_expired", 401)
+        expected = "provider" if session["kind"] == "provider_pending" else session["kind"]
+        if requested_kind and requested_kind != expected:
+            raise DomainError("session_kind_mismatch", 403)
+        refresh_token = secrets.token_urlsafe(48)
+        access_expires_at = iso_datetime(minutes=ACCESS_TOKEN_MINUTES)
+        refresh_expires_at = iso_datetime(days=SESSION_DAYS)
+        con.execute(
+            """UPDATE auth_sessions SET refresh_hash=?,expires_at=?,
+            access_expires_at=?,last_used_at=CURRENT_TIMESTAMP,
+            refreshed_at=CURRENT_TIMESTAMP WHERE id=?""",
+            (
+                hash_secret(refresh_token),
+                refresh_expires_at,
+                access_expires_at,
+                row["id"],
+            ),
+        )
+    return {
+        "token": token,
+        "refreshToken": refresh_token,
+        "session": session,
+        "kind": session["kind"],
+        "accessExpiresAt": access_expires_at,
+        "refreshExpiresAt": refresh_expires_at,
+    }
 
 
 def validated_session(con, session):
@@ -1605,40 +1794,54 @@ def token_session(headers):
         return None
     with db() as con:
         row = con.execute(
-            "SELECT id,session_json,expires_at FROM auth_sessions WHERE token_hash=? AND revoked=0",
+            """SELECT id,session_json,expires_at,access_expires_at
+            FROM auth_sessions WHERE token_hash=? AND revoked=0""",
             (hash_secret(token),),
         ).fetchone()
         if not row:
             return None
-        try:
-            expires_at = datetime.fromisoformat(str(row["expires_at"]).replace("Z", "+00:00"))
-            if expires_at.tzinfo is None:
-                expires_at = expires_at.replace(tzinfo=UTC)
-            if expires_at <= datetime.now(UTC):
-                con.execute("UPDATE auth_sessions SET revoked=1 WHERE id=?", (row["id"],))
-                return None
-        except ValueError:
+        access_expiry = row["access_expires_at"] or row["expires_at"]
+        if not _session_not_expired(access_expiry):
+            if not row["access_expires_at"]:
+                con.execute(
+                    "UPDATE auth_sessions SET revoked=1 WHERE id=?", (row["id"],)
+                )
+            return None
+        if not _session_not_expired(row["expires_at"]):
             con.execute("UPDATE auth_sessions SET revoked=1 WHERE id=?", (row["id"],))
             return None
         session = validated_session(con, jload(row["session_json"], None))
         if not session:
             con.execute("UPDATE auth_sessions SET revoked=1 WHERE id=?", (row["id"],))
             return None
+        con.execute(
+            "UPDATE auth_sessions SET last_used_at=CURRENT_TIMESTAMP WHERE id=?",
+            (row["id"],),
+        )
         return session
 
 
 def revoke_session(headers):
     authorization = str(headers.get("Authorization", "") or "")
-    if not authorization.startswith("Bearer "):
-        return False
-    token = authorization[7:].strip()
-    if not token:
-        return False
+    token = authorization[7:].strip() if authorization.startswith("Bearer ") else ""
+    cookie_hashes = [
+        hash_secret(value)
+        for name, value in _cookie_values(headers).items()
+        if name in set(REFRESH_COOKIE_NAMES.values()) and value
+    ]
     with db() as con:
-        result = con.execute(
-            "UPDATE auth_sessions SET revoked=1 WHERE token_hash=?", (hash_secret(token),)
-        )
-    return result.rowcount > 0
+        changed = 0
+        if token:
+            changed += con.execute(
+                "UPDATE auth_sessions SET revoked=1 WHERE token_hash=?",
+                (hash_secret(token),),
+            ).rowcount
+        for cookie_hash in cookie_hashes:
+            changed += con.execute(
+                "UPDATE auth_sessions SET revoked=1 WHERE refresh_hash=?",
+                (cookie_hash,),
+            ).rowcount
+    return changed > 0
 
 
 def revoke_account_sessions(con, kind, account_id, exclude_token_hash=None):
@@ -2433,12 +2636,30 @@ def get_bootstrap(session=None):
             "loyaltyEnabled", "requestBoardEnabled", "contactApprovalRequired",
             "loyaltyCampaignActive", "loyaltyTargetPoints", "loyaltyCampaignAr",
             "loyaltyCampaignEn", "loyaltyCampaignNoteAr", "loyaltyCampaignNoteEn",
+            "loyaltyTargetRequests", "loyaltyCycleMode",
             "subscriptionsEnabled", "paymentGatewayEnabled", "serviceAreas",
             "deviceNotifications", "mergeNotifications",
         }
         settings = platform_settings if is_admin else {
             key: value for key, value in platform_settings.items() if key in public_setting_keys
         }
+        location_catalog = location_snapshot(con, include_inactive=is_admin)
+        settings = dict(settings)
+        settings["serviceAreas"] = [
+            {
+                "id": area["id"],
+                "ar": area["ar"],
+                "en": area["en"],
+                "active": area["active"],
+                "w": [
+                    [wilayah["ar"], wilayah["en"], wilayah["id"]]
+                    for wilayah in area["w"]
+                    if is_admin or wilayah["active"]
+                ],
+            }
+            for area in location_catalog
+            if is_admin or area["active"]
+        ]
         packages = [
             row_package(r) for r in con.execute(
                 "SELECT * FROM packages WHERE active=1 AND COALESCE(legacy,0)=0 ORDER BY price,duration_days"
@@ -2762,6 +2983,8 @@ def get_bootstrap(session=None):
                     "campaigns": [dict(r) | {"rules": jload(r["rules"], {})} for r in con.execute(
                         "SELECT * FROM campaigns ORDER BY created_at DESC"
                     )],
+                    "rewardCampaigns": RewardCampaignService(con).list_admin(),
+                    "campaignEligibility": RewardCampaignService(con).eligibility_queue(),
                     "promotions": [dict(r) for r in con.execute(
                         "SELECT * FROM provider_promotions ORDER BY created_at DESC"
                     )],
@@ -2780,6 +3003,38 @@ def get_bootstrap(session=None):
                 admin_entities["contactConsents"] = [dict(r) for r in con.execute(
                     "SELECT * FROM contact_consents ORDER BY updated_at DESC LIMIT 300"
                 )]
+        reward_campaigns = []
+        user_loyalty = {}
+        reward_service = RewardCampaignService(con)
+        if is_user:
+            reward_campaigns = reward_service.for_subject("user", session["userId"])
+            try:
+                loyalty_target = int(platform_settings.get("loyaltyTargetRequests", 8) or 8)
+            except (TypeError, ValueError):
+                loyalty_target = 8
+            user_loyalty = loyalty_summary(
+                con,
+                session["userId"],
+                target=max(1, loyalty_target),
+                cycle_mode=(
+                    "repeat"
+                    if platform_settings.get("loyaltyCycleMode") == "repeat"
+                    else "cap"
+                ),
+            )
+        elif is_provider:
+            current_provider = next(
+                (item for item in providers if item["id"] == session["providerId"]),
+                {},
+            )
+            subject_kind = (
+                "company"
+                if current_provider.get("providerType") == "company"
+                else "provider"
+            )
+            reward_campaigns = reward_service.for_subject(
+                subject_kind, session["providerId"]
+            )
         data = {
             "categories": categories,
             "providers": providers,
@@ -2797,6 +3052,10 @@ def get_bootstrap(session=None):
             "users": users,
             "advertisements": advertisements,
             "serviceAssets": service_assets if is_user else [],
+            "locationCatalog": location_catalog,
+            "rewardCampaigns": reward_campaigns,
+            "loyaltySummary": user_loyalty,
+            "serverTime": datetime.now(UTC).isoformat(),
             "serviceAvailability": service_availability_snapshot(con),
             "providerInsights": provider_operational_insights(
                 con, session["providerId"]
@@ -3287,6 +3546,7 @@ class Handler(SimpleHTTPRequestHandler):
             self.send_header("Access-Control-Allow-Headers", "Authorization, Content-Type")
             self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
             self.send_header("Access-Control-Expose-Headers", "X-Request-ID")
+            self.send_header("Access-Control-Allow-Credentials", "true")
             self.send_header("Vary", "Origin")
         super().end_headers()
 
@@ -3294,13 +3554,54 @@ class Handler(SimpleHTTPRequestHandler):
         self.send_response(204)
         self.end_headers()
 
-    def send_json(self, data, status=200):
+    def send_json(self, data, status=200, extra_headers=None):
         raw = jdump(data).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(raw)))
+        for name, value in extra_headers or []:
+            self.send_header(name, value)
         self.end_headers()
         self.wfile.write(raw)
+
+    def request_origin_allowed(self):
+        origin = str(self.headers.get("Origin", "") or "").rstrip("/")
+        return not origin or origin in ALLOWED_ORIGINS
+
+    def refresh_cookie_header(self, kind, value, *, clear=False):
+        kind = "provider" if kind == "provider_pending" else kind
+        name = REFRESH_COOKIE_NAMES.get(kind)
+        if not name:
+            return ""
+        secure = (
+            APP_ENV == "production"
+            or self.headers.get("X-Forwarded-Proto", "").split(",", 1)[0].strip()
+            == "https"
+        )
+        parts = [
+            f"{name}={'' if clear else value}",
+            "Path=/api/",
+            "HttpOnly",
+            f"Max-Age={0 if clear else SESSION_DAYS * 86400}",
+            "SameSite=None" if secure else "SameSite=Lax",
+        ]
+        if secure:
+            parts.append("Secure")
+        return "; ".join(parts)
+
+    def send_session_json(self, payload, session_bundle, status=200):
+        kind = session_bundle.get("kind", "")
+        cookie = self.refresh_cookie_header(
+            kind, session_bundle.pop("refreshToken", "")
+        )
+        response = {
+            **payload,
+            "token": session_bundle["token"],
+            "accessExpiresAt": session_bundle["accessExpiresAt"],
+            "sessionKind": kind,
+        }
+        headers = [("Set-Cookie", cookie)] if cookie else []
+        return self.send_json(response, status, headers)
 
     def send_bytes(self, raw, content_type, filename=None, status=200):
         self.send_response(status)
@@ -3685,8 +3986,60 @@ class Handler(SimpleHTTPRequestHandler):
             return self.send_domain_error(err)
         except (json.JSONDecodeError, UnicodeDecodeError, ValueError):
             return self.send_json({"error": "invalid_request_data"}, 400)
+        if path == "/api/location/reverse":
+            try:
+                latitude = finite_number(
+                    data.get("lat"), minimum=-90, maximum=90
+                )
+                longitude = finite_number(
+                    data.get("lng"), minimum=-180, maximum=180
+                )
+            except DomainError as err:
+                return self.send_domain_error(err)
+            with db() as con:
+                area = resolve_area(con, latitude, longitude)
+            return self.send_json(
+                {
+                    "ok": True,
+                    "area": area,
+                    "location": {"lat": latitude, "lng": longitude},
+                    "serverTime": datetime.now(UTC).isoformat(),
+                }
+            )
+        if path in {"/api/auth/refresh", "/api/auth/persist", "/api/auth/logout"}:
+            if not self.request_origin_allowed():
+                return self.send_json({"error": "origin_not_allowed"}, 403)
+        if path == "/api/auth/refresh":
+            requested_kind = safe_text(data.get("kind"), 40)
+            if requested_kind not in {"user", "provider", "admin"}:
+                return self.send_json({"error": "invalid_session_kind"}, 400)
+            bundle = refresh_session(self.headers, requested_kind)
+            return self.send_session_json(
+                {"ok": True, "session": bundle["session"]}, bundle
+            )
+        if path == "/api/auth/persist":
+            requested_kind = safe_text(data.get("kind"), 40)
+            if requested_kind not in {"", "user", "provider", "admin"}:
+                return self.send_json({"error": "invalid_session_kind"}, 400)
+            bundle = persist_access_session(self.headers, requested_kind)
+            return self.send_session_json(
+                {"ok": True, "session": bundle["session"]}, bundle
+            )
         if path == "/api/auth/logout":
-            return self.send_json({"ok": True, "revoked": revoke_session(self.headers)})
+            requested_kind = safe_text(data.get("kind"), 40)
+            revoked = revoke_session(self.headers)
+            clear_kinds = (
+                [requested_kind]
+                if requested_kind in {"user", "provider", "admin"}
+                else ["user", "provider", "admin"]
+            )
+            headers = [
+                ("Set-Cookie", self.refresh_cookie_header(kind, "", clear=True))
+                for kind in clear_kinds
+            ]
+            return self.send_json(
+                {"ok": True, "revoked": revoked}, extra_headers=headers
+            )
         if path == "/api/otp/request":
             purpose = str(data.get("purpose", "login") or "login")[:80]
             target_kind = str(data.get("targetKind", "user") or "user")[:40]
@@ -3758,11 +4111,14 @@ class Handler(SimpleHTTPRequestHandler):
                     return self.send_json({"error": "invalid_code", "attempts": attempts}, 403)
                 clear_login_failures(con, "admin", lock_key)
             user = admin_public(row)
-            token = issue_token({"kind": "admin", **user})
-            return self.send_json({"token": token, "user": user})
+            bundle = issue_session_tokens(
+                {"kind": "admin", **user}, device_id=data.get("deviceId", "")
+            )
+            return self.send_session_json({"user": user}, bundle)
         if path == "/api/provider/login":
             phone = normalize_phone(data.get("phone", ""))
-            if len(phone) < 11:
+            account_id = safe_text(data.get("accountId"), 120)
+            if len(phone) < 11 and not account_id:
                 return self.send_json({"error": "valid_phone_required"}, 400)
             pending_request = None
             provider_row = None
@@ -3770,18 +4126,30 @@ class Handler(SimpleHTTPRequestHandler):
             if not pin:
                 pin = safe_text(data.get("code", ""), 8)
             with db() as con:
-                lock_state = login_failure_state(con, "provider", phone)
+                lock_key = account_id or phone
+                lock_state = login_failure_state(con, "provider", lock_key)
                 if lock_state["locked"]:
                     return self.send_json(
                         {"error": "login_temporarily_locked", "retryAfter": lock_state["retryAfter"]},
                         429,
                     )
-                provider_candidates = list(con.execute(
-                    """SELECT * FROM providers WHERE active=1 AND status!='deleted'
-                    AND (phone=? OR phone=?) ORDER BY created_at DESC""",
-                    (phone, phone.replace("968", "", 1)),
-                ))
-                if not provider_candidates:
+                if account_id:
+                    provider_candidates = list(
+                        con.execute(
+                            """SELECT * FROM providers
+                            WHERE id=? AND active=1 AND status!='deleted'""",
+                            (account_id,),
+                        )
+                    )
+                    if provider_candidates:
+                        phone = normalize_phone(provider_candidates[0]["phone"])
+                else:
+                    provider_candidates = list(con.execute(
+                        """SELECT * FROM providers WHERE active=1 AND status!='deleted'
+                        AND (phone=? OR phone=?) ORDER BY created_at DESC""",
+                        (phone, phone.replace("968", "", 1)),
+                    ))
+                if not provider_candidates and phone:
                     provider_candidates = [
                         candidate for candidate in con.execute(
                             "SELECT * FROM providers WHERE active=1 AND status!='deleted' ORDER BY created_at DESC"
@@ -3798,14 +4166,14 @@ class Handler(SimpleHTTPRequestHandler):
                     ),
                     provider_candidates[0] if provider_candidates else None,
                 )
-                team_row = con.execute(
+                team_row = None if account_id else con.execute(
                     """SELECT tm.*,p.name provider_name FROM provider_team_members tm
                     JOIN providers p ON p.id=tm.provider_id
                     WHERE tm.active=1 AND p.active=1 AND p.status!='deleted'
                     AND (tm.phone=? OR tm.phone=?) LIMIT 1""",
                     (phone, phone.replace("968", "", 1)),
                 ).fetchone()
-                if not team_row:
+                if not team_row and not account_id:
                     team_row = next(
                         (
                             candidate
@@ -3836,10 +4204,22 @@ class Handler(SimpleHTTPRequestHandler):
                     team_row and team_row["pin_hash"] and verify_secret(pin, team_row["pin_hash"])
                 )
                 if not (owner_pin_ok or team_pin_ok or otp_ok):
-                    for request_row in con.execute(
-                        "SELECT id,payload,created_at FROM provider_requests ORDER BY created_at DESC"
-                    ):
+                    pending_rows = (
+                        con.execute(
+                            """SELECT id,payload,created_at FROM provider_requests
+                            WHERE id=?""",
+                            (account_id,),
+                        )
+                        if account_id
+                        else con.execute(
+                            """SELECT id,payload,created_at FROM provider_requests
+                            ORDER BY created_at DESC"""
+                        )
+                    )
+                    for request_row in pending_rows:
                         request_payload = jload(request_row["payload"], {})
+                        if account_id and request_row["id"] == account_id:
+                            phone = normalize_phone(request_payload.get("phone", ""))
                         if (
                             phone_matches(request_payload.get("phone", ""), phone)
                             and request_payload.get("pinHash")
@@ -3850,17 +4230,19 @@ class Handler(SimpleHTTPRequestHandler):
                             )
                             break
                 if not (owner_pin_ok or team_pin_ok or otp_ok or pending_request):
-                    attempts = record_login_failure(con, "provider", phone, phone)
+                    attempts = record_login_failure(
+                        con, "provider", lock_key, phone
+                    )
                     return self.send_json(
                         {"error": "invalid_provider_login", "attempts": attempts},
                         403,
                     )
                 if pending_request:
-                    clear_login_failures(con, "provider", phone)
+                    clear_login_failures(con, "provider", lock_key)
                 elif row and (owner_pin_ok or otp_ok):
                     provider_row = row
                     provider_id = row["id"]
-                    clear_login_failures(con, "provider", phone)
+                    clear_login_failures(con, "provider", lock_key)
                     provider_role = "provider_owner"
                     provider_permissions = list(PROVIDER_ROLE_PERMISSIONS["provider_owner"])
                     member_id = ""
@@ -3870,7 +4252,7 @@ class Handler(SimpleHTTPRequestHandler):
                         "SELECT * FROM providers WHERE id=? AND active=1 AND status!='deleted'",
                         (provider_id,),
                     ).fetchone()
-                    clear_login_failures(con, "provider", phone)
+                    clear_login_failures(con, "provider", lock_key)
                     if not str(team_row["pin_hash"] or "").startswith("pbkdf2_sha256$"):
                         con.execute(
                             "UPDATE provider_team_members SET pin_hash=? WHERE id=?",
@@ -3885,24 +4267,25 @@ class Handler(SimpleHTTPRequestHandler):
                         (hash_pin(pin), row["id"]),
                     )
             if pending_request:
-                token = issue_token({
+                bundle = issue_session_tokens({
                     "kind": "provider_pending", "requestId": pending_request["id"],
                     "name": pending_request.get("name", ""), "phone": phone,
-                })
-                return self.send_json({
-                    "token": token, "pending": True, "request": pending_request,
-                })
+                }, device_id=data.get("deviceId", ""))
+                return self.send_session_json(
+                    {"pending": True, "request": pending_request}, bundle
+                )
             if not provider_row:
                 return self.send_json({"error": "invalid_provider_login"}, 403)
             provider = row_provider(provider_row, private=True, sign_private=True)
-            token = issue_token({
+            bundle = issue_session_tokens({
                 "kind": "provider", "providerId": provider["id"], "name": provider["name"],
                 "role": provider_role, "memberId": member_id,
                 "providerPermissions": provider_permissions,
-            })
-            return self.send_json({"token": token, "provider": provider})
+            }, device_id=data.get("deviceId", ""))
+            return self.send_session_json({"provider": provider}, bundle)
         if path == "/api/users/login":
             phone = normalize_phone(data.get("phone", ""))
+            account_id = safe_text(data.get("accountId"), 120)
             name = str(data.get("name", "") or "").strip()[:80]
             pin = str(data.get("pin", "") or "")
             gender = (
@@ -3910,13 +4293,25 @@ class Handler(SimpleHTTPRequestHandler):
                 if data.get("gender") in {"male", "female", "not_specified"}
                 else ""
             )
-            if len(phone) < 11:
+            if len(phone) < 11 and not account_id:
                 return self.send_json({"error": "valid_phone_required"}, 400)
             with db() as con:
-                row = con.execute("SELECT * FROM app_users WHERE phone=?", (phone,)).fetchone()
+                row = (
+                    con.execute(
+                        "SELECT * FROM app_users WHERE id=?", (account_id,)
+                    ).fetchone()
+                    if account_id
+                    else con.execute(
+                        "SELECT * FROM app_users WHERE phone=?", (phone,)
+                    ).fetchone()
+                )
+                if row:
+                    phone = normalize_phone(row["phone"])
+                elif account_id:
+                    return self.send_json({"error": "invalid_user_pin"}, 403)
                 if row and row["status"] != "active":
                     return self.send_json({"error": "account_inactive"}, 403)
-                lock_key = row["id"] if row else phone
+                lock_key = row["id"] if row else (account_id or phone)
                 lock_state = login_failure_state(con, "user", lock_key)
                 if lock_state["locked"]:
                     return self.send_json(
@@ -3991,8 +4386,16 @@ class Handler(SimpleHTTPRequestHandler):
                     )
                 user_row = con.execute("SELECT * FROM app_users WHERE id=?", (user_id,)).fetchone()
             user = row_app_user(user_row, private=True, sign_private=True)
-            token = issue_token({"kind": "user", "userId": user_id, "name": user["name"], "phone": phone})
-            return self.send_json({"token": token, "user": user})
+            bundle = issue_session_tokens(
+                {
+                    "kind": "user",
+                    "userId": user_id,
+                    "name": user["name"],
+                    "phone": phone,
+                },
+                device_id=data.get("deviceId", ""),
+            )
+            return self.send_session_json({"user": user}, bundle)
         if path == "/api/provider-requests":
             pin = str(data.get("pin", "")).strip()[:128]
             req_id = slug("req")
@@ -4121,13 +4524,15 @@ class Handler(SimpleHTTPRequestHandler):
                 )
             send_whatsapp(settings.get("adminWhatsapp"), f"طلب مزود جديد في خدماتي: {item['name']} - {item['phone']} - {len(item['services'])} خدمات")
             safe_item = provider_request_view(item)
-            token = issue_token({
+            bundle = issue_session_tokens({
                 "kind": "provider_pending",
                 "requestId": item["id"],
                 "name": item["name"],
                 "phone": item["phone"],
-            })
-            return self.send_json({"ok": True, "request": safe_item, "token": token}, 201)
+            }, device_id=data.get("deviceId", ""))
+            return self.send_session_json(
+                {"ok": True, "request": safe_item}, bundle, 201
+            )
         if path == "/api/reviews":
             return self.save_review(data)
         if path == "/api/complaints":
@@ -4205,9 +4610,32 @@ class Handler(SimpleHTTPRequestHandler):
                     item["phone"], item["comment"], item["request_id"], item["user_id"],
                 ),
             )
+            record_loyalty_transaction(
+                con,
+                session["userId"],
+                5,
+                "verified_review",
+                f"review:{request_id}",
+            )
             recompute_provider_quality(con, provider_id)
             log_audit(con, session, "review.created", provider_id, request_id)
-        return self.send_json({"ok": True, "review": item}, 201)
+            platform_row = con.execute(
+                "SELECT value FROM settings WHERE key='platform'"
+            ).fetchone()
+            platform = jload(platform_row["value"], {}) if platform_row else {}
+            summary = loyalty_summary(
+                con,
+                session["userId"],
+                target=max(1, int(platform.get("loyaltyTargetRequests", 8) or 8)),
+                cycle_mode=(
+                    "repeat"
+                    if platform.get("loyaltyCycleMode") == "repeat"
+                    else "cap"
+                ),
+            )
+        return self.send_json(
+            {"ok": True, "review": item, "loyaltySummary": summary}, 201
+        )
 
     def save_complaint(self, data):
         session = self.require_user()
@@ -4429,10 +4857,25 @@ class Handler(SimpleHTTPRequestHandler):
                             action_text="فتح المهمة",
                             action_route=f"provider:tasks:{request_id}",
                         )
+                        record_loyalty_transaction(
+                            con,
+                            user_id,
+                            10,
+                            "completed_request",
+                            f"completed:{request_id}",
+                        )
                         updated = con.execute(
                             "SELECT * FROM customer_requests WHERE id=?",
                             (request_id,),
                         ).fetchone()
+                        platform_row = con.execute(
+                            "SELECT value FROM settings WHERE key='platform'"
+                        ).fetchone()
+                        platform = (
+                            jload(platform_row["value"], {})
+                            if platform_row
+                            else {}
+                        )
                         return self.send_json(
                             {
                                 "ok": True,
@@ -4441,6 +4884,25 @@ class Handler(SimpleHTTPRequestHandler):
                                     con,
                                     row_customer_request(updated, sign_private=True),
                                     asset_visible=True,
+                                ),
+                                "loyaltySummary": loyalty_summary(
+                                    con,
+                                    user_id,
+                                    target=max(
+                                        1,
+                                        int(
+                                            platform.get(
+                                                "loyaltyTargetRequests", 8
+                                            )
+                                            or 8
+                                        ),
+                                    ),
+                                    cycle_mode=(
+                                        "repeat"
+                                        if platform.get("loyaltyCycleMode")
+                                        == "repeat"
+                                        else "cap"
+                                    ),
                                 ),
                             }
                         )
@@ -6240,6 +6702,7 @@ class Handler(SimpleHTTPRequestHandler):
             "/api/admin/recovery-code": "manage_admins",
             "/api/admin/settings": "manage_settings",
             "/api/admin/catalog": "manage_settings",
+            "/api/admin/locations": "manage_settings",
             "/api/admin/users": "manage_admins",
             "/api/admin/test-whatsapp": "manage_settings",
             "/api/admin/ads": "manage_settings",
@@ -6248,6 +6711,24 @@ class Handler(SimpleHTTPRequestHandler):
         if not session:
             return
         with db() as con:
+            if path == "/api/admin/locations":
+                try:
+                    result = LocationCatalogService(con).apply(data)
+                except DomainError as err:
+                    return self.send_domain_error(err)
+                log_audit(
+                    con,
+                    session,
+                    f"location.{safe_text(data.get('action'), 40) or 'updated'}",
+                    safe_text(
+                        data.get("id")
+                        or data.get("governorateId")
+                        or data.get("wilayahId"),
+                        120,
+                    ),
+                    "",
+                )
+                return self.send_json({"ok": True, **result})
             if path == "/api/admin/catalog":
                 action = safe_text(data.get("action"), 40)
                 category_id = safe_text(data.get("categoryId") or data.get("id"), 80)
@@ -6951,10 +7432,68 @@ class Handler(SimpleHTTPRequestHandler):
                 log_audit(con, session, "coupon.upserted", coupon_id, code)
                 return self.send_json({"ok": True, "id": coupon_id})
             if path == "/api/admin/campaigns":
-                campaign_id = str(data.get("id") or slug("campaign"))
+                service = RewardCampaignService(con)
+                action = safe_text(data.get("action"), 40)
+                if action == "review_eligibility":
+                    eligibility = service.review_eligibility(
+                        safe_text(data.get("eligibilityId"), 180),
+                        status=safe_text(data.get("status"), 40),
+                        reviewed_by=session.get("id", ""),
+                        note=safe_text(data.get("note"), 500),
+                    )
+                    log_audit(
+                        con,
+                        session,
+                        "campaign.eligibility_reviewed",
+                        eligibility["id"],
+                        eligibility["status"],
+                    )
+                    return self.send_json(
+                        {"ok": True, "eligibility": eligibility}
+                    )
+                campaign_id = safe_text(data.get("id"), 120) or slug("campaign")
+                is_reward = (
+                    data.get("kind") == "reward"
+                    or any(
+                        key in data
+                        for key in (
+                            "audience",
+                            "rewardType",
+                            "metric",
+                            "target",
+                            "descriptionAr",
+                        )
+                    )
+                )
+                if action == "set_status":
+                    campaign = service.update_status(
+                        campaign_id, safe_text(data.get("status"), 40)
+                    )
+                    log_audit(
+                        con,
+                        session,
+                        "campaign.status_updated",
+                        campaign_id,
+                        campaign["status"],
+                    )
+                    return self.send_json({"ok": True, "campaign": campaign})
+                if is_reward:
+                    campaign = service.save(campaign_id, data)
+                    log_audit(
+                        con,
+                        session,
+                        "campaign.upserted",
+                        campaign_id,
+                        campaign["status"],
+                    )
+                    return self.send_json({"ok": True, "campaign": campaign})
                 status = str(data.get("status", "draft") or "draft")
-                if status not in {"draft", "scheduled", "active", "paused", "completed", "cancelled"}:
-                    return self.send_json({"error": "invalid_campaign_status"}, 400)
+                if status not in {
+                    "draft", "scheduled", "active", "paused", "completed", "cancelled"
+                }:
+                    return self.send_json(
+                        {"error": "invalid_campaign_status"}, 400
+                    )
                 con.execute(
                     """INSERT INTO campaigns(
                     id,name_ar,name_en,kind,starts_at,ends_at,budget,status,rules)
@@ -6968,8 +7507,17 @@ class Handler(SimpleHTTPRequestHandler):
                         str(data.get("kind", "subscription") or "subscription")[:40],
                         str(data.get("startsAt", "") or "")[:40],
                         str(data.get("endsAt", "") or "")[:40],
-                        finite_number(data.get("budget", 0), minimum=0, maximum=1_000_000_000), status,
-                        jdump(data.get("rules", {}) if isinstance(data.get("rules"), dict) else {}),
+                        finite_number(
+                            data.get("budget", 0),
+                            minimum=0,
+                            maximum=1_000_000_000,
+                        ),
+                        status,
+                        jdump(
+                            data.get("rules", {})
+                            if isinstance(data.get("rules"), dict)
+                            else {}
+                        ),
                     ),
                 )
                 log_audit(con, session, "campaign.upserted", campaign_id, status)
@@ -7102,6 +7650,25 @@ class Handler(SimpleHTTPRequestHandler):
                 settings_data["supportEmail"] = SUPPORT_EMAIL
                 settings_data["policyVersion"] = POLICY_VERSION
                 settings_data["currency"] = OMR
+                try:
+                    loyalty_target = int(
+                        settings_data.get("loyaltyTargetRequests", 8)
+                    )
+                except (TypeError, ValueError):
+                    return self.send_json(
+                        {"error": "invalid_loyalty_target"}, 400
+                    )
+                if loyalty_target < 1 or loyalty_target > 100_000:
+                    return self.send_json(
+                        {"error": "invalid_loyalty_target"}, 400
+                    )
+                settings_data["loyaltyTargetRequests"] = loyalty_target
+                settings_data["loyaltyCycleMode"] = (
+                    "repeat"
+                    if settings_data.get("loyaltyCycleMode") == "repeat"
+                    else "cap"
+                )
+                settings_data.pop("serviceAreas", None)
                 con.execute("UPDATE settings SET value=? WHERE key='platform'", (jdump(settings_data),))
                 log_audit(con, session, "settings.updated", "platform", "")
                 return self.send_json({"ok": True})

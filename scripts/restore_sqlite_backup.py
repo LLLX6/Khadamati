@@ -11,7 +11,12 @@ import sqlite3
 import tempfile
 import zipfile
 
-from scripts.backup_sqlite import FORMAT, sha256_file
+try:
+    from scripts.backup_sqlite import FORMAT, sha256_file
+except ModuleNotFoundError:
+    # Support the documented direct invocation:
+    # python scripts/restore_sqlite_backup.py ...
+    from backup_sqlite import FORMAT, sha256_file
 
 
 def safe_archive_name(name: str) -> bool:

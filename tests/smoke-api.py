@@ -3,6 +3,7 @@ import io
 import os
 import sys
 import base64
+import http.cookiejar
 import urllib.error
 import urllib.request
 import zipfile
@@ -44,6 +45,25 @@ def request(path, payload=None, token=""):
     )
     try:
         with urllib.request.urlopen(req, timeout=20) as response:
+            return response.status, json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as error:
+        raw = error.read().decode("utf-8")
+        return error.code, json.loads(raw or "{}")
+
+
+def session_request(opener, path, payload=None, token=""):
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8") if payload is not None else None
+    headers = {"Content-Type": "application/json", "Origin": "http://127.0.0.1:8080"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    req = urllib.request.Request(
+        f"{BASE_URL}{path}",
+        data=body,
+        headers=headers,
+        method="POST" if payload is not None else "GET",
+    )
+    try:
+        with opener.open(req, timeout=20) as response:
             return response.status, json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as error:
         raw = error.read().decode("utf-8")
@@ -108,6 +128,104 @@ def main():
         item.get("targetKind") == "admin"
         for item in scoped_admin.get("notifications", [])
     ), "Admin session received account-scoped notifications"
+
+    status, reverse_area = request(
+        "/api/location/reverse", {"lat": 23.6703, "lng": 58.1891}
+    )
+    expect(status, reverse_area, {200}, "Reverse area lookup failed")
+    assert reverse_area.get("area", {}).get("wilayahId") == "muscat-seeb", (
+        f"Seeb coordinates resolved incorrectly: {reverse_area}"
+    )
+    status, forbidden_location_admin = request(
+        "/api/admin/locations",
+        {
+            "action": "save_governorate",
+            "id": "smoke-forbidden-governorate",
+            "ar": "محظور",
+            "en": "Forbidden",
+        },
+    )
+    assert status in {401, 403}, "Location administration was exposed publicly"
+    status, location_governorate = request(
+        "/api/admin/locations",
+        {
+            "action": "save_governorate",
+            "id": "smoke-governorate",
+            "ar": "محافظة فحص",
+            "en": "Smoke Governorate",
+            "sortOrder": 90,
+        },
+        admin_token,
+    )
+    expect(status, location_governorate, {200}, "Governorate creation failed")
+    status, location_wilayat = request(
+        "/api/admin/locations",
+        {
+            "action": "save_wilayat",
+            "id": "smoke-governorate-smoke-wilayat",
+            "governorateId": "smoke-governorate",
+            "ar": "ولاية فحص",
+            "en": "Smoke Wilayat",
+            "sortOrder": 1,
+            "lat": 23.5,
+            "lng": 58.1,
+        },
+        admin_token,
+    )
+    expect(status, location_wilayat, {200}, "Wilayat creation failed")
+    status, paused_wilayat = request(
+        "/api/admin/locations",
+        {
+            "action": "set_wilayat_active",
+            "id": "smoke-governorate-smoke-wilayat",
+            "active": False,
+        },
+        admin_token,
+    )
+    expect(status, paused_wilayat, {200}, "Wilayat pause failed")
+    smoke_governorate = next(
+        item
+        for item in paused_wilayat["areas"]
+        if item["id"] == "smoke-governorate"
+    )
+    assert next(
+        item
+        for item in smoke_governorate["w"]
+        if item["id"] == "smoke-governorate-smoke-wilayat"
+    )["active"] is False
+
+    campaign_id = "smoke-reward-campaign"
+    status, campaign_saved = request(
+        "/api/admin/campaigns",
+        {
+            "id": campaign_id,
+            "kind": "reward",
+            "nameAr": "حملة فحص",
+            "nameEn": "Smoke campaign",
+            "descriptionAr": "حملة للتحقق من المسار الإداري",
+            "descriptionEn": "Campaign for administrative workflow validation",
+            "audience": "user",
+            "rewardType": "draw",
+            "rewardLabelAr": "مكافأة تحددها الإدارة",
+            "rewardLabelEn": "Management-defined reward",
+            "metric": "completed_requests",
+            "target": 2,
+            "startsAt": "2026-01-01T00:00:00+00:00",
+            "endsAt": "2027-01-01T00:00:00+00:00",
+            "countdownEnabled": True,
+            "status": "active",
+        },
+        admin_token,
+    )
+    expect(status, campaign_saved, {200}, "Reward campaign creation failed")
+    assert campaign_saved["campaign"]["effectiveStatus"] == "active"
+    status, campaign_paused = request(
+        "/api/admin/campaigns",
+        {"action": "set_status", "id": campaign_id, "status": "paused"},
+        admin_token,
+    )
+    expect(status, campaign_paused, {200}, "Reward campaign pause failed")
+    assert campaign_paused["campaign"]["status"] == "paused"
 
     catalog_category = "smoke-catalog"
     catalog_service = "smoke-service"
@@ -454,6 +572,55 @@ def main():
     )
     expect(status, recovered_user, {200}, "User could not sign in with the recovered PIN")
     user_token = recovered_user["token"]
+
+    session_cookies = http.cookiejar.CookieJar()
+    session_opener = urllib.request.build_opener(
+        urllib.request.HTTPCookieProcessor(session_cookies)
+    )
+    status, remembered_login = session_request(
+        session_opener,
+        "/api/users/login",
+        {"phone": "96895550992", "name": "مستخدم اختبار الإنتاج", "pin": "8642"},
+    )
+    expect(status, remembered_login, {200}, "Remembered user login failed")
+    remembered_token = remembered_login["token"]
+    assert any(
+        cookie.name == "khadamati_user_refresh" and cookie.value
+        for cookie in session_cookies
+    ), "User login did not issue a role-scoped refresh cookie"
+    status, persisted_session = session_request(
+        session_opener,
+        "/api/auth/persist",
+        {"kind": "user"},
+        remembered_token,
+    )
+    expect(status, persisted_session, {200}, "Persisting a valid user session failed")
+    status, refreshed_session = session_request(
+        session_opener, "/api/auth/refresh", {"kind": "user"}
+    )
+    expect(status, refreshed_session, {200}, "Refreshing a remembered user session failed")
+    assert refreshed_session.get("session", {}).get("kind") == "user"
+    status, cross_role_refresh = session_request(
+        session_opener, "/api/auth/refresh", {"kind": "provider"}
+    )
+    assert status == 401 and cross_role_refresh.get("error") == "refresh_session_required", (
+        "A user refresh cookie was accepted for the provider role"
+    )
+    refreshed_token = refreshed_session["token"]
+    status, logged_out = session_request(
+        session_opener,
+        "/api/auth/logout",
+        {"kind": "user"},
+        refreshed_token,
+    )
+    expect(status, logged_out, {200}, "Full user logout failed")
+    status, refresh_after_logout = session_request(
+        session_opener, "/api/auth/refresh", {"kind": "user"}
+    )
+    assert status == 401 and refresh_after_logout.get("error") in {
+        "refresh_session_required",
+        "session_expired",
+    }, "A user session remained restorable after full logout"
 
     status, saved_asset = request(
         "/api/service-assets",
@@ -1037,9 +1204,13 @@ def main():
             {
                 "ok": True,
                 "public_privacy": True,
+                "reverse_location": True,
+                "location_administration": True,
+                "reward_campaigns": True,
                 "provider_registration": True,
                 "provider_upgrade_admin_notification": True,
                 "manual_recovery": True,
+                "durable_role_sessions": True,
                 "exact_matching": True,
                 "request_marketplace": True,
                 "active_request_visibility": True,

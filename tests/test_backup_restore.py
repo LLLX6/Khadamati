@@ -1,10 +1,14 @@
 import sqlite3
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 
 from scripts.backup_sqlite import create_backup
 from scripts.restore_sqlite_backup import restore_backup
+
+ROOT = Path(__file__).resolve().parents[1]
 
 
 class BackupRestoreTests(unittest.TestCase):
@@ -61,6 +65,17 @@ class BackupRestoreTests(unittest.TestCase):
             with self.assertRaises(FileExistsError):
                 restore_backup(archive, existing)
             self.assertEqual(b"do-not-overwrite", existing.read_bytes())
+
+    def test_restore_script_supports_direct_invocation(self):
+        result = subprocess.run(
+            [sys.executable, "scripts/restore_sqlite_backup.py", "--help"],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("--database-target", result.stdout)
 
 
 if __name__ == "__main__":

@@ -3548,7 +3548,7 @@ svg{stroke-linecap:round;stroke-linejoin:round}
 .location-sharing-state.active{border-color:#a8ded0;background:#edf9f5}
 .location-sharing-actions{margin-top:12px}
 
-.chat-sheet .modal-head{min-height:68px;padding:8px 10px}
+.chat-sheet .modal-head{min-height:68px;padding:8px 10px;color:var(--ink)!important;background:var(--panel)!important}
 .chat-profile-head{display:grid!important;grid-template-columns:40px minmax(0,1fr) auto;gap:8px;align-items:center}
 .chat-profile-identity{display:grid;grid-template-columns:42px minmax(0,1fr);align-items:center;gap:8px;min-width:0}
 .chat-profile-identity .avatar{width:42px!important;height:42px!important;border-radius:50%!important;object-fit:cover}
@@ -3563,15 +3563,27 @@ svg{stroke-linecap:round;stroke-linejoin:round}
 .chat-composer{flex:0 0 auto;display:grid!important;grid-template-columns:40px minmax(0,1fr) 40px 44px!important;align-items:end;gap:6px;padding:7px 0 0!important;background:var(--panel)}
 .chat-input-shell{min-width:0;position:relative}
 .chat-input-shell .textarea{min-height:42px!important;max-height:112px!important;padding:10px 11px!important;border-radius:16px!important;resize:none}
-.chat-record-state{position:absolute;inset-inline:8px;bottom:5px;display:flex;align-items:center;gap:6px;pointer-events:none}
+.chat-record-state{position:absolute;inset-inline:5px;bottom:5px;display:flex;align-items:center;gap:6px;pointer-events:none}
 .recording-pill,.voice-ready{max-width:100%;font-size:.66rem}
+.recording-pill{pointer-events:auto;align-items:center;justify-content:space-between;gap:7px;width:100%;min-height:32px}
+.recording-pill button{width:26px;height:26px;min-width:26px;border:0;border-radius:8px;background:rgba(180,35,24,.1);color:#b42318;display:grid;place-items:center}
+.recording-pill button svg{width:14px;height:14px}
 .voice-ready{pointer-events:auto;position:relative;z-index:3;width:100%;display:flex;align-items:center;gap:4px}
-.voice-ready audio{min-width:0;flex:1 1 auto;width:min(180px,100%);height:32px}
-.voice-ready button{width:30px;height:30px;min-width:30px;border:0;border-radius:9px;background:#fff0f3;color:var(--action-danger);display:grid;place-items:center;cursor:pointer}
-.voice-ready button svg{width:16px;height:16px}
+.voice-ready audio{min-width:72px;flex:1 1 auto;width:100%;height:32px}
+.voice-ready-actions{display:flex;align-items:center;gap:3px;flex:0 0 auto}
+.voice-ready button{width:29px;height:29px;min-width:29px;border:0;border-radius:9px;background:#fff0f3;color:var(--action-danger);display:grid;place-items:center;cursor:pointer}
+.voice-ready button.voice-send{background:var(--action-primary);color:#fff}
+.voice-ready button svg{width:15px;height:15px}
 .chat-composer.has-voice .chat-input-shell .textarea{color:transparent;caret-color:transparent;pointer-events:none}
 .chat-composer.has-voice .chat-record-state{pointer-events:auto;inset-inline:5px}
 .chat-message audio{width:min(240px,100%);height:36px}
+.chat-image-open{display:block;width:100%;padding:0;border:0;border-radius:12px;overflow:hidden;background:transparent;cursor:zoom-in}
+.chat-image-open img{display:block;width:100%}
+.chat-image-preview-sheet .modal-body{display:grid;gap:14px}
+.chat-image-preview{display:grid;place-items:center;min-height:220px;max-height:56dvh;overflow:hidden;border:1px solid var(--line);border-radius:16px;background:var(--panel2)}
+.chat-image-preview img{display:block;width:100%;height:100%;max-height:56dvh;object-fit:contain}
+.chat-image-preview-actions{display:grid;grid-template-columns:1fr 1fr}
+.chat-image-preview-actions>*{width:100%;justify-content:center}
 .chat-options-sheet .menu-row{min-height:52px}
 
 .ad-slider-copy{
@@ -5502,7 +5514,7 @@ summary:focus-visible{
   .app-top .app-brand .brand-word>span{max-width:58px;font-size:.9rem}
 }
 
-/* Khadamati 1.0.1 final mobile and request-flow corrections. */
+/* Khadamati 1.0.2 final mobile and request-flow corrections. */
 :root{
   --navH:84px;
 }
@@ -5809,4 +5821,77 @@ summary:focus-visible{
     padding-inline:6px!important;
     font-size:.61rem!important;
   }
+}
+
+/* Reward campaigns and centralized location management. */
+.reward-campaign-card{
+  display:grid;
+  grid-template-columns:minmax(0,1fr);
+  gap:10px;
+  overflow:hidden;
+  margin:10px 0;
+  border:1px solid color-mix(in srgb,#d2a13e 28%,var(--line));
+  border-radius:16px;
+  background:linear-gradient(145deg,color-mix(in srgb,#f4cf78 13%,var(--panel)),color-mix(in srgb,var(--accent) 6%,var(--panel)));
+}
+.reward-campaign-card>img{width:100%;height:132px;object-fit:cover}
+.reward-campaign-copy{display:grid;gap:8px;padding:12px}
+.reward-campaign-heading{display:grid;grid-template-columns:36px minmax(0,1fr) auto;align-items:center;gap:8px;min-width:0}
+.reward-campaign-heading>span{width:36px;height:36px;display:grid;place-items:center;border-radius:11px;background:#fff5d8;color:#9a6a08}
+.reward-campaign-heading>span svg{width:19px;height:19px}
+.reward-campaign-heading small,.reward-campaign-heading b{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.reward-campaign-heading small{color:var(--muted);font-size:.62rem}
+.reward-campaign-heading b{font-size:.82rem}
+.reward-campaign-heading time{display:inline-flex;align-items:center;gap:4px;padding:5px 7px;border-radius:9px;background:color-mix(in srgb,var(--panel) 82%,transparent);font-size:.58rem;font-weight:850;white-space:nowrap}
+.reward-campaign-heading time svg{width:13px;height:13px}
+.reward-campaign-copy p{margin:0;color:var(--muted);font-size:.7rem;line-height:1.65}
+.reward-label{justify-self:start;padding:5px 8px;border-radius:9px;background:color-mix(in srgb,#d2a13e 15%,var(--panel));color:#79540b;font-size:.66rem}
+.reward-campaign-card.compact{margin:8px 0}
+.reward-campaign-card.compact>img{height:92px}
+.reward-campaign-card.compact .reward-campaign-copy{padding:10px}
+
+.campaign-admin-summary,.location-admin-summary{grid-template-columns:repeat(4,minmax(0,1fr))}
+.campaign-admin-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:10px;margin:12px 0}
+.campaign-admin-card{display:grid;gap:10px;min-width:0;padding:12px;border:1px solid var(--line);border-radius:16px;background:var(--panel);box-shadow:0 5px 18px rgba(12,49,72,.05)}
+.campaign-admin-card header{display:grid;grid-template-columns:38px minmax(0,1fr) auto;align-items:center;gap:8px}
+.campaign-admin-card header h3,.campaign-admin-card header small{display:block;margin:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.campaign-admin-card header h3{font-size:.82rem}
+.campaign-admin-card header small{color:var(--muted);font-size:.6rem}
+.campaign-admin-card>p{margin:0;color:var(--muted);font-size:.68rem;line-height:1.6}
+.campaign-admin-meta{display:flex;flex-wrap:wrap;gap:6px}
+.campaign-admin-meta span{display:inline-flex;align-items:center;gap:4px;padding:5px 7px;border-radius:8px;background:var(--panel2);font-size:.6rem;font-weight:800}
+.campaign-admin-meta svg{width:13px;height:13px}
+.campaign-eligibility-panel{margin-top:14px}
+.campaign-eligibility-row{align-items:center}
+.campaign-editor-sheet .full-action{width:100%;margin-top:14px}
+
+.location-admin-list{display:grid;gap:10px;margin-top:12px}
+.location-admin-group{padding:0;overflow:hidden}
+.location-admin-group>summary{display:grid;grid-template-columns:40px minmax(0,1fr) auto 18px;align-items:center;gap:8px;padding:11px;cursor:pointer;list-style:none}
+.location-admin-group>summary::-webkit-details-marker{display:none}
+.location-admin-group>summary b,.location-admin-group>summary small{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.location-admin-group>summary small{margin-top:2px;color:var(--muted);font-size:.61rem}
+.location-admin-group>summary>i{font-style:normal;transition:transform .2s ease}
+.location-admin-group[open]>summary>i{transform:rotate(180deg)}
+.location-admin-actions{padding:0 11px 10px;border-top:1px solid var(--line)}
+.location-wilayat-list{padding:0 11px 11px}
+.location-wilayat-list .list-item{grid-template-columns:minmax(0,1fr) auto;gap:8px}
+.location-wilayat-list .list-item>.row-actions{grid-column:1/-1}
+.location-wilayat-list .is-disabled{opacity:.62}
+
+@media(max-width:700px){
+  .campaign-admin-summary,.location-admin-summary{grid-template-columns:repeat(2,minmax(0,1fr))}
+  .campaign-admin-grid{grid-template-columns:1fr}
+  .campaign-admin-card .row-actions,.location-admin-actions{display:grid;grid-template-columns:repeat(2,minmax(0,1fr))}
+  .campaign-admin-card .row-actions>*,.location-admin-actions>*{width:100%;justify-content:center}
+  .reward-campaign-heading{grid-template-columns:34px minmax(0,1fr)}
+  .reward-campaign-heading time{grid-column:2;justify-self:start}
+}
+
+@media(max-width:360px){
+  .chat-image-preview-actions{grid-template-columns:1fr}
+  .voice-ready button{width:27px;height:27px;min-width:27px}
+  .reward-campaign-heading time{font-size:.54rem}
+  .location-admin-group>summary{grid-template-columns:36px minmax(0,1fr) 16px}
+  .location-admin-group>summary .badge{grid-column:2;justify-self:start}
 }
