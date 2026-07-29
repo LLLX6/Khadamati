@@ -612,6 +612,8 @@ class CommunityService:
         description = _clean(payload.get("description"), 1200)
         if len(title) < 3:
             raise DomainError("community_title_required", 400)
+        if listing_kind == "wanted" and len(title.split()) > 3:
+            raise DomainError("community_title_too_long", 400)
         if len(description) < 3:
             raise DomainError("community_description_required", 400)
         service_value = _clean(payload.get("serviceValue"), 180)
