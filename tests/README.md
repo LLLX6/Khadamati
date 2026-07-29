@@ -39,6 +39,9 @@ The API/domain flows also verify map privacy, approved-provider availability,
 subscription service/category limits, registration, exact matching, active request visibility,
 the public request marketplace, provider recommendations and abuse controls,
 subscriptions, contact consent, reviews, and cross-account collaboration.
+The Community flow verifies customer wanted posts, provider package listings,
+service-matched offers, idempotent offer acceptance and package ordering,
+request/chat creation, expiry, plan quotas, ownership, reports, and admin moderation.
 The workflow checks cover request idempotency, service assets, the two-party
 agreement, guarded work start, completion evidence, customer resolution, the
 event timeline, and provider daily capacity.

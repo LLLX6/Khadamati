@@ -46,6 +46,7 @@ function assert(value, message) {
 async function capture(page, name, options = {}) {
   if (!SCREENSHOT_DIR) return;
   fs.mkdirSync(SCREENSHOT_DIR, { recursive: true });
+  await page.waitForTimeout(350);
   await page.screenshot({
     path: path.join(SCREENSHOT_DIR, `${name}.png`),
     fullPage: options.fullPage !== false,
@@ -259,7 +260,7 @@ async function clickAdminTab(page, tab) {
   const rememberedUser = await page.evaluate(() => JSON.parse(localStorage.getItem('KHADAMATI_ACCOUNT_MEMORY_V1') || '{}'));
   assert(rememberedUser.user?.id === 'ui-user', 'The device did not retain the safe user account identity.');
   const userNavOrder = await page.locator('.bottom-nav [data-action="nav"]').evaluateAll(items => items.map(item => item.dataset.view));
-  assert(JSON.stringify(userNavOrder) === JSON.stringify(['home', 'services', 'tasks', 'requestBoard', 'myAccount']), `User bottom navigation order is incorrect: ${userNavOrder.join(', ')}`);
+  assert(JSON.stringify(userNavOrder) === JSON.stringify(['home', 'services', 'tasks', 'community', 'myAccount']), `User bottom navigation order is incorrect: ${userNavOrder.join(', ')}`);
   assert((await page.locator('.app-brand .brand-word > span').textContent()).trim() === 'خدماتي', 'The Arabic app name is missing from the signed-in header.');
 
   assert((await page.locator('.clean-grid .category-tile').count()) <= 6, 'Home must show no more than six categories.');
@@ -381,10 +382,113 @@ async function clickAdminTab(page, tab) {
   await capture(page, '01b-progressive-search');
   await clickUserNav(page, 'home');
 
-  await clickUserNav(page, 'requestBoard');
+  await page.evaluate(() => {
+    const key = 'KHADAMATI_PRIVATE_STATE_V1';
+    const state = JSON.parse(sessionStorage.getItem(key) || '{}');
+    const expiresAt = new Date(Date.now() + 24 * 86400000).toISOString();
+    state.communityListings = [
+      {
+        id: 'community-package-ui',
+        kind: 'package',
+        ownerKind: 'provider',
+        ownerId: 'p-electric',
+        title: 'باقة العناية الكهربائية للمنزل',
+        description: 'فحص لوحة الكهرباء ونقاط التوصيل مع تقرير مختصر وموعد مؤكد.',
+        categoryId: 'homecare',
+        serviceValue: 'homecare|electrician',
+        priceAmount: 12,
+        billingPeriod: 'one_time',
+        durationText: 'زيارة واحدة · ساعتان',
+        gov: 'مسقط',
+        wilayah: 'السيب',
+        details: {
+          inclusions: ['فحص اللوحة', 'فحص نقاط الكهرباء'],
+          commitment: 'موعد مؤكد داخل التطبيق',
+        },
+        contactChannels: ['app', 'whatsapp'],
+        status: 'active',
+        billingStatus: 'free_first',
+        featured: true,
+        mine: false,
+        expiresAt,
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+        owner: {
+          id: 'p-electric',
+          name: 'جهـاد للتقنية',
+          imageUrl: 'assets/providers/omani-electrician.webp',
+          gov: 'مسقط',
+          wilayah: 'السيب',
+          verified: true,
+          whatsappAvailable: true,
+        },
+      },
+      {
+        id: 'community-wanted-ui',
+        kind: 'wanted',
+        ownerKind: 'user',
+        ownerId: 'ui-user',
+        title: 'أبحث عن كهربائي لتركيب إنارة',
+        description: 'تركيب وحدتي إنارة وفحص المفتاح في المنزل.',
+        categoryId: 'homecare',
+        serviceValue: 'homecare|electrician',
+        budgetMin: 10,
+        budgetMax: 18,
+        durationText: 'خلال يومين',
+        gov: 'مسقط',
+        wilayah: 'السيب',
+        status: 'active',
+        billingStatus: 'included',
+        featured: false,
+        mine: true,
+        offers: [],
+        expiresAt,
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+        owner: {
+          id: 'ui-user',
+          name: 'مستخدم خدماتي',
+          imageUrl: '',
+          gov: 'مسقط',
+          wilayah: 'السيب',
+          verified: true,
+        },
+      },
+    ];
+    state.communityStats = { activePackages: 1, activeWanted: 1, openReports: 0 };
+    state.communityTab = 'packages';
+    sessionStorage.setItem(key, JSON.stringify(state));
+  });
+  await page.reload({ waitUntil: 'domcontentloaded' });
+  await clickUserNav(page, 'community');
+  assert(await page.locator('.community-page').count(), 'The Community destination did not open.');
+  assert(await page.locator('.community-tabs [data-value="packages"]').count(), 'The packages Community tab is missing.');
+  assert(await page.locator('.community-tabs [data-value="wanted"]').count(), 'The wanted Community tab is missing.');
+  assert(await page.locator('.community-card').count() === 1, 'Community package card is missing.');
+  await capture(page, '08-community-user-packages', { fullPage: false });
+  await page.locator('[data-action="toggleLang"]:visible').first().click();
+  assert(await page.locator('html').getAttribute('dir') === 'ltr', 'Community English mode did not switch to LTR.');
+  assert(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth + 1), 'Community English mode overflows horizontally.');
+  await capture(page, '08h-community-user-english', { fullPage: false });
+  await page.locator('[data-action="toggleLang"]:visible').first().click();
+  await page.evaluate(() => document.documentElement.dataset.theme = 'dark');
+  await capture(page, '08i-community-user-dark', { fullPage: false });
+  await page.evaluate(() => document.documentElement.dataset.theme = 'light');
+  await page.locator('[data-action="openCommunityListing"]').first().click();
+  await capture(page, '08a-community-package-details', { fullPage: false });
+  await page.locator('.community-detail-sheet [data-action="closeModal"]').click();
+  await page.locator('.community-tabs [data-value="wanted"]').click();
+  assert(await page.locator('.community-card').count() === 1, 'Community wanted card is missing.');
+  await capture(page, '08b-community-user-wanted', { fullPage: false });
+  await page.locator('.community-fab').click();
+  assert(await page.locator('.community-editor').count(), 'Community wanted editor did not open.');
+  await capture(page, '08c-community-wanted-editor', { fullPage: false });
+  await page.locator('.community-editor [data-action="closeModal"]').click();
+  await page.locator('.community-tabs [data-value="board"]').click();
   assert(await page.locator('.request-board-view').count(), 'The standalone request board did not open.');
-  assert(await page.locator('.bottom-nav [data-view="requestBoard"][aria-current="page"]').count(), 'Request board is not represented as its own active bottom-navigation destination.');
+  assert(await page.locator('.bottom-nav [data-view="community"][aria-current="page"]').count(), 'Community is not represented as its active bottom-navigation destination.');
   assert(await page.locator('.request-board-guide').count(), 'Request board guidance is missing.');
+  await capture(page, '08d-community-request-board', { fullPage: false });
   assert(await page.locator('.request-board-guide').evaluate(element => element.getBoundingClientRect().right <= window.innerWidth + 1), 'Request board guidance overflows the mobile viewport.');
   await page.locator('.request-board-guide summary').click();
   const recommendationGuide = page.locator('.request-board-guide img');
@@ -463,7 +567,8 @@ async function clickAdminTab(page, tab) {
   await capture(page, '01g-direct-review');
   await page.locator('[data-action="saveQuickRequest"]').click();
   await page.waitForSelector('.active-request-home');
-  await clickUserNav(page, 'requestBoard');
+  await clickUserNav(page, 'community');
+  await page.locator('.community-tabs [data-value="board"]').click();
   assert(await page.locator('.request-opportunity').count(), 'New request is missing from the request board.');
   await clickUserNav(page, 'myAccount');
   assert(await page.locator('.app-back:visible').count() === 1, 'My Account shows a duplicate back control.');
@@ -472,8 +577,8 @@ async function clickAdminTab(page, tab) {
   assert(await page.locator('.requests-disclosure').count(), 'Grouped request sections are missing from My Account.');
   assert(await page.locator('.requests-disclosure[open]').count() === 0, 'Request groups should start collapsed.');
   await page.locator('.requests-disclosure summary').first().click();
-  assert(await page.locator('.requests-disclosure[open] .request-card').count(), 'Created request is missing from the active request section.');
-  assert(await page.locator('.requests-disclosure[open] .request-created-meta').count(), 'Request date and time are missing from the customer request card.');
+  assert(await page.locator('.requests-disclosure[open] .request-item-disclosure').count(), 'Created request is missing from the active request section.');
+  assert((await page.locator('.requests-disclosure[open] .request-disclosure-main small').first().textContent()).trim().length > 0, 'Request date and time are missing from the customer request summary.');
   assert(await page.locator('.requests-disclosure[open] [data-action="repeatRequest"]').count() === 0, 'An active request should not offer a duplicate repeat action.');
   const requestItem = page.locator('.requests-disclosure[open] .request-item-disclosure').first();
   await requestItem.locator(':scope > summary').click();
@@ -482,7 +587,7 @@ async function clickAdminTab(page, tab) {
     return { radius: parseFloat(style.borderRadius), width: element.getBoundingClientRect().width, height: element.getBoundingClientRect().height };
   });
   assert(requestStatusShape.radius <= 10 && requestStatusShape.width > requestStatusShape.height, `Request status is not a framed rectangular label: ${JSON.stringify(requestStatusShape)}`);
-  const passportFits = await requestItem.locator('.task-passport > span').evaluateAll(items => items.length === 3 && items.every(item => item.scrollWidth <= item.clientWidth + 1 && item.querySelector('b')?.scrollWidth <= item.querySelector('b')?.clientWidth + 1));
+  const passportFits = await requestItem.locator('.request-compact-facts > span').evaluateAll(items => items.length === 3 && items.every(item => item.scrollWidth <= item.clientWidth + 1 && item.querySelector('b')?.scrollWidth <= item.querySelector('b')?.clientWidth + 1));
   assert(passportFits, 'Location, timing, or priority text is cramped inside the request summary.');
   await page.locator('.requests-disclosure summary').first().click();
   const repeatSource = await page.evaluate(() => {
@@ -663,6 +768,15 @@ async function clickAdminTab(page, tab) {
   await page.locator('[data-action="closeModal"]').click();
 
   await page.locator('.side-nav [data-action="providerTab"][data-tab="leads"]').click();
+  await page.locator('.community-tabs [data-value="packages"]').click();
+  assert(await page.locator('.community-page[data-community-mode="provider"]').count(), 'Provider Community destination is missing.');
+  await page.locator('#toastRoot').evaluate(element => { element.innerHTML = ''; });
+  await capture(page, '08e-community-provider-packages', { fullPage: false });
+  await page.locator('.community-fab').click();
+  assert(await page.locator('.community-editor').count(), 'Provider package editor did not open.');
+  await capture(page, '08f-community-package-editor', { fullPage: false });
+  await page.locator('.community-editor [data-action="closeModal"]').click();
+  await page.locator('.community-tabs [data-value="board"]').click();
   assert(await page.locator('.request-opportunity').count(), 'Provider request board is empty.');
   assert(await page.locator('.request-opportunity [data-action="providerAcceptRequest"]').count(), 'Matching provider cannot offer from the request board.');
   await capture(page, '02b-provider-opportunities');
@@ -676,7 +790,7 @@ async function clickAdminTab(page, tab) {
   const customerModeAuth = await page.evaluate(() => JSON.parse(sessionStorage.getItem('KHADAMATI_AUTH_V3') || '{}'));
   assert(customerModeAuth.activeRole === 'user' && customerModeAuth.userToken === 'ui-user-token', 'Returning from provider mode did not restore the customer session.');
   await clickUserNav(page, 'myAccount');
-  assert(await page.locator('.request-offer-summary').count(), 'Offer comparison summary is missing.');
+  assert(await page.locator('.requests-disclosure [data-action="compareRequestOffers"]').count(), 'Offer comparison action is missing from the current request summary.');
   await page.waitForTimeout(600);
   if (await page.locator('#modalRoot .modal-backdrop.show').count()) {
     assert(await page.locator('#modalRoot .notification-disclosure').count(), 'Unexpected modal blocked offer comparison.');
@@ -693,7 +807,9 @@ async function clickAdminTab(page, tab) {
   assert(await page.locator('.chat-message.theirs').filter({ hasText: /شكراً لاختيار عرضي|Thank you for choosing my offer/i }).count(), 'Automatic provider welcome message is missing.');
   await page.locator('[data-action="closeModal"]').click();
 
-  await revealRequestAction(page, 'manageRequestContact');
+  const requestDetails = await revealRequestAction(page, 'openRequestTaskDetails');
+  await requestDetails.click();
+  await page.waitForSelector('.task-detail-sheet');
   assert(await page.locator('.request-offer-summary').count() === 0, 'Offer comparison remained visible after selecting a provider.');
   assert(await page.locator('[data-action="compareRequestOffers"]').count() === 0, 'Compare action remained available after offer selection.');
   assert(await page.locator('[data-action="manageRequestContact"]').count(), 'Contact privacy control is missing after provider selection.');
@@ -709,6 +825,9 @@ async function clickAdminTab(page, tab) {
   await page.locator('#contactAllowCall').check();
   await page.locator('[data-action="saveRequestContactConsent"]').click();
   await page.waitForSelector('.contact-consent-sheet', { state: 'detached' });
+  const detailsAfterConsent = await revealRequestAction(page, 'openRequestTaskDetails');
+  await detailsAfterConsent.click();
+  await page.waitForSelector('.task-detail-sheet');
   await revealRequestAction(page, 'openRequestChat');
   assert(await page.locator('[data-action="requestWhatsapp"]').count(), 'WhatsApp was not enabled after customer consent.');
   assert(await page.locator('[data-action="requestCall"]').count(), 'Phone calls were not enabled after customer consent.');
@@ -804,20 +923,23 @@ async function clickAdminTab(page, tab) {
   const startWork = await revealRequestAction(page, 'startCustomerRequest');
   await startWork.click();
   await page.waitForFunction(() => {
-    const card = document.querySelector('[data-request-card]');
+    const card = document.querySelector('[data-request-disclosure]');
     return card && /قيد التنفيذ|In progress/i.test(card.textContent || '');
   });
-  assert(await page.locator('[data-request-card]').count(), 'Starting work removed the user from active requests.');
+  assert(await page.locator('[data-request-disclosure]').count(), 'Starting work removed the user from active requests.');
   assert(
-    await page.locator('[data-request-card] .request-status').filter({ hasText: /قيد التنفيذ|In progress/i }).count(),
+    await page.locator('[data-request-disclosure] .request-status').filter({ hasText: /قيد التنفيذ|In progress/i }).count(),
     'Request did not move to in-progress after work started.',
   );
 
+  await revealRequestAction(page, 'openRequestTaskDetails').then(action => action.click());
+  await page.locator('.task-detail-sheet').waitFor({ state: 'visible' });
   const calendarAction = await revealRequestAction(page, 'addRequestCalendar');
   const downloadPromise = page.waitForEvent('download');
   await calendarAction.click();
   const calendarDownload = await downloadPromise;
   assert((await calendarDownload.suggestedFilename()).endsWith('.ics'), 'Calendar export is not an ICS file.');
+  await page.locator('.task-detail-sheet [data-action="closeModal"]').click();
 
   await clickUserNav(page, 'myAccount');
   await page.locator('details.account-disclosure:has([data-action="providerMode"]) > summary').click();
@@ -970,8 +1092,11 @@ async function clickAdminTab(page, tab) {
   await page.locator('[data-action="closeModal"]').click();
   await clickAdminTab(page, 'finance');
   assert(await page.locator('.finance-command-grid').count(), 'Financial control center is missing.');
-  await clickAdminTab(page, 'assistant');
-  assert(await page.locator('.subscription-command h2').filter({ hasText: /ساحة الطلبات|Request marketplace/i }).count(), 'The obsolete assistant health page was not replaced by the request marketplace.');
+  await clickAdminTab(page, 'community');
+  assert(await page.locator('.admin-community').count(), 'Community management center is missing.');
+  assert(await page.locator('#communityEnabledSetting').count(), 'Community activation control is missing.');
+  assert(await page.locator('[data-action="saveCommunitySettings"]').count(), 'Community revenue settings cannot be saved.');
+  await capture(page, '08g-community-admin', { fullPage: false });
   assert(await page.locator('[data-action="openAssistant"]').count() === 0, 'The obsolete assistant test control is still visible in administration.');
   await clickAdminTab(page, 'campaigns');
   assert(await page.locator('.campaign-admin-card').count() === 1, 'Reward campaigns are missing from management.');

@@ -573,6 +573,222 @@ def main():
     expect(status, recovered_user, {200}, "User could not sign in with the recovered PIN")
     user_token = recovered_user["token"]
 
+    status, community_settings = request(
+        "/api/community",
+        {
+            "action": "settings",
+            "communityEnabled": True,
+            "communityModerationRequired": False,
+            "communityWantedExpiryDays": 30,
+            "communityPackageExpiryDays": 30,
+            "communityFirstPackageFreeDays": 30,
+            "communityRenewalFee": 2,
+            "communityPlanQuotas": {"professional_12m": 5},
+        },
+        admin_token,
+    )
+    expect(status, community_settings, {200}, "Community settings could not be saved")
+
+    status, wanted_listing = request(
+        "/api/community",
+        {
+            "action": "save",
+            "kind": "wanted",
+            "title": "أبحث عن كهربائي لاختبار المجتمع",
+            "description": "فحص لوحة الكهرباء وإصلاح العطل داخل التطبيق",
+            "serviceValue": "homecare|electrician",
+            "budgetMin": 10,
+            "budgetMax": 18,
+            "durationText": "خلال يوم واحد",
+            "gov": "مسقط",
+            "wilayah": "السيب",
+            "location": {"lat": 23.621, "lng": 58.221},
+            "locationText": "السيب، مسقط",
+            "listingDays": 30,
+            "publish": True,
+            "idempotencyKey": "smoke-community-wanted-v1",
+        },
+        user_token,
+    )
+    expect(status, wanted_listing, {201}, "Community wanted listing creation failed")
+    wanted_id = wanted_listing["listing"]["id"]
+    assert wanted_listing["listing"]["status"] == "active"
+
+    status, forged_wanted = request(
+        "/api/community",
+        {
+            "action": "save",
+            "kind": "wanted",
+            "title": "إعلان غير مصرح",
+            "description": "يجب أن يرفضه الخادم لحساب المزود",
+            "serviceValue": "homecare|electrician",
+        },
+        provider_token,
+    )
+    expect(status, forged_wanted, {403}, "Provider created a user-only wanted listing")
+
+    status, community_offer = request(
+        "/api/community",
+        {
+            "action": "offer",
+            "listingId": wanted_id,
+            "amount": 14,
+            "durationText": "الوصول خلال ساعتين",
+            "note": "يشمل الفحص والإصلاح الأولي",
+            "idempotencyKey": "smoke-community-offer-v1",
+        },
+        provider_token,
+    )
+    expect(status, community_offer, {201}, "Provider community offer failed")
+    community_offer_id = community_offer["offer"]["id"]
+
+    status, accepted_community_offer = request(
+        "/api/community",
+        {
+            "action": "accept_offer",
+            "listingId": wanted_id,
+            "offerId": community_offer_id,
+            "language": "ar",
+        },
+        user_token,
+    )
+    expect(status, accepted_community_offer, {201}, "Community offer acceptance failed")
+    wanted_request_id = accepted_community_offer.get("requestId")
+    assert wanted_request_id and accepted_community_offer.get("route") == (
+        f"user:chat:{wanted_request_id}"
+    ), "Accepted community offer did not create the expected chat route"
+
+    status, duplicate_offer_acceptance = request(
+        "/api/community",
+        {
+            "action": "accept_offer",
+            "listingId": wanted_id,
+            "offerId": community_offer_id,
+            "language": "ar",
+        },
+        user_token,
+    )
+    expect(
+        status,
+        duplicate_offer_acceptance,
+        {200},
+        "Repeated community offer acceptance was not idempotent",
+    )
+    assert duplicate_offer_acceptance.get("duplicate") is True
+    assert duplicate_offer_acceptance.get("requestId") == wanted_request_id
+
+    status, package_listing = request(
+        "/api/community",
+        {
+            "action": "save",
+            "kind": "package",
+            "title": "باقة فحص كهرباء منزلية",
+            "description": "فحص كامل للوحة والتوصيلات مع تقرير مختصر",
+            "serviceValue": "homecare|electrician",
+            "priceAmount": 12,
+            "billingPeriod": "one_time",
+            "durationText": "زيارة واحدة لمدة ساعتين",
+            "gov": "مسقط",
+            "wilayah": "السيب",
+            "location": {"lat": 23.62, "lng": 58.22},
+            "locationText": "مسقط والسيب",
+            "details": {
+                "inclusions": ["فحص اللوحة", "فحص نقاط الكهرباء"],
+                "commitment": "موعد مؤكد داخل التطبيق",
+                "fulfillment": "في موقع العميل",
+            },
+            "contactChannels": ["app", "whatsapp"],
+            "listingDays": 30,
+            "publish": True,
+            "idempotencyKey": "smoke-community-package-v1",
+        },
+        provider_token,
+    )
+    expect(status, package_listing, {201}, "Provider package listing creation failed")
+    package_id = package_listing["listing"]["id"]
+    assert package_listing["listing"]["status"] == "active"
+    assert package_listing["listing"]["billingStatus"] in {
+        "free_first",
+        "plan_included",
+        "included",
+    }
+
+    package_order_key = "smoke-community-package-order-v1"
+    status, package_order = request(
+        "/api/community",
+        {
+            "action": "request_package",
+            "listingId": package_id,
+            "idempotencyKey": package_order_key,
+            "language": "en",
+        },
+        user_token,
+    )
+    expect(status, package_order, {201}, "Community package order failed")
+    package_request_id = package_order.get("requestId")
+    assert package_request_id and package_request_id != wanted_request_id
+
+    status, duplicate_package_order = request(
+        "/api/community",
+        {
+            "action": "request_package",
+            "listingId": package_id,
+            "idempotencyKey": package_order_key,
+            "language": "en",
+        },
+        user_token,
+    )
+    expect(status, duplicate_package_order, {200}, "Repeated package order was not idempotent")
+    assert duplicate_package_order.get("duplicate") is True
+    assert duplicate_package_order.get("requestId") == package_request_id
+
+    status, community_report = request(
+        "/api/community",
+        {
+            "action": "report",
+            "listingId": package_id,
+            "reason": "بلاغ اختبار آلي للمراجعة الإدارية",
+        },
+        user_token,
+    )
+    expect(status, community_report, {201}, "Community report creation failed")
+
+    status, community_user_state = request("/api/bootstrap", token=user_token)
+    expect(status, community_user_state, {200}, "User community bootstrap failed")
+    community_user_requests = community_user_state.get("customerRequests", [])
+    assert any(
+        item.get("id") == wanted_request_id
+        and item.get("acceptedProviderId") == provider_id
+        for item in community_user_requests
+    ), "Accepted wanted offer did not persist in the user request list"
+    assert any(
+        item.get("id") == package_request_id
+        and item.get("acceptedProviderId") == provider_id
+        for item in community_user_requests
+    ), "Package order did not persist in the user request list"
+    assert any(
+        item.get("id") == wanted_id and item.get("requestId") == wanted_request_id
+        for item in community_user_state.get("communityListings", [])
+    ), "Wanted listing did not retain its generated request"
+
+    status, community_provider_state = request("/api/bootstrap", token=provider_token)
+    expect(status, community_provider_state, {200}, "Provider community bootstrap failed")
+    assert any(
+        item.get("id") in {wanted_request_id, package_request_id}
+        for item in community_provider_state.get("customerRequests", [])
+    ), "Community request did not reach the selected provider"
+
+    status, community_admin_state = request("/api/admin/session", token=admin_token)
+    expect(status, community_admin_state, {200}, "Administration community state failed")
+    assert any(
+        item.get("id") == package_id
+        for item in community_admin_state.get("communityListings", [])
+    ), "Community package is missing from administration"
+    assert any(
+        item.get("listingId") == package_id
+        for item in community_admin_state.get("communityReports", [])
+    ), "Community report is missing from administration"
+
     session_cookies = http.cookiejar.CookieJar()
     session_opener = urllib.request.build_opener(
         urllib.request.HTTPCookieProcessor(session_cookies)
@@ -1213,6 +1429,10 @@ def main():
                 "durable_role_sessions": True,
                 "exact_matching": True,
                 "request_marketplace": True,
+                "community_wanted_offer_flow": True,
+                "community_package_order_flow": True,
+                "community_idempotency": True,
+                "community_admin_moderation": True,
                 "active_request_visibility": True,
                 "provider_recommendations": True,
                 "recommendation_abuse_controls": True,
