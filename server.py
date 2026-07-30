@@ -132,6 +132,7 @@ JSON_LIMITS = {
     "/api/provider/work-images": 50_000_000,
     "/api/provider/documents": 22_000_000,
     "/api/provider/image": 4_000_000,
+    "/api/users/register": 4_000_000,
     "/api/user/profile": 4_000_000,
     "/api/user/requests": 20_000_000,
     "/api/request/collaboration": 10_000_000,
@@ -739,7 +740,9 @@ def init_db():
               active INTEGER NOT NULL DEFAULT 1, PRIMARY KEY(id, category_id)
             );
             CREATE TABLE IF NOT EXISTS providers(
-              id TEXT PRIMARY KEY, name TEXT NOT NULL, phone TEXT NOT NULL, gov TEXT, wilayah TEXT,
+              id TEXT PRIMARY KEY, name TEXT NOT NULL, phone TEXT NOT NULL,
+              email TEXT DEFAULT '', age INTEGER NOT NULL DEFAULT 0, nationality TEXT DEFAULT '',
+              gov TEXT, wilayah TEXT,
               areas TEXT, bio TEXT, hours TEXT, status TEXT, active INTEGER, verified INTEGER, featured INTEGER,
               package_id TEXT, rating REAL, reviews INTEGER, admin_note TEXT DEFAULT '', image_path TEXT DEFAULT '', card_image TEXT DEFAULT '',
               pin_hash TEXT DEFAULT '', services TEXT NOT NULL, work_images TEXT DEFAULT '[]', documents TEXT DEFAULT '[]',
@@ -796,6 +799,7 @@ def init_db():
             );
             CREATE TABLE IF NOT EXISTS app_users(
               id TEXT PRIMARY KEY, phone TEXT NOT NULL UNIQUE, name TEXT DEFAULT '', pin_hash TEXT DEFAULT '',
+              email TEXT DEFAULT '', age INTEGER NOT NULL DEFAULT 0, nationality TEXT DEFAULT '',
               gov TEXT DEFAULT '', wilayah TEXT DEFAULT '', avatar TEXT DEFAULT '', latitude REAL, longitude REAL,
               status TEXT NOT NULL DEFAULT 'active', failed_attempts INTEGER NOT NULL DEFAULT 0,
               locked_until TEXT DEFAULT '', first_login TEXT DEFAULT CURRENT_TIMESTAMP,
@@ -989,6 +993,9 @@ def init_db():
         ensure_column(con, "providers", "quote_templates", "TEXT DEFAULT '[]'")
         ensure_column(con, "providers", "updated_at", "TEXT DEFAULT ''")
         ensure_column(con, "providers", "gender", "TEXT DEFAULT 'not_specified'")
+        ensure_column(con, "providers", "email", "TEXT DEFAULT ''")
+        ensure_column(con, "providers", "age", "INTEGER NOT NULL DEFAULT 0")
+        ensure_column(con, "providers", "nationality", "TEXT DEFAULT ''")
         ensure_column(con, "providers", "location_sharing_expires_at", "TEXT DEFAULT ''")
         ensure_column(con, "providers", "deleted_at", "TEXT DEFAULT ''")
         ensure_column(con, "providers", "delete_reason", "TEXT DEFAULT ''")
@@ -996,6 +1003,9 @@ def init_db():
         ensure_column(con, "app_users", "location_updated_at", "TEXT DEFAULT ''")
         ensure_column(con, "app_users", "updated_at", "TEXT DEFAULT ''")
         ensure_column(con, "app_users", "gender", "TEXT DEFAULT 'not_specified'")
+        ensure_column(con, "app_users", "email", "TEXT DEFAULT ''")
+        ensure_column(con, "app_users", "age", "INTEGER NOT NULL DEFAULT 0")
+        ensure_column(con, "app_users", "nationality", "TEXT DEFAULT ''")
         ensure_column(con, "auth_sessions", "refresh_hash", "TEXT DEFAULT ''")
         ensure_column(con, "auth_sessions", "access_expires_at", "TEXT DEFAULT ''")
         ensure_column(con, "auth_sessions", "device_id", "TEXT DEFAULT ''")
@@ -1344,6 +1354,7 @@ def row_provider(r, private=False, sign_private=False):
     d["availability"] = jload(d.pop("availability", "{}"), {})
     d["responseMinutes"] = int(d.pop("response_minutes", 30) or 30)
     d["completedJobs"] = int(d.pop("completed_jobs", 0) or 0)
+    d["age"] = int(d.get("age", 0) or 0)
     quote_templates = jload(d.pop("quote_templates", "[]"), [])
     if private:
         d["quoteTemplates"] = quote_templates if isinstance(quote_templates, list) else []
@@ -1386,7 +1397,7 @@ def row_provider(r, private=False, sign_private=False):
     d["pinConfigured"] = bool(d.pop("pin_hash", ""))
     if not private:
         for key in (
-            "phone", "adminNote", "documents", "commercialNo", "companyId",
+            "phone", "email", "adminNote", "documents", "commercialNo", "companyId",
             "verificationExpiry", "commercialExpiry", "licenseExpiry", "pinConfigured",
             "locationSharingExpiresAt", "deletedAt", "deleteReason",
             "hiddenHistoryIds",
@@ -3521,7 +3532,7 @@ def upsert_provider(con, data):
     )
     con.execute(
         """UPDATE providers SET before_after=?,intro_video_url=?,availability=?,
-        response_minutes=?,completed_jobs=?,gender=?,location_sharing_expires_at=?
+        response_minutes=?,completed_jobs=?,gender=?,email=?,age=?,nationality=?,location_sharing_expires_at=?
         WHERE id=?""",
         (
             jdump(before_after), intro_video_url,
@@ -3532,6 +3543,9 @@ def upsert_provider(con, data):
             if p.get("gender", existing_provider.get("gender", "not_specified"))
             in {"male", "female", "not_specified"}
             else "not_specified",
+            safe_text(p.get("email", existing_provider.get("email", "")), 160).strip().lower(),
+            int(finite_number(p.get("age", existing_provider.get("age", 0)), minimum=0, maximum=120)),
+            safe_text(p.get("nationality", existing_provider.get("nationality", "")), 80),
             safe_text(
                 p.get(
                     "locationSharingExpiresAt",
@@ -4363,16 +4377,78 @@ class Handler(SimpleHTTPRequestHandler):
                 "providerPermissions": provider_permissions,
             }, device_id=data.get("deviceId", ""))
             return self.send_session_json({"provider": provider}, bundle)
-        if path == "/api/users/login":
+        if path == "/api/users/register":
             phone = normalize_phone(data.get("phone", ""))
-            account_id = safe_text(data.get("accountId"), 120)
-            name = str(data.get("name", "") or "").strip()[:80]
+            name = safe_text(data.get("name"), 80).strip()
+            email = safe_text(data.get("email"), 160).strip().lower()
+            nationality = safe_text(data.get("nationality"), 80).strip()
             pin = str(data.get("pin", "") or "")
+            try:
+                age = int(data.get("age", 0) or 0)
+            except (TypeError, ValueError):
+                age = 0
             gender = (
                 data.get("gender")
                 if data.get("gender") in {"male", "female", "not_specified"}
-                else ""
+                else "not_specified"
             )
+            if len(phone) != 11 or not phone.startswith("968"):
+                return self.send_json({"error": "valid_phone_required"}, 400)
+            if len(name) < 2:
+                return self.send_json({"error": "registration_name_required"}, 400)
+            if not re.fullmatch(r"\d{4,8}", pin):
+                return self.send_json({"error": "pin_required"}, 400)
+            if email and not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email):
+                return self.send_json({"error": "invalid_email"}, 400)
+            if age < 1 or age > 120:
+                return self.send_json({"error": "invalid_age"}, 400)
+            if len(nationality) < 2:
+                return self.send_json({"error": "nationality_required"}, 400)
+            try:
+                location = normalized_location(data.get("location"))
+            except DomainError as err:
+                return self.send_domain_error(err)
+            user_id = slug("usr")
+            avatar = ""
+            if data.get("avatarData"):
+                avatar = save_upload_data(
+                    user_id, data["avatarData"], "avatar", IMAGE_MIMES, 2_500_000
+                )
+            with db() as con:
+                if con.execute(
+                    "SELECT id FROM app_users WHERE phone=?", (phone,)
+                ).fetchone():
+                    return self.send_json({"error": "phone_already_registered"}, 409)
+                con.execute(
+                    """INSERT INTO app_users(
+                    id,phone,name,pin_hash,email,age,nationality,gov,wilayah,avatar,
+                    latitude,longitude,gender)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (
+                        user_id, phone, name, hash_pin(pin), email, age, nationality,
+                        safe_text(data.get("gov"), 80),
+                        safe_text(data.get("wilayah"), 80),
+                        avatar, location.get("lat"), location.get("lng"), gender,
+                    ),
+                )
+                create_notification(
+                    con, "admin", "", "مستخدم جديد",
+                    f"تم تسجيل {name}", type_="user", related_id=user_id,
+                    action_text="فتح المستخدم", action_route=f"admin:user:{user_id}",
+                )
+                user_row = con.execute(
+                    "SELECT * FROM app_users WHERE id=?", (user_id,)
+                ).fetchone()
+            user = row_app_user(user_row, private=True, sign_private=True)
+            bundle = issue_session_tokens(
+                {"kind": "user", "userId": user_id, "name": name, "phone": phone},
+                device_id=data.get("deviceId", ""),
+            )
+            return self.send_session_json({"user": user}, bundle)
+        if path == "/api/users/login":
+            phone = normalize_phone(data.get("phone", ""))
+            account_id = safe_text(data.get("accountId"), 120)
+            pin = str(data.get("pin", "") or "")
             if len(phone) < 11 and not account_id:
                 return self.send_json({"error": "valid_phone_required"}, 400)
             with db() as con:
@@ -4388,8 +4464,10 @@ class Handler(SimpleHTTPRequestHandler):
                 if row:
                     phone = normalize_phone(row["phone"])
                 elif account_id:
-                    return self.send_json({"error": "invalid_user_pin"}, 403)
-                if row and row["status"] != "active":
+                    return self.send_json({"error": "account_not_found"}, 404)
+                if not row:
+                    return self.send_json({"error": "account_not_found"}, 404)
+                if row["status"] != "active":
                     return self.send_json({"error": "account_inactive"}, 403)
                 lock_key = row["id"] if row else (account_id or phone)
                 lock_state = login_failure_state(con, "user", lock_key)
@@ -4411,58 +4489,27 @@ class Handler(SimpleHTTPRequestHandler):
                         )
                     except DomainError:
                         otp_ok = False
-                pin_ok = bool(row and row["pin_hash"] and verify_secret(pin, row["pin_hash"]))
-                if row and row["pin_hash"] and not (pin_ok or otp_ok):
+                pin_ok = bool(row["pin_hash"] and verify_secret(pin, row["pin_hash"]))
+                if row["pin_hash"] and not (pin_ok or otp_ok):
                     attempts = record_login_failure(con, "user", lock_key, phone)
                     con.execute("UPDATE app_users SET failed_attempts=? WHERE id=?", (attempts, row["id"]))
                     return self.send_json({"error": "invalid_user_pin", "attempts": attempts}, 403)
-                if not row and len(pin) < 4 and not otp_ok:
-                    return self.send_json({"error": "pin_required"}, 400)
-                if row and not row["pin_hash"] and len(pin) < 4 and not otp_ok:
+                if not row["pin_hash"] and len(pin) < 4 and not otp_ok:
                     return self.send_json({"error": "otp_or_new_pin_required"}, 403)
-                try:
-                    location = normalized_location(data.get("location"))
-                except DomainError as err:
-                    return self.send_domain_error(err)
-                if row:
+                con.execute(
+                    """UPDATE app_users SET last_login=CURRENT_TIMESTAMP,
+                    login_count=login_count+1,failed_attempts=0 WHERE id=?""",
+                    (row["id"],),
+                )
+                user_id = row["id"]
+                clear_login_failures(con, "user", lock_key)
+                if not row["pin_hash"] and len(pin) >= 4:
                     con.execute(
-                        """UPDATE app_users SET name=COALESCE(NULLIF(?,''),name),gov=COALESCE(NULLIF(?,''),gov),
-                        wilayah=COALESCE(NULLIF(?,''),wilayah),latitude=COALESCE(?,latitude),
-                        longitude=COALESCE(?,longitude),last_login=CURRENT_TIMESTAMP,
-                        login_count=login_count+1,failed_attempts=0,
-                        gender=COALESCE(NULLIF(?,''),gender) WHERE id=?""",
-                        (
-                            name, data.get("gov", ""), data.get("wilayah", ""),
-                            location.get("lat"), location.get("lng"), gender, row["id"],
-                        ),
+                        "UPDATE app_users SET pin_hash=? WHERE id=?", (hash_pin(pin), user_id)
                     )
-                    user_id = row["id"]
-                    clear_login_failures(con, "user", lock_key)
-                    if not row["pin_hash"] and len(pin) >= 4:
-                        con.execute(
-                            "UPDATE app_users SET pin_hash=? WHERE id=?", (hash_pin(pin), user_id)
-                        )
-                    if pin_ok and not str(row["pin_hash"] or "").startswith("pbkdf2_sha256$"):
-                        con.execute(
-                            "UPDATE app_users SET pin_hash=? WHERE id=?", (hash_pin(pin), user_id)
-                        )
-                else:
-                    user_id = slug("usr")
+                if pin_ok and not str(row["pin_hash"] or "").startswith("pbkdf2_sha256$"):
                     con.execute(
-                        """INSERT INTO app_users(
-                        id,phone,name,pin_hash,gov,wilayah,latitude,longitude,gender)
-                        VALUES(?,?,?,?,?,?,?,?,?)""",
-                        (
-                            user_id, phone, name, hash_pin(pin) if len(pin) >= 4 else "",
-                            data.get("gov", ""), data.get("wilayah", ""),
-                            location.get("lat"), location.get("lng"),
-                            gender or "not_specified",
-                        ),
-                    )
-                    create_notification(
-                        con, "admin", "", "مستخدم جديد",
-                        f"تم تسجيل {name or phone}", type_="user", related_id=user_id,
-                        action_text="فتح المستخدم", action_route=f"admin:user:{user_id}",
+                        "UPDATE app_users SET pin_hash=? WHERE id=?", (hash_pin(pin), user_id)
                     )
                 user_row = con.execute("SELECT * FROM app_users WHERE id=?", (user_id,)).fetchone()
             user = row_app_user(user_row, private=True, sign_private=True)
@@ -4484,12 +4531,18 @@ class Handler(SimpleHTTPRequestHandler):
                 base_price = finite_number(
                     data.get("priceFrom", 0), minimum=0, maximum=1_000_000
                 )
+                provider_age = int(
+                    finite_number(data.get("age", 0), minimum=0, maximum=120)
+                )
             except DomainError as err:
                 return self.send_domain_error(err)
             item = {
                 "id": req_id,
                 "name": safe_text(data.get("name"), 120),
                 "phone": normalize_phone(data.get("phone", "")),
+                "email": safe_text(data.get("email"), 160).strip().lower(),
+                "age": provider_age,
+                "nationality": safe_text(data.get("nationality"), 80).strip(),
                 "providerType": data.get("providerType", "individual") if data.get("providerType") in ("individual", "company") else "individual",
                 "companyName": safe_text(data.get("companyName"), 160),
                 "commercialNo": safe_text(data.get("commercialNo"), 120),
@@ -4548,6 +4601,12 @@ class Handler(SimpleHTTPRequestHandler):
                 return self.send_json({"error": "pin_too_short"}, 400)
             if item["providerType"] == "company" and not item["companyName"]:
                 return self.send_json({"error": "company_name_required"}, 400)
+            if item["email"] and not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", item["email"]):
+                return self.send_json({"error": "invalid_email"}, 400)
+            if item["providerType"] == "individual" and not 18 <= item["age"] <= 120:
+                return self.send_json({"error": "invalid_age"}, 400)
+            if item["providerType"] == "individual" and len(item["nationality"]) < 2:
+                return self.send_json({"error": "nationality_required"}, 400)
             if not item["commercialNo"]:
                 return self.send_json({"error": "commercial_number_required"}, 400)
             credential_expiry = (
@@ -5380,17 +5439,31 @@ class Handler(SimpleHTTPRequestHandler):
                     and not verify_secret(data.get("currentPin", ""), user_row["pin_hash"])
                 ):
                     return self.send_json({"error": "current_pin_incorrect"}, 403)
+                email = safe_text(data.get("email", user_row["email"]), 160).strip().lower()
+                nationality = safe_text(
+                    data.get("nationality", user_row["nationality"]), 80
+                ).strip()
+                if email and not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email):
+                    return self.send_json({"error": "invalid_email"}, 400)
+                try:
+                    age = int(data.get("age", user_row["age"]) or 0)
+                except (TypeError, ValueError):
+                    return self.send_json({"error": "invalid_age"}, 400)
+                if age < 0 or age > 120:
+                    return self.send_json({"error": "invalid_age"}, 400)
+                if len(nationality) < 2:
+                    return self.send_json({"error": "nationality_required"}, 400)
                 try:
                     location = normalized_location(data.get("location"))
                 except DomainError as err:
                     return self.send_domain_error(err)
                 con.execute(
-                    """UPDATE app_users SET name=?,phone=?,gov=?,wilayah=?,avatar=?,
+                    """UPDATE app_users SET name=?,phone=?,email=?,age=?,nationality=?,gov=?,wilayah=?,avatar=?,
                     latitude=COALESCE(?,latitude),longitude=COALESCE(?,longitude),gender=?
                     WHERE id=?""",
                     (
                         str(data.get("name", user_row["name"]) or "").strip()[:80],
-                        phone,
+                        phone, email, age, nationality,
                         str(data.get("gov", user_row["gov"]) or "").strip()[:80],
                         str(data.get("wilayah", user_row["wilayah"]) or "").strip()[:80],
                         avatar, location.get("lat"), location.get("lng"),
@@ -6930,6 +7003,22 @@ class Handler(SimpleHTTPRequestHandler):
                 )
                 name = safe_text(data.get("name", provider["name"]), 120)
                 phone = normalize_phone(data.get("phone", provider["phone"]))
+                email = safe_text(
+                    data.get("email", provider.get("email", "")), 160
+                ).strip().lower()
+                nationality = safe_text(
+                    data.get("nationality", provider.get("nationality", "")), 80
+                ).strip()
+                try:
+                    age = int(
+                        finite_number(
+                            data.get("age", provider.get("age", 0)),
+                            minimum=0,
+                            maximum=120,
+                        )
+                    )
+                except DomainError as err:
+                    return self.send_domain_error(err)
                 bio = safe_text(data.get("bio", provider["bio"]), 900)
                 commercial_no = safe_text(
                     data.get("commercialNo", provider.get("commercialNo", "")), 120
@@ -6962,6 +7051,12 @@ class Handler(SimpleHTTPRequestHandler):
                     return self.send_domain_error(err)
                 if not name or len(phone) < 11:
                     return self.send_json({"error": "name_and_valid_phone_required"}, 400)
+                if email and not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email):
+                    return self.send_json({"error": "invalid_email"}, 400)
+                if provider.get("providerType") == "individual" and not 18 <= age <= 120:
+                    return self.send_json({"error": "invalid_age"}, 400)
+                if provider.get("providerType") == "individual" and len(nationality) < 2:
+                    return self.send_json({"error": "nationality_required"}, 400)
                 if not commercial_no:
                     return self.send_json({"error": "commercial_number_required"}, 400)
                 word_count = len(bio.split())
@@ -6980,6 +7075,9 @@ class Handler(SimpleHTTPRequestHandler):
                 provider.update({
                     "name": name,
                     "phone": phone,
+                    "email": email,
+                    "age": age,
+                    "nationality": nationality,
                     "commercialNo": commercial_no,
                     "verificationExpiry": safe_text(data.get("verificationExpiry", provider.get("verificationExpiry", "")), 40),
                     "commercialExpiry": safe_text(data.get("commercialExpiry", provider.get("commercialExpiry", "")), 40),
