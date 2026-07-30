@@ -5424,6 +5424,8 @@ class Handler(SimpleHTTPRequestHandler):
                 avatar = user_row["avatar"] or ""
                 if data.get("avatarData"):
                     avatar = save_upload_data(user_id, data["avatarData"], "avatar", IMAGE_MIMES, 2_500_000)
+                age_was_supplied = "age" in data
+                nationality_was_supplied = "nationality" in data
                 phone = normalize_phone(data.get("phone", user_row["phone"]))
                 if len(phone) != 11 or not phone.startswith("968"):
                     return self.send_json({"error": "valid_phone_required"}, 400)
@@ -5449,9 +5451,9 @@ class Handler(SimpleHTTPRequestHandler):
                     age = int(data.get("age", user_row["age"]) or 0)
                 except (TypeError, ValueError):
                     return self.send_json({"error": "invalid_age"}, 400)
-                if age < 0 or age > 120:
+                if age_was_supplied and (age < 0 or age > 120):
                     return self.send_json({"error": "invalid_age"}, 400)
-                if len(nationality) < 2:
+                if nationality_was_supplied and len(nationality) < 2:
                     return self.send_json({"error": "nationality_required"}, 400)
                 try:
                     location = normalized_location(data.get("location"))
@@ -7001,6 +7003,8 @@ class Handler(SimpleHTTPRequestHandler):
                 entitlements = EntitlementService(con).profile_limits(
                     provider["id"], preserve_existing=True
                 )
+                age_was_supplied = "age" in data
+                nationality_was_supplied = "nationality" in data
                 name = safe_text(data.get("name", provider["name"]), 120)
                 phone = normalize_phone(data.get("phone", provider["phone"]))
                 email = safe_text(
@@ -7053,9 +7057,17 @@ class Handler(SimpleHTTPRequestHandler):
                     return self.send_json({"error": "name_and_valid_phone_required"}, 400)
                 if email and not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email):
                     return self.send_json({"error": "invalid_email"}, 400)
-                if provider.get("providerType") == "individual" and not 18 <= age <= 120:
+                if (
+                    provider.get("providerType") == "individual"
+                    and age_was_supplied
+                    and not 18 <= age <= 120
+                ):
                     return self.send_json({"error": "invalid_age"}, 400)
-                if provider.get("providerType") == "individual" and len(nationality) < 2:
+                if (
+                    provider.get("providerType") == "individual"
+                    and nationality_was_supplied
+                    and len(nationality) < 2
+                ):
                     return self.send_json({"error": "nationality_required"}, 400)
                 if not commercial_no:
                     return self.send_json({"error": "commercial_number_required"}, 400)

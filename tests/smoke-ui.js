@@ -198,7 +198,7 @@ async function clickAdminTab(page, tab) {
   await page.waitForSelector('[data-action="openUserLogin"]');
   await capture(page, '00-entry');
   if (IS_MOBILE && VIEWPORT_HEIGHT > 700) {
-  const entryLayout = await page.locator('.entry-card-focus').evaluate(card => {
+    const entryLayout = await page.locator('.entry-card-focus').evaluate(card => {
       const cardBox = card.getBoundingClientRect();
       const utilities = card.querySelector('.entry-utilities')?.getBoundingClientRect();
       const trust = card.querySelector('.entry-trust-line')?.getBoundingClientRect();
@@ -209,15 +209,19 @@ async function clickAdminTab(page, tab) {
         bottomGap: trust ? cardBox.bottom - trust.bottom : 999,
       };
     });
-    assert(entryLayout.cardHeight >= entryLayout.viewportHeight * 0.9, 'The mobile entry card no longer uses the available screen height.');
+    assert(entryLayout.cardHeight <= entryLayout.viewportHeight - 8, 'The mobile entry card extends beyond the usable screen height.');
     assert(entryLayout.topGap <= 32 && entryLayout.bottomGap <= 36, 'The mobile entry content leaves an excessive blank band at the top or bottom.');
   }
 
   await page.locator('[data-action="openUserLogin"]').click();
   await page.locator('#customerLoginPhone').click();
   assert(await page.locator('#customerLoginPhone').isVisible(), 'Clicking inside the sign-in sheet closed it unexpectedly.');
+  assert(await page.locator('#customerLoginName').count() === 0, 'Sign-in must not ask for registration details.');
+  await page.locator('[data-action="openUserRegistration"]').click();
+  assert(await page.locator('#customerRegisterName').isVisible(), 'The separate user registration sheet did not open.');
+  assert(await page.locator('#customerRegisterNationality').isVisible(), 'User registration is missing its nationality field.');
+  await page.locator('.registration-sheet [data-action="openUserLogin"]').click();
   await page.locator('#customerLoginPhone').fill('95550001');
-  await page.locator('#customerLoginName').fill('مستخدم الاختبار الآلي');
   await page.locator('[data-action="customerLogin"]').click();
   assert(await page.locator('#customerLoginPin').isVisible(), 'Submitting without a PIN must keep the sign-in sheet open.');
   await page.locator('#customerLoginPin').fill('2468');
@@ -463,7 +467,7 @@ async function clickAdminTab(page, tab) {
   await clickUserNav(page, 'community');
   assert(await page.locator('.community-page').count(), 'The Community destination did not open.');
   assert(await page.locator('.community-tabs [data-value="packages"]').count(), 'The packages Community tab is missing.');
-  assert(await page.locator('.community-tabs [data-value="wanted"]').count(), 'The wanted Community tab is missing.');
+  assert(await page.locator('.community-tabs [data-value="board"]').count(), 'The merged request-board Community tab is missing.');
   assert(await page.locator('.community-card').count() === 1, 'Community package card is missing.');
   await capture(page, '08-community-user-packages', { fullPage: false });
   await page.locator('[data-action="toggleLang"]:visible').first().click();
@@ -477,17 +481,16 @@ async function clickAdminTab(page, tab) {
   await page.locator('[data-action="openCommunityListing"]').first().click();
   await capture(page, '08a-community-package-details', { fullPage: false });
   await page.locator('.community-detail-sheet [data-action="closeModal"]').click();
-  await page.locator('.community-tabs [data-value="wanted"]').click();
+  await page.locator('.community-tabs [data-value="board"]').click();
   assert(await page.locator('.community-card').count() === 1, 'Community wanted card is missing.');
+  assert(await page.locator('.request-board-view').count(), 'The merged request board did not open.');
+  assert(await page.locator('.bottom-nav [data-view="community"][aria-current="page"]').count(), 'Community is not represented as its active bottom-navigation destination.');
+  assert(await page.locator('.request-board-guide').count(), 'Request board guidance is missing.');
   await capture(page, '08b-community-user-wanted', { fullPage: false });
   await page.locator('.community-fab').click();
   assert(await page.locator('.community-editor').count(), 'Community wanted editor did not open.');
   await capture(page, '08c-community-wanted-editor', { fullPage: false });
   await page.locator('.community-editor [data-action="closeModal"]').click();
-  await page.locator('.community-tabs [data-value="board"]').click();
-  assert(await page.locator('.request-board-view').count(), 'The standalone request board did not open.');
-  assert(await page.locator('.bottom-nav [data-view="community"][aria-current="page"]').count(), 'Community is not represented as its active bottom-navigation destination.');
-  assert(await page.locator('.request-board-guide').count(), 'Request board guidance is missing.');
   await capture(page, '08d-community-request-board', { fullPage: false });
   assert(await page.locator('.request-board-guide').evaluate(element => element.getBoundingClientRect().right <= window.innerWidth + 1), 'Request board guidance overflows the mobile viewport.');
   await page.locator('.request-board-guide summary').click();
@@ -1094,6 +1097,7 @@ async function clickAdminTab(page, tab) {
   assert(await page.locator('.finance-command-grid').count(), 'Financial control center is missing.');
   await clickAdminTab(page, 'community');
   assert(await page.locator('.admin-community').count(), 'Community management center is missing.');
+  await page.locator('[data-action="adminCommunityView"][data-value="settings"]').click();
   assert(await page.locator('#communityEnabledSetting').count(), 'Community activation control is missing.');
   assert(await page.locator('[data-action="saveCommunitySettings"]').count(), 'Community revenue settings cannot be saved.');
   await capture(page, '08g-community-admin', { fullPage: false });

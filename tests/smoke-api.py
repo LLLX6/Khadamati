@@ -316,8 +316,14 @@ def main():
     provider_phone = "96895550991"
     provider_pin = "7319"
     status, same_phone_user = request(
-        "/api/users/login",
-        {"phone": provider_phone, "name": "مستخدم ومزود", "pin": "2468"},
+        "/api/users/register",
+        {
+            "phone": provider_phone,
+            "name": "مستخدم ومزود",
+            "pin": "2468",
+            "age": 30,
+            "nationality": "عُماني",
+        },
     )
     expect(status, same_phone_user, {200}, "User account with provider phone failed")
     status, missing_expiry = request(
@@ -327,6 +333,8 @@ def main():
             "phone": "96895550992",
             "pin": provider_pin,
             "providerType": "individual",
+            "age": 30,
+            "nationality": "عُماني",
             "commercialNo": "TEST-LIC-NO-EXPIRY",
             "registrationVersion": 57,
             "gov": "مسقط",
@@ -347,6 +355,8 @@ def main():
             "phone": provider_phone,
             "pin": provider_pin,
             "providerType": "individual",
+            "age": 30,
+            "nationality": "عُماني",
             "commercialNo": "TEST-LIC-991",
             "licenseExpiry": "2028-12-31",
             "registrationVersion": 57,
@@ -524,11 +534,13 @@ def main():
     assert "phone" not in provider_quote["lead"], "Provider quote response exposed a customer phone"
 
     status, user = request(
-        "/api/users/login",
+        "/api/users/register",
         {
             "phone": "96895550992",
             "name": "مستخدم اختبار الإنتاج",
             "pin": "2468",
+            "age": 30,
+            "nationality": "عُماني",
             "gov": "مسقط",
             "wilayah": "السيب",
             "location": {"lat": 23.621, "lng": 58.221},
@@ -568,7 +580,7 @@ def main():
     expect(status, completed_recovery, {200}, "Temporary recovery code could not reset the account PIN")
     status, recovered_user = request(
         "/api/users/login",
-        {"phone": "96895550992", "name": "مستخدم اختبار الإنتاج", "pin": "8642"},
+        {"phone": "96895550992", "pin": "8642"},
     )
     expect(status, recovered_user, {200}, "User could not sign in with the recovered PIN")
     user_token = recovered_user["token"]
@@ -594,7 +606,7 @@ def main():
         {
             "action": "save",
             "kind": "wanted",
-            "title": "أبحث عن كهربائي لاختبار المجتمع",
+            "title": "مطلوب كهربائي منزل",
             "description": "فحص لوحة الكهرباء وإصلاح العطل داخل التطبيق",
             "serviceValue": "homecare|electrician",
             "budgetMin": 10,
@@ -796,7 +808,7 @@ def main():
     status, remembered_login = session_request(
         session_opener,
         "/api/users/login",
-        {"phone": "96895550992", "name": "مستخدم اختبار الإنتاج", "pin": "8642"},
+        {"phone": "96895550992", "pin": "8642"},
     )
     expect(status, remembered_login, {200}, "Remembered user login failed")
     remembered_token = remembered_login["token"]
@@ -955,11 +967,13 @@ def main():
     ), "Marketplace request exposed private requester data"
 
     status, recommender = request(
-        "/api/users/login",
+        "/api/users/register",
         {
             "phone": "96895550993",
             "name": "مستخدم مرشح للمزود",
             "pin": "3579",
+            "age": 30,
+            "nationality": "عُماني",
             "gov": "مسقط",
             "wilayah": "السيب",
             "location": {"lat": 23.623, "lng": 58.223},

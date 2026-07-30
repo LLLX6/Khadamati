@@ -7774,14 +7774,16 @@ canvas{
 
   .entry-card.entry-card-focus{
     width:calc(100vw - 18px)!important;
-    min-height:calc(100dvh - 18px - env(safe-area-inset-top,0px) - env(safe-area-inset-bottom,0px))!important;
-    align-self:stretch!important;
+    min-height:auto!important;
+    max-height:calc(100dvh - 18px - env(safe-area-inset-top,0px) - env(safe-area-inset-bottom,0px))!important;
+    align-self:center!important;
+    overflow:auto!important;
     padding:15px!important;
     border-radius:20px!important;
   }
 
   .entry-card-focus .entry-trust-line{
-    align-self:end!important;
+    align-self:auto!important;
     margin-top:10px!important;
   }
 

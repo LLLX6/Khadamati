@@ -71,6 +71,8 @@ def register_provider(base: str, admin_token: str, suffix: str):
                 "phone": phone,
                 "pin": pin,
                 "providerType": "individual",
+                "age": 30,
+                "nationality": "عُماني",
                 "commercialNo": f"SEC-{suffix}",
                 "licenseExpiry": "2028-12-31",
                 "businessRole": "كهربائي منازل",
@@ -250,8 +252,23 @@ def run():
                 "cross-provider branch IDOR",
             )
 
+            expect(
+                http(
+                    base,
+                    "/api/users/register",
+                    {
+                        "phone": "96896660001",
+                        "name": "مستخدم أمني",
+                        "pin": "4268",
+                        "age": 30,
+                        "nationality": "عُماني",
+                    },
+                ),
+                {200},
+                "user registration",
+            )
             user = expect(
-                http(base, "/api/users/login", {"phone": "96896660001", "name": "مستخدم أمني", "pin": "4268"}),
+                http(base, "/api/users/login", {"phone": "96896660001", "pin": "4268"}),
                 {200},
                 "user login",
             )
@@ -285,7 +302,21 @@ def run():
             )
 
             lock_phone = "96896660002"
-            expect(http(base, "/api/users/login", {"phone": lock_phone, "name": "قفل", "pin": "1357"}), {200}, "lock user seed")
+            expect(
+                http(
+                    base,
+                    "/api/users/register",
+                    {
+                        "phone": lock_phone,
+                        "name": "مستخدم القفل",
+                        "pin": "1357",
+                        "age": 30,
+                        "nationality": "عُماني",
+                    },
+                ),
+                {200},
+                "lock user seed",
+            )
             for _ in range(3):
                 expect(http(base, "/api/users/login", {"phone": lock_phone, "pin": "9999"}), {403}, "wrong PIN")
             expect(http(base, "/api/users/login", {"phone": lock_phone, "pin": "1357"}), {429}, "locked login")
@@ -316,7 +347,7 @@ def run():
                 assert error.code == 413, f"oversized body returned HTTP {error.code}"
 
             sw = (ROOT / "service-worker.js").read_text(encoding="utf-8")
-            assert "khadamati-app-shell-v1.1.0" in sw
+            assert "khadamati-app-shell-v1.1.1-mobile-polish-r1" in sw
             assert "./assets/styles/khadamati-v1.css" in sw
             assert "khadamati-v1.css" in sw
             page_source = (ROOT / "index.html").read_text(encoding="utf-8")
