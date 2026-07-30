@@ -8567,6 +8567,65 @@ canvas{
   justify-content:flex-start!important;
 }
 [dir="ltr"] .entry-utilities-single{justify-content:flex-end!important}
+.entry-access-utilities{
+  width:100%;
+  display:flex!important;
+  align-items:center;
+  justify-content:space-between!important;
+  gap:8px;
+}
+.entry-guest-compact{
+  min-height:42px!important;
+  display:inline-flex!important;
+  align-items:center;
+  gap:7px;
+  padding:7px 11px!important;
+  border-radius:12px!important;
+  color:var(--brand2);
+  background:color-mix(in srgb,var(--accent) 6%,var(--panel))!important;
+}
+.entry-guest-compact svg{width:19px;height:19px}
+.entry-guest-compact span{font-size:.7rem;font-weight:900}
+.account-login-sheet .modal-body{
+  gap:10px!important;
+}
+.account-login-sheet .login-sheet-intro{
+  margin:0!important;
+}
+.account-login-sheet .field{
+  gap:5px;
+  margin:0!important;
+}
+.account-login-sheet .field label{
+  line-height:1.35;
+}
+.account-login-sheet .provider-login-actions,
+.account-login-sheet .auth-mode-link,
+.account-login-sheet .entry-browse-link{
+  margin:0!important;
+}
+.provider-entry-card .entry-top{
+  padding-bottom:10px;
+  border-bottom:1px solid var(--line);
+}
+.provider-entry-hero{
+  margin:12px 0!important;
+}
+.provider-entry-login{
+  display:grid;
+  gap:10px;
+  padding:13px!important;
+}
+.provider-entry-login>.field{
+  gap:5px;
+  margin:0!important;
+}
+.provider-entry-login .provider-login-actions{
+  margin:2px 0 0!important;
+}
+.provider-entry-actions{
+  margin-top:8px!important;
+}
 .remembered-account-details{
   min-width:0;
   display:grid;
