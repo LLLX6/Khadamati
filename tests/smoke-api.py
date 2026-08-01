@@ -573,9 +573,17 @@ def main():
     assert len(temporary_code) == 6 and temporary_code.isdigit(), "Temporary recovery code is invalid"
     assert issued_recovery.get("whatsappMessage") and temporary_code in issued_recovery["whatsappMessage"], "Ready WhatsApp recovery message is incomplete"
 
+    status, verified_recovery = request(
+        "/api/recovery/verify",
+        {"recoveryId": recovery_id, "code": temporary_code},
+    )
+    expect(status, verified_recovery, {200}, "Temporary recovery code could not be verified")
+    reset_token = verified_recovery.get("resetToken", "")
+    assert reset_token and temporary_code not in reset_token, "Recovery reset token is missing or unsafe"
+
     status, completed_recovery = request(
         "/api/recovery/complete",
-        {"recoveryId": recovery_id, "code": temporary_code, "pin": "8642"},
+        {"recoveryId": recovery_id, "resetToken": reset_token, "pin": "8642"},
     )
     expect(status, completed_recovery, {200}, "Temporary recovery code could not reset the account PIN")
     status, recovered_user = request(

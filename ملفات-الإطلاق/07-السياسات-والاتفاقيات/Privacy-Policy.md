@@ -1,8 +1,8 @@
 # Privacy Policy
 
 **Product:** Khadamati App
-**Draft version:** `2026-07-18.1`
-**Last updated:** 26 July 2026
+**Draft version:** `2026-08-02.1`
+**Last updated:** 2 August 2026
 **Controller:** `[Legal entity name]`
 **Commercial registration:** `[Registration number]`
 **Address:** `[Official address]`
@@ -21,8 +21,8 @@ government authority or legal certification body.
 
 ## Data processed
 
-- Account data: name, phone number, image, governorate, wilayah, hashed access
-  credential, language, and notification settings.
+- Account data: name, phone number, optional email address, image, governorate,
+  wilayah, hashed access credential, language, and notification settings.
 - Request data: category, exact service, description, priority, selected
   location, images, status, date, and time.
 - Interaction data: offers, recommendations, ratings, complaints, consents,
@@ -41,6 +41,11 @@ government authority or legal certification body.
 Data is used to create and secure accounts, match requests, operate offers and
 chat, show distance with permission, review providers, manage subscriptions and
 complaints, prevent abuse, investigate incidents, and provide support.
+
+An optional email address may be used to deliver a temporary six-digit code
+for access-code recovery. Only a hash of that code is stored; it expires after
+a short period and request/attempt limits apply. The administration email uses
+the same mechanism for dashboard sign-in when email delivery is configured.
 
 ## Consent and permissions
 

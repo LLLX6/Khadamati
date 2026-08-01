@@ -53,6 +53,15 @@ async function capture(page, name, options = {}) {
   });
 }
 
+async function dismissProviderSectionGuide(page, captureName = '') {
+  await page.waitForTimeout(260);
+  const action = page.locator('[data-action="dismissProviderSectionGuide"]');
+  if (!(await action.count())) return false;
+  if (captureName) await capture(page, captureName, { fullPage: false });
+  await action.last().click();
+  return true;
+}
+
 async function clickUserNav(page, view) {
   if (view === 'conversations') {
     const conversations = page.locator('[data-action="openConversations"]:visible').first();
@@ -288,7 +297,7 @@ async function clickAdminTab(page, tab) {
   const onboardingSets = [
     { role: 'user', slides: ['user-service', 'user-direct-request', 'user-matching', 'user-track'] },
     { role: 'guest', slides: ['guest-browse', 'guest-compare', 'guest-signin', 'guest-privacy'] },
-    { role: 'provider', slides: ['provider-profile', 'provider-opportunity', 'provider-availability', 'provider-offer'] },
+    { role: 'provider', slides: ['provider-account-v2', 'provider-community-v2', 'provider-today-v2', 'provider-tasks-v2'] },
     { role: 'company', slides: ['company-profile', 'company-dispatch', 'company-analytics', 'company-team'] },
   ].map(set => ({ ...set, slides: set.slides.map(name => `assets/onboarding/core/${name}.webp`) }));
   for (const set of onboardingSets) {
@@ -787,6 +796,7 @@ async function clickAdminTab(page, tab) {
   const resumedPage = await context.newPage();
   await resumedPage.goto(testUrl, { waitUntil: 'domcontentloaded' });
   await resumedPage.waitForSelector('.provider-topbar');
+  await dismissProviderSectionGuide(resumedPage);
   assert(await resumedPage.locator('[data-action="openProviderAccess"]').count() === 0, 'A full app reopen returned the saved provider to the sign-in gateway.');
   await resumedPage.locator('.provider-top-actions [data-action="switchAccountMode"]').click();
   await resumedPage.waitForSelector('.app-top');
@@ -861,13 +871,16 @@ async function clickAdminTab(page, tab) {
     await page.locator('.provider-nav-secondary[data-action="providerToolTab"][data-tab="business"]').click();
   }
   await page.waitForSelector('.platform-dashboard-grid');
+  await dismissProviderSectionGuide(page, '02c-provider-business-guide');
   assert(await page.locator('.legal-profile-card').count(), 'Provider legal pathway summary is missing from the business center.');
   assert(await page.locator('.platform-workspace-section').count() >= 3, 'Provider CRM, contracts, or training workspace is incomplete.');
   assert(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth + 1), 'Provider business center overflows the mobile viewport.');
   await capture(page, '02c-provider-business');
   await page.locator('.side-nav [data-action="providerTab"][data-tab="home"]').click();
+  await dismissProviderSectionGuide(page, '02d-provider-today-guide');
 
   await page.locator('.side-nav [data-action="providerTab"][data-tab="leads"]').click();
+  await dismissProviderSectionGuide(page, '02e-provider-community-guide');
   await page.locator('.community-v3-tabs [data-value="packages"]').click();
   assert(await page.locator('.community-page[data-community-mode="provider"]').count(), 'Provider Community destination is missing.');
   await page.locator('#toastRoot').evaluate(element => { element.innerHTML = ''; });
@@ -1059,6 +1072,7 @@ async function clickAdminTab(page, tab) {
   await page.locator('.chat-sheet [data-action="closeModalSoft"]').click();
   assert(await page.locator('.provider-workspace .conversation-page-list').count(), 'Closing a chat did not return to the provider conversation page.');
   await page.locator('.side-nav [data-action="providerTab"][data-tab="tasks"]').click();
+  await dismissProviderSectionGuide(page, '06a-provider-tasks-guide');
   assert(await page.locator('.provider-active-jobs .provider-task-card').count(), 'Accepted request is missing from provider active jobs.');
   assert(await page.locator('.provider-active-jobs [data-action="providerAcceptRequest"]').count() === 0, 'Provider can still submit an offer after being selected.');
   assert(await page.locator('.provider-active-jobs [data-action="openCompletionEvidence"]').count() === 1, 'Provider active job must expose exactly one completion action.');
@@ -1077,6 +1091,7 @@ async function clickAdminTab(page, tab) {
   await capture(page, '06-provider-active-jobs');
 
   await page.locator('.side-nav [data-action="providerTab"][data-tab="profile"]').click();
+  await dismissProviderSectionGuide(page, '06b-provider-account-guide');
   await page.locator('#ppBeforeImage').setInputFiles(path.join(__dirname, '..', 'app-icon-192.png'));
   await page.locator('#ppAfterImage').setInputFiles(path.join(__dirname, '..', 'app-icon-512.png'));
   await page.locator('#ppBeforeAfterCaption').fill('نتيجة اختبار قبل وبعد');
@@ -1133,6 +1148,7 @@ async function clickAdminTab(page, tab) {
   }
   else if (await directSupport.count()) await directSupport.evaluate(element => element.click());
   else throw new Error('Provider support navigation is unavailable.');
+  await dismissProviderSectionGuide(page);
   const accountSecurity = page.locator('.compact-settings-disclosure').filter({ has: page.locator('[data-action="providerLogout"]') });
   if (!(await accountSecurity.getAttribute('open'))) await accountSecurity.locator('summary').click();
   await accountSecurity.locator('[data-action="providerLogout"]').click();
@@ -1149,6 +1165,9 @@ async function clickAdminTab(page, tab) {
   await page.locator('[data-action="closeModal"]').click();
   await page.locator('[data-action="goBack"]').click();
   for (let i = 0; i < 6; i++) await page.locator('[data-action="brandHome"]').first().click();
+  if (await page.locator('[data-action="useAdminPassword"]').count()) {
+    await page.locator('[data-action="useAdminPassword"]').click();
+  }
   await page.waitForSelector('#adminCode');
   await page.locator('#adminCode').fill('UI-Test-4829');
   await page.locator('[data-action="adminLogin"]').click();

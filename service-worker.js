@@ -1,4 +1,4 @@
-const CACHE_NAME = 'khadamati-app-shell-v1.1.1-transformation-r1';
+const CACHE_NAME = 'khadamati-app-shell-v1.1.2-email-access-r1';
 const SHELL = [
   './',
   './index.html',
@@ -26,10 +26,10 @@ const SHELL = [
   './assets/onboarding/core/guest-compare.webp',
   './assets/onboarding/core/guest-signin.webp',
   './assets/onboarding/core/guest-privacy.webp',
-  './assets/onboarding/core/provider-profile.webp',
-  './assets/onboarding/core/provider-opportunity.webp',
-  './assets/onboarding/core/provider-availability.webp',
-  './assets/onboarding/core/provider-offer.webp',
+  './assets/onboarding/core/provider-account-v2.webp',
+  './assets/onboarding/core/provider-community-v2.webp',
+  './assets/onboarding/core/provider-tasks-v2.webp',
+  './assets/onboarding/core/provider-today-v2.webp',
   './assets/onboarding/core/company-profile.webp',
   './assets/onboarding/core/company-dispatch.webp',
   './assets/onboarding/core/company-analytics.webp',

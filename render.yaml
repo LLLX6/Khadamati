@@ -16,7 +16,7 @@ services:
       - key: KHADAMATI_ENV
         value: production
       - key: KHADAMATI_RELEASE
-        value: v1.1.1
+        value: v1.1.2
       - key: KHADAMATI_SEED_SAMPLE_DATA
         value: false
       - key: KHADAMATI_PUBLIC_URL
@@ -25,6 +25,8 @@ services:
         value: https://lllx6.github.io
       - key: KHADAMATI_ADMIN_CODE
         sync: false
+      - key: KHADAMATI_ADMIN_EMAIL
+        value: om.khadamati@gmail.com
       - key: KHADAMATI_OTP_PEPPER
         sync: false
       - key: KHADAMATI_MEDIA_SIGNING_KEY

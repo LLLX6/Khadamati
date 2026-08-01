@@ -55,6 +55,33 @@ class RecoveryEmailTests(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertFalse(result["configured"])
 
+    def test_sends_admin_login_code_to_configured_admin_email(self):
+        settings = {
+            "KHADAMATI_SMTP_HOST": "smtp.example.test",
+            "KHADAMATI_SMTP_PORT": "587",
+            "KHADAMATI_SMTP_USER": "sender@example.test",
+            "KHADAMATI_SMTP_PASSWORD": "test-only-password",
+            "KHADAMATI_SMTP_FROM_EMAIL": "sender@example.test",
+            "KHADAMATI_SMTP_USE_TLS": "1",
+            "KHADAMATI_SMTP_USE_SSL": "0",
+        }
+        client = MagicMock()
+        smtp = MagicMock()
+        smtp.return_value.__enter__.return_value = client
+
+        with (
+            patch.dict(os.environ, settings, clear=False),
+            patch.object(server, "ADMIN_EMAIL", "admin@example.test"),
+            patch.object(server.smtplib, "SMTP", smtp),
+            patch.object(server, "log_event"),
+        ):
+            result = server.send_admin_login_email("654321")
+
+        self.assertTrue(result["ok"])
+        message = client.send_message.call_args.args[0]
+        self.assertEqual("admin@example.test", message["To"])
+        self.assertIn("654321", message.get_content())
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -397,9 +397,25 @@ CREATE TABLE IF NOT EXISTS password_recoveries (
   code_hash TEXT NOT NULL,
   attempts INTEGER NOT NULL DEFAULT 0,
   expires_at TIMESTAMPTZ NOT NULL,
+  verified_at TIMESTAMPTZ,
+  reset_token_hash TEXT DEFAULT '',
   used_at TIMESTAMPTZ,
   created_at TIMESTAMPTZ DEFAULT now()
 );
+
+CREATE TABLE IF NOT EXISTS admin_email_challenges (
+  id TEXT PRIMARY KEY,
+  admin_id TEXT NOT NULL REFERENCES admin_users(id) ON DELETE CASCADE,
+  code_hash TEXT NOT NULL,
+  request_key TEXT DEFAULT '',
+  attempts INTEGER NOT NULL DEFAULT 0,
+  expires_at TIMESTAMPTZ NOT NULL,
+  used_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_admin_email_challenge
+  ON admin_email_challenges(admin_id, expires_at, used_at);
 
 CREATE TABLE IF NOT EXISTS push_subscriptions (
   id TEXT PRIMARY KEY,

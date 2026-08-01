@@ -120,7 +120,7 @@ def environment_flag(name, default=False):
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
-APP_RELEASE = os.environ.get("KHADAMATI_RELEASE", "v1.1.1").strip() or "v1.1.1"
+APP_RELEASE = os.environ.get("KHADAMATI_RELEASE", "v1.1.2").strip() or "v1.1.2"
 TRUST_MIGRATION_KEY = "TRUST_SCHEMA_V1"
 QUALITY_MIGRATION_KEY = "QUALITY_SCHEMA_V1"
 PLATFORM_MIGRATION_KEY = "PLATFORM_SCHEMA_V1"
@@ -160,8 +160,11 @@ MEDIA_SIGNING_KEY = (
 )
 ADMIN_2FA_KEY = os.environ.get("KHADAMATI_ADMIN_2FA_KEY") or MEDIA_SIGNING_KEY
 REQUIRE_ADMIN_2FA = environment_flag(
-    "KHADAMATI_REQUIRE_ADMIN_2FA", APP_ENV == "production"
+    "KHADAMATI_REQUIRE_ADMIN_2FA", False
 )
+ADMIN_EMAIL = (
+    os.environ.get("KHADAMATI_ADMIN_EMAIL") or SUPPORT_EMAIL
+).strip().lower()
 DEFAULT_JSON_LIMIT = max(65_536, int(os.environ.get("KHADAMATI_MAX_JSON_BYTES", "1000000")))
 JSON_LIMITS = {
     "/api/provider-requests": 60_000_000,
@@ -899,7 +902,14 @@ def init_db():
             CREATE TABLE IF NOT EXISTS password_recoveries(
               id TEXT PRIMARY KEY, account_kind TEXT NOT NULL, account_id TEXT DEFAULT '', phone TEXT NOT NULL,
               code_hash TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, expires_at TEXT NOT NULL,
+              verified_at TEXT DEFAULT '', reset_token_hash TEXT DEFAULT '',
               used_at TEXT DEFAULT '', created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS admin_email_challenges(
+              id TEXT PRIMARY KEY, admin_id TEXT NOT NULL, code_hash TEXT NOT NULL,
+              request_key TEXT DEFAULT '', attempts INTEGER NOT NULL DEFAULT 0,
+              expires_at TEXT NOT NULL, used_at TEXT DEFAULT '',
+              created_at TEXT DEFAULT CURRENT_TIMESTAMP
             );
             CREATE TABLE IF NOT EXISTS push_subscriptions(
               id TEXT PRIMARY KEY, target_kind TEXT NOT NULL, target_id TEXT DEFAULT '', endpoint TEXT NOT NULL UNIQUE,
@@ -1011,6 +1021,8 @@ def init_db():
             CREATE INDEX IF NOT EXISTS idx_subscription_provider ON subscriptions(provider_id,status,end_date);
             CREATE INDEX IF NOT EXISTS idx_payment_subscription ON payments(subscription_id,status);
             CREATE INDEX IF NOT EXISTS idx_otp_phone ON otp_challenges(phone,purpose,created_at);
+            CREATE INDEX IF NOT EXISTS idx_admin_email_challenge
+              ON admin_email_challenges(admin_id,expires_at,used_at);
             """
         )
         ensure_column(con, "providers", "image_path", "TEXT DEFAULT ''")
@@ -1064,6 +1076,8 @@ def init_db():
         ensure_column(con, "auth_sessions", "device_id", "TEXT DEFAULT ''")
         ensure_column(con, "auth_sessions", "last_used_at", "TEXT DEFAULT ''")
         ensure_column(con, "auth_sessions", "refreshed_at", "TEXT DEFAULT ''")
+        ensure_column(con, "password_recoveries", "verified_at", "TEXT DEFAULT ''")
+        ensure_column(con, "password_recoveries", "reset_token_hash", "TEXT DEFAULT ''")
         con.execute(
             """CREATE UNIQUE INDEX IF NOT EXISTS idx_auth_refresh_hash
             ON auth_sessions(refresh_hash) WHERE refresh_hash!=''"""
@@ -3761,6 +3775,60 @@ def send_recovery_email(to, account_name, code):
         return {"ok": False, "configured": True, "channel": "email"}
 
 
+def send_admin_login_email(code):
+    """Send a short-lived administrator login code without exposing it elsewhere."""
+    address = safe_text(ADMIN_EMAIL, 254).strip().lower()
+    if not smtp_configured() or not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", address):
+        return {"ok": False, "configured": smtp_configured(), "channel": "email"}
+    host = str(os.environ.get("KHADAMATI_SMTP_HOST", "")).strip()
+    user = str(os.environ.get("KHADAMATI_SMTP_USER", "")).strip()
+    password = str(os.environ.get("KHADAMATI_SMTP_PASSWORD", "")).strip()
+    sender = str(os.environ.get("KHADAMATI_SMTP_FROM_EMAIL", user or SUPPORT_EMAIL)).strip()
+    sender_name = str(os.environ.get("KHADAMATI_SMTP_FROM_NAME", "إدارة خدماتي | Khadamati")).strip()
+    try:
+        port = int(os.environ.get("KHADAMATI_SMTP_PORT", "587"))
+    except ValueError:
+        port = 587
+    use_ssl = environment_flag("KHADAMATI_SMTP_USE_SSL", port == 465)
+    use_tls = environment_flag("KHADAMATI_SMTP_USE_TLS", not use_ssl)
+    message = EmailMessage()
+    message["Subject"] = "رمز دخول إدارة خدماتي | Khadamati admin code"
+    message["From"] = formataddr((sender_name, sender))
+    message["To"] = address
+    message.set_content(
+        "رمز الدخول المؤقت إلى إدارة خدماتي هو: " + code + "\n"
+        "صالح لمدة 10 دقائق ولمحاولة دخول واحدة. لا تشاركه مع أي شخص.\n\n"
+        "Your temporary Khadamati admin sign-in code is: " + code + "\n"
+        "It expires in 10 minutes and can be used once. Do not share it.\n"
+    )
+    try:
+        client_class = smtplib.SMTP_SSL if use_ssl else smtplib.SMTP
+        kwargs = {"host": host, "port": port, "timeout": 12}
+        if use_ssl:
+            kwargs["context"] = ssl.create_default_context()
+        with client_class(**kwargs) as client:
+            client.ehlo()
+            if use_tls:
+                client.starttls(context=ssl.create_default_context())
+                client.ehlo()
+            client.login(user, password)
+            client.send_message(message)
+        log_event("admin.email_code_sent", destination=f"***@{address.rsplit('@', 1)[-1]}")
+        return {"ok": True, "configured": True, "channel": "email"}
+    except (OSError, smtplib.SMTPException) as err:
+        log_event("admin.email_code_failed", level="warning", errorType=type(err).__name__)
+        return {"ok": False, "configured": True, "channel": "email"}
+
+
+def mask_email(address):
+    value = safe_text(address, 254).strip().lower()
+    if "@" not in value:
+        return ""
+    local, domain = value.rsplit("@", 1)
+    visible = local[:2] if len(local) > 2 else local[:1]
+    return f"{visible}***@{domain}"
+
+
 def log_whatsapp(target, status, detail):
     digits = normalize_phone(target)
     masked_target = f"***{digits[-4:]}" if len(digits) >= 4 else "***"
@@ -4794,7 +4862,11 @@ class Handler(SimpleHTTPRequestHandler):
                 )
             except DomainError as err:
                 return self.send_domain_error(err)
+        if path == "/api/admin/email-code/request":
+            return self.admin_email_code_request(data)
         if path == "/api/admin/login":
+            challenge_id = safe_text(data.get("emailChallengeId", ""), 160)
+            email_code = safe_text(data.get("emailCode", ""), 12)
             supplied_code = safe_text(data.get("code", ""), 128)
             lock_key = f"ip:{self.client_key()}"
             with db() as con:
@@ -4804,45 +4876,69 @@ class Handler(SimpleHTTPRequestHandler):
                         {"error": "login_temporarily_locked", "retryAfter": lock_state["retryAfter"]},
                         429,
                     )
-                row = next(
-                    (
-                        candidate for candidate in con.execute("SELECT * FROM admin_users WHERE active=1")
-                        if verify_secret(supplied_code, candidate["code_hash"])
-                    ),
-                    None,
-                )
-                if row and not str(row["code_hash"] or "").startswith("pbkdf2_sha256$"):
-                    con.execute(
-                        "UPDATE admin_users SET code_hash=? WHERE id=?",
-                        (hash_pin(supplied_code), row["id"]),
-                    )
-                if not row:
-                    attempts = record_login_failure(con, "admin", lock_key)
-                    return self.send_json({"error": "invalid_code", "attempts": attempts}, 403)
-                two_factor = AdminTwoFactorService(con, ADMIN_2FA_KEY)
-                if bool(row["two_factor_enabled"]):
-                    if not data.get("twoFactorCode"):
-                        return self.send_json(
-                            {
-                                "ok": True,
-                                "twoFactorRequired": True,
-                                "message": "admin_2fa_required",
-                            }
+                if challenge_id or email_code:
+                    challenge = con.execute(
+                        """SELECT * FROM admin_email_challenges
+                        WHERE id=? AND COALESCE(used_at,'')=''""",
+                        (challenge_id,),
+                    ).fetchone()
+                    if not challenge:
+                        return self.send_json({"error": "admin_email_code_not_found"}, 404)
+                    try:
+                        expires = datetime.fromisoformat(str(challenge["expires_at"]).replace("Z", "+00:00"))
+                        if expires.tzinfo is None:
+                            expires = expires.replace(tzinfo=UTC)
+                    except ValueError:
+                        expires = datetime.now(UTC) - timedelta(seconds=1)
+                    if expires <= datetime.now(UTC):
+                        return self.send_json({"error": "admin_email_code_expired"}, 410)
+                    if int(challenge["attempts"] or 0) >= 5 or not verify_secret(email_code, challenge["code_hash"]):
+                        con.execute(
+                            "UPDATE admin_email_challenges SET attempts=attempts+1 WHERE id=?",
+                            (challenge_id,),
                         )
-                    if not two_factor.verify_admin(row, data.get("twoFactorCode")):
                         attempts = record_login_failure(con, "admin", lock_key)
                         return self.send_json(
-                            {"error": "admin_2fa_invalid", "attempts": attempts}, 403
+                            {"error": "admin_email_code_invalid", "attempts": attempts}, 403
                         )
-                elif REQUIRE_ADMIN_2FA:
-                    setup = two_factor.begin(row["id"], row["name"])
-                    return self.send_json(
-                        {
-                            "ok": True,
-                            "twoFactorSetupRequired": True,
-                            **setup,
-                        }
+                    row = con.execute(
+                        "SELECT * FROM admin_users WHERE id=? AND active=1",
+                        (challenge["admin_id"],),
+                    ).fetchone()
+                    if not row:
+                        return self.send_json({"error": "admin_account_not_found"}, 404)
+                    con.execute(
+                        "UPDATE admin_email_challenges SET used_at=CURRENT_TIMESTAMP WHERE id=?",
+                        (challenge_id,),
                     )
+                else:
+                    row = next(
+                        (
+                            candidate for candidate in con.execute("SELECT * FROM admin_users WHERE active=1")
+                            if verify_secret(supplied_code, candidate["code_hash"])
+                        ),
+                        None,
+                    )
+                    if row and not str(row["code_hash"] or "").startswith("pbkdf2_sha256$"):
+                        con.execute(
+                            "UPDATE admin_users SET code_hash=? WHERE id=?",
+                            (hash_pin(supplied_code), row["id"]),
+                        )
+                    if not row:
+                        attempts = record_login_failure(con, "admin", lock_key)
+                        return self.send_json({"error": "invalid_code", "attempts": attempts}, 403)
+                    two_factor = AdminTwoFactorService(con, ADMIN_2FA_KEY)
+                    if bool(row["two_factor_enabled"]):
+                        if not data.get("twoFactorCode"):
+                            return self.send_json(
+                                {"ok": True, "twoFactorRequired": True, "message": "admin_2fa_required"}
+                            )
+                        if not two_factor.verify_admin(row, data.get("twoFactorCode")):
+                            attempts = record_login_failure(con, "admin", lock_key)
+                            return self.send_json({"error": "admin_2fa_invalid", "attempts": attempts}, 403)
+                    elif REQUIRE_ADMIN_2FA:
+                        setup = two_factor.begin(row["id"], row["name"])
+                        return self.send_json({"ok": True, "twoFactorSetupRequired": True, **setup})
                 clear_login_failures(con, "admin", lock_key)
             user = admin_public(row)
             bundle = issue_session_tokens(
@@ -5232,6 +5328,16 @@ class Handler(SimpleHTTPRequestHandler):
                     limits = PlanCatalog.account_limits(
                         foundation, "company" if is_company else "individual"
                     )
+                    try:
+                        requested_team_size = int(item["companySize"] or 1)
+                    except (TypeError, ValueError):
+                        requested_team_size = 1
+                    team_limit = max(1, int(limits.get("maxTeamMembers") or 1))
+                    if not is_company:
+                        requested_team_size = 1
+                    if requested_team_size < 1 or requested_team_size > team_limit:
+                        raise DomainError("team_size_exceeds_plan", 409)
+                    item["companySize"] = str(requested_team_size)
                     item["services"] = normalized_provider_services(
                         con, raw_services,
                         limit=max(1, int(limits.get("maxServices") or 1)),
@@ -5392,6 +5498,8 @@ class Handler(SimpleHTTPRequestHandler):
             return self.notification_action(data)
         if path == "/api/recovery/request":
             return self.recovery_request(data)
+        if path == "/api/recovery/verify":
+            return self.recovery_verify(data)
         if path == "/api/recovery/complete":
             return self.recovery_complete(data)
         if path == "/api/account/delete":
@@ -8308,9 +8416,91 @@ class Handler(SimpleHTTPRequestHandler):
             response["debugCode"] = code
         return self.send_json(response)
 
+    def admin_email_code_request(self, data):
+        if not smtp_configured():
+            return self.send_json(
+                {"error": "email_delivery_unavailable", "fallback": "admin_code"}, 503
+            )
+        request_key = hashlib.sha256(self.client_key().encode("utf-8")).hexdigest()[:32]
+        with db() as con:
+            recent = con.execute(
+                """SELECT COUNT(*) n FROM admin_email_challenges
+                WHERE request_key=? AND created_at>=datetime('now','-1 hour')""",
+                (request_key,),
+            ).fetchone()["n"]
+            if int(recent or 0) >= 5:
+                return self.send_json({"error": "admin_email_rate_limited"}, 429)
+            row = con.execute(
+                "SELECT * FROM admin_users WHERE active=1 ORDER BY created_at LIMIT 1"
+            ).fetchone()
+            if not row:
+                return self.send_json({"error": "admin_account_not_found"}, 404)
+            development_code = os.environ.get("KHADAMATI_DEV_OTP_CODE", "").strip()
+            code = (
+                development_code
+                if APP_ENV != "production" and re.fullmatch(r"\d{6}", development_code)
+                else f"{secrets.randbelow(1_000_000):06d}"
+            )
+            challenge_id = slug("adm-email")
+            con.execute(
+                """INSERT INTO admin_email_challenges(
+                id,admin_id,code_hash,request_key,expires_at) VALUES(?,?,?,?,?)""",
+                (challenge_id, row["id"], hash_pin(code), request_key, iso_datetime(minutes=10)),
+            )
+        delivery = send_admin_login_email(code)
+        if not delivery.get("ok"):
+            with db() as con:
+                con.execute("DELETE FROM admin_email_challenges WHERE id=?", (challenge_id,))
+            return self.send_json(
+                {"error": "email_delivery_unavailable", "fallback": "admin_code"}, 503
+            )
+        response = {
+            "ok": True,
+            "challengeId": challenge_id,
+            "maskedEmail": mask_email(ADMIN_EMAIL),
+            "expiresIn": 600,
+        }
+        if APP_ENV != "production" and development_code:
+            response["debugCode"] = code
+        return self.send_json(response)
+
+    def recovery_verify(self, data):
+        recovery_id = safe_text(data.get("recoveryId", ""), 160)
+        code = safe_text(data.get("code", ""), 12)
+        with db() as con:
+            row = con.execute(
+                "SELECT * FROM password_recoveries WHERE id=? AND COALESCE(used_at,'')=''",
+                (recovery_id,),
+            ).fetchone()
+            if not row:
+                return self.send_json({"error": "recovery_not_found"}, 404)
+            try:
+                expires = datetime.fromisoformat(str(row["expires_at"]).replace("Z", "+00:00"))
+                if expires.tzinfo is None:
+                    expires = expires.replace(tzinfo=UTC)
+            except ValueError:
+                expires = datetime.now(UTC) - timedelta(seconds=1)
+            if expires <= datetime.now(UTC):
+                return self.send_json({"error": "recovery_expired"}, 410)
+            if int(row["attempts"] or 0) >= 5 or not verify_secret(code, row["code_hash"]):
+                con.execute(
+                    "UPDATE password_recoveries SET attempts=attempts+1 WHERE id=?", (recovery_id,)
+                )
+                return self.send_json({"error": "invalid_recovery_code"}, 403)
+            reset_token = secrets.token_urlsafe(32)
+            con.execute(
+                """UPDATE password_recoveries
+                SET verified_at=CURRENT_TIMESTAMP,reset_token_hash=? WHERE id=?""",
+                (hash_pin(reset_token), recovery_id),
+            )
+        return self.send_json(
+            {"ok": True, "resetToken": reset_token, "accountKind": row["account_kind"]}
+        )
+
     def recovery_complete(self, data):
         recovery_id = str(data.get("recoveryId", ""))
         code = str(data.get("code", ""))
+        reset_token = str(data.get("resetToken", ""))
         pin = str(data.get("pin", ""))
         if not re.fullmatch(r"\d{4,8}", pin):
             return self.send_json({"error": "pin_too_short"}, 400)
@@ -8329,9 +8519,16 @@ class Handler(SimpleHTTPRequestHandler):
                 expires = datetime.now(UTC) - timedelta(seconds=1)
             if expires <= datetime.now(UTC):
                 return self.send_json({"error": "recovery_expired"}, 410)
-            if int(row["attempts"] or 0) >= 5 or not verify_secret(code, row["code_hash"]):
-                con.execute("UPDATE password_recoveries SET attempts=attempts+1 WHERE id=?", (recovery_id,))
-                return self.send_json({"error": "invalid_recovery_code"}, 403)
+            token_valid = bool(
+                reset_token
+                and row["verified_at"]
+                and row["reset_token_hash"]
+                and verify_secret(reset_token, row["reset_token_hash"])
+            )
+            if not token_valid:
+                if int(row["attempts"] or 0) >= 5 or not verify_secret(code, row["code_hash"]):
+                    con.execute("UPDATE password_recoveries SET attempts=attempts+1 WHERE id=?", (recovery_id,))
+                    return self.send_json({"error": "invalid_recovery_code"}, 403)
             if row["account_kind"] == "user":
                 con.execute(
                     "UPDATE app_users SET pin_hash=? WHERE id=?", (hash_pin(pin), row["account_id"])

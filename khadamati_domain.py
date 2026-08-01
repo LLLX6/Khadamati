@@ -12,7 +12,7 @@ from typing import Any, Callable, Iterable
 
 
 SUPPORT_EMAIL = os.environ.get("KHADAMATI_SUPPORT_EMAIL", "om.khadamati@gmail.com").strip()
-POLICY_VERSION = "2026-07-28.1"
+POLICY_VERSION = "2026-08-02.1"
 MIGRATION_KEY = "KHADAMATI_SUBSCRIPTION_MIGRATION_V1"
 RANKING_VERSION = "khadamati-ranking-v1"
 OMR = "OMR"
@@ -271,9 +271,12 @@ class PlanCatalog:
             "maxCategories": int(limits.get("maxCategories") or plan.get("max_categories") or 0),
             "maxImages": int(limits.get("maxImages") or plan.get("max_images") or 0),
             "maxWilayats": int(limits.get("maxWilayats") or plan.get("max_wilayats") or 0),
+            "maxTeamMembers": int(limits.get("maxTeamMembers") or plan.get("max_team_members") or entitlements.get("teamMembers") or 1),
+            "maxBranches": int(limits.get("maxBranches") or plan.get("max_branches") or entitlements.get("branches") or 1),
         }
         if normalized_type == "individual":
             result["maxCategories"] = 1
+            result["maxTeamMembers"] = 1
         return result
 
     @staticmethod

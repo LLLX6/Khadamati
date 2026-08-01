@@ -1,6 +1,6 @@
 # Terms of Service
 
-**Draft version:** `2026-07-18.1`
+**Draft version:** `2026-08-02.1`
 **Entity:** `[Legal entity name]`
 
 > **This document is a draft and requires legal review and formal approval before publication.**
@@ -9,7 +9,9 @@
 
 Use of account features means acceptance of the versioned terms and related
 policies. Independent accounts are not intended for persons under 18. Account
-information must be accurate, and access codes must not be shared.
+information must be accurate. Email is optional and, when supplied, may be
+used to deliver a temporary security code for access-code recovery. Access
+codes must not be shared.
 
 ## Platform role
 
