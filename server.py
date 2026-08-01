@@ -68,6 +68,32 @@ from khadamati_community import (
     run_community_maintenance,
     save_community_settings,
 )
+from khadamati_trust import (
+    ComplaintCaseService,
+    InteractionBlockService,
+    ProviderVerificationService,
+    install_trust_schema,
+    trust_statistics,
+)
+from khadamati_security import AdminTwoFactorService, install_security_schema
+from khadamati_growth import KnownProviderInvitationService, install_growth_schema
+from khadamati_platform import (
+    ConversationControlService,
+    DemandAlertService,
+    EnterpriseAPIService,
+    FeatureFlagService,
+    FinancialScenarioService,
+    MaintenanceContractService,
+    OrganizationService,
+    ProviderCRMService,
+    ProviderLegalProfileService,
+    ReferralService,
+    RiskReviewService,
+    TrainingAchievementService,
+    adapter_snapshot,
+    install_platform_schema,
+    platform_snapshot,
+)
 
 try:
     from pywebpush import WebPushException, webpush
@@ -90,7 +116,10 @@ def environment_flag(name, default=False):
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
-APP_RELEASE = os.environ.get("KHADAMATI_RELEASE", "v1.1.0").strip() or "v1.1.0"
+APP_RELEASE = os.environ.get("KHADAMATI_RELEASE", "v1.1.1").strip() or "v1.1.1"
+TRUST_MIGRATION_KEY = "TRUST_SCHEMA_V1"
+QUALITY_MIGRATION_KEY = "QUALITY_SCHEMA_V1"
+PLATFORM_MIGRATION_KEY = "PLATFORM_SCHEMA_V1"
 SAMPLE_DATA_ENABLED = environment_flag(
     "KHADAMATI_SEED_SAMPLE_DATA",
     environment_flag("KHADAMATI_SEED_DEMO_DATA", APP_ENV in {"development", "test"}),
@@ -125,6 +154,10 @@ MEDIA_SIGNING_KEY = (
     or os.environ.get("KHADAMATI_OTP_PEPPER")
     or secrets.token_urlsafe(32)
 )
+ADMIN_2FA_KEY = os.environ.get("KHADAMATI_ADMIN_2FA_KEY") or MEDIA_SIGNING_KEY
+REQUIRE_ADMIN_2FA = environment_flag(
+    "KHADAMATI_REQUIRE_ADMIN_2FA", APP_ENV == "production"
+)
 DEFAULT_JSON_LIMIT = max(65_536, int(os.environ.get("KHADAMATI_MAX_JSON_BYTES", "1000000")))
 JSON_LIMITS = {
     "/api/provider-requests": 60_000_000,
@@ -139,7 +172,14 @@ JSON_LIMITS = {
     "/api/request/workflow": 14_000_000,
     "/api/service-assets": 4_000_000,
     "/api/community": 8_000_000,
+    "/api/trust/complaint": 18_000_000,
+    "/api/trust/verification": 8_000_000,
+    "/api/trust/block": 200_000,
+    "/api/platform": 2_000_000,
+    "/api/admin/platform": 2_000_000,
     "/api/admin/ads": 6_000_000,
+    "/api/admin/complaint-case": 2_000_000,
+    "/api/admin/verification": 2_000_000,
 }
 
 ALL_PERMISSIONS = [
@@ -690,8 +730,8 @@ def ensure_column(con, table, column, definition):
             )
 
 
-def create_pre_migration_backup():
-    """Create one SQLite snapshot immediately before the subscription migration."""
+def create_pre_migration_backup(migration_key=MIGRATION_KEY):
+    """Create one SQLite snapshot immediately before an additive migration."""
     if not DB_PATH.exists() or DB_PATH.stat().st_size == 0:
         return None
     source = sqlite3.connect(DB_PATH, timeout=12)
@@ -699,7 +739,7 @@ def create_pre_migration_backup():
     try:
         try:
             migrated = source.execute(
-                "SELECT 1 FROM settings WHERE key=? LIMIT 1", (MIGRATION_KEY,)
+                "SELECT 1 FROM settings WHERE key=? LIMIT 1", (migration_key,)
             ).fetchone()
         except sqlite3.OperationalError:
             migrated = None
@@ -708,7 +748,8 @@ def create_pre_migration_backup():
         backup_dir = Path(os.environ.get("KHADAMATI_BACKUP_DIR") or (DB_PATH.parent / "backups"))
         backup_dir.mkdir(parents=True, exist_ok=True)
         stamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
-        target = backup_dir / f"khadamati-pre-{MIGRATION_KEY.lower()}-{stamp}.sqlite3"
+        safe_key = re.sub(r"[^a-z0-9_-]+", "-", migration_key.lower()).strip("-")
+        target = backup_dir / f"khadamati-pre-{safe_key}-{stamp}.sqlite3"
         destination = sqlite3.connect(target)
         try:
             source.backup(destination)
@@ -720,8 +761,13 @@ def create_pre_migration_backup():
 
 
 def init_db():
-    backup_path = create_pre_migration_backup()
-    if backup_path:
+    backup_paths = [
+        create_pre_migration_backup(MIGRATION_KEY),
+        create_pre_migration_backup(TRUST_MIGRATION_KEY),
+        create_pre_migration_backup(QUALITY_MIGRATION_KEY),
+        create_pre_migration_backup(PLATFORM_MIGRATION_KEY),
+    ]
+    for backup_path in dict.fromkeys(path for path in backup_paths if path):
         log_event("database.pre_migration_backup", file=backup_path.name)
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
     with db() as con:
@@ -746,7 +792,8 @@ def init_db():
               areas TEXT, bio TEXT, hours TEXT, status TEXT, active INTEGER, verified INTEGER, featured INTEGER,
               package_id TEXT, rating REAL, reviews INTEGER, admin_note TEXT DEFAULT '', image_path TEXT DEFAULT '', card_image TEXT DEFAULT '',
               pin_hash TEXT DEFAULT '', services TEXT NOT NULL, work_images TEXT DEFAULT '[]', documents TEXT DEFAULT '[]',
-              quality_score INTEGER DEFAULT 60, response_score INTEGER DEFAULT 70, subscription_until TEXT DEFAULT '',
+              quality_score INTEGER DEFAULT 60, response_score INTEGER DEFAULT 70,
+              quality_breakdown TEXT DEFAULT '{}', subscription_until TEXT DEFAULT '',
               subscription_start TEXT DEFAULT '', provider_type TEXT DEFAULT 'individual', company_name TEXT DEFAULT '', company_id TEXT DEFAULT '',
               commercial_no TEXT DEFAULT '', verification_expiry TEXT DEFAULT '', commercial_expiry TEXT DEFAULT '', license_expiry TEXT DEFAULT '',
               latitude REAL, longitude REAL, location_updated_at TEXT DEFAULT '',
@@ -770,7 +817,8 @@ def init_db():
             );
             CREATE TABLE IF NOT EXISTS reviews(
               id TEXT PRIMARY KEY, provider_id TEXT NOT NULL, rating INTEGER NOT NULL, customer_name TEXT,
-              phone TEXT, comment TEXT, approved INTEGER NOT NULL DEFAULT 1, created_at TEXT DEFAULT CURRENT_TIMESTAMP
+              phone TEXT, comment TEXT, dimensions TEXT DEFAULT '{}',
+              approved INTEGER NOT NULL DEFAULT 1, created_at TEXT DEFAULT CURRENT_TIMESTAMP
             );
             CREATE TABLE IF NOT EXISTS complaints(
               id TEXT PRIMARY KEY, provider_id TEXT, customer_name TEXT, phone TEXT, reason TEXT, detail TEXT,
@@ -968,6 +1016,7 @@ def init_db():
         ensure_column(con, "providers", "documents", "TEXT DEFAULT '[]'")
         ensure_column(con, "providers", "quality_score", "INTEGER DEFAULT 60")
         ensure_column(con, "providers", "response_score", "INTEGER DEFAULT 70")
+        ensure_column(con, "providers", "quality_breakdown", "TEXT DEFAULT '{}'")
         ensure_column(con, "providers", "subscription_until", "TEXT DEFAULT ''")
         ensure_column(con, "providers", "subscription_start", "TEXT DEFAULT ''")
         ensure_column(con, "providers", "provider_type", "TEXT DEFAULT 'individual'")
@@ -1074,6 +1123,7 @@ def init_db():
         ensure_column(con, "leads", "status", "TEXT DEFAULT 'open'")
         ensure_column(con, "reviews", "request_id", "TEXT DEFAULT ''")
         ensure_column(con, "reviews", "user_id", "TEXT DEFAULT ''")
+        ensure_column(con, "reviews", "dimensions", "TEXT DEFAULT '{}'")
         ensure_column(con, "reviews", "deleted_at", "TEXT DEFAULT ''")
         ensure_column(con, "reviews", "moderation_reason", "TEXT DEFAULT ''")
         ensure_column(con, "complaints", "request_id", "TEXT DEFAULT ''")
@@ -1083,6 +1133,13 @@ def init_db():
         install_reward_schema(con)
         install_location_schema(con)
         install_community_schema(con)
+        install_trust_schema(con)
+        install_security_schema(con)
+        install_growth_schema(con)
+        install_platform_schema(con)
+        ensure_column(con, "customer_requests", "organization_id", "TEXT DEFAULT ''")
+        ensure_column(con, "customer_requests", "organization_location_id", "TEXT DEFAULT ''")
+        ensure_column(con, "customer_requests", "requested_by_member_id", "TEXT DEFAULT ''")
         for c in SEED_CATEGORIES:
             con.execute(
                 "INSERT OR IGNORE INTO categories(id,icon,ar,en,active) VALUES(?,?,?,?,?)",
@@ -1122,6 +1179,34 @@ def init_db():
                 "UPDATE providers SET pin_hash='' WHERE id=? AND pin_hash IN (?,?)",
                 (p["id"], hash_secret("1234"), hash_secret(str(p.get("phone", ""))[-4:])),
             )
+        verification_backfill = ProviderVerificationService(con).backfill()
+        con.execute(
+            """INSERT INTO settings(key,value) VALUES(?,?)
+            ON CONFLICT(key) DO UPDATE SET value=excluded.value""",
+            (
+                TRUST_MIGRATION_KEY,
+                jdump(
+                    {
+                        "installedAt": datetime.now(UTC).isoformat(),
+                        "verificationCasesCreated": verification_backfill,
+                    }
+                ),
+            ),
+        )
+        con.execute(
+            """INSERT INTO settings(key,value) VALUES(?,?)
+            ON CONFLICT(key) DO UPDATE SET value=excluded.value""",
+            (
+                PLATFORM_MIGRATION_KEY,
+                jdump(
+                    {
+                        "installedAt": datetime.now(UTC).isoformat(),
+                        "version": 1,
+                        "rollback": "schema additions are additive; disable feature flags before code rollback",
+                    }
+                ),
+            ),
+        )
         for pkg in [
             ("intro", "مجانية", "Free launch", 0, 365, 0, 1, 5, 1),
             ("individual_6m", "مزود 6 أشهر", "Provider 6 months", 10, 183, 10, 4, 5, 1),
@@ -1154,6 +1239,24 @@ def init_db():
                 id,provider_id,rating,customer_name,phone,comment,approved,created_at)
                 VALUES(?,?,?,?,?,?,1,CURRENT_TIMESTAMP)""",
                 ("rev_seed_2", "p2", 5, "عميلة", "", "التنظيف ممتاز والموعد واضح"),
+            )
+        if not con.execute(
+            "SELECT 1 FROM settings WHERE key=?",
+            (QUALITY_MIGRATION_KEY,),
+        ).fetchone():
+            for provider_row in con.execute("SELECT id FROM providers"):
+                recompute_provider_quality(con, provider_row["id"])
+            con.execute(
+                "INSERT INTO settings(key,value) VALUES(?,?)",
+                (
+                    QUALITY_MIGRATION_KEY,
+                    jdump(
+                        {
+                            "installedAt": datetime.now(UTC).isoformat(),
+                            "version": 1,
+                        }
+                    ),
+                ),
             )
         con.execute(
             "INSERT OR IGNORE INTO settings VALUES('platform', ?)",
@@ -1220,7 +1323,9 @@ def init_db():
         con.execute("UPDATE settings SET value=? WHERE key='platform'", (jdump(platform_settings),))
         if con.execute("SELECT COUNT(*) n FROM admin_users").fetchone()["n"] == 0 and INITIAL_ADMIN_CODE:
             con.execute(
-                "INSERT INTO admin_users VALUES(?,?,?,?,?,1,CURRENT_TIMESTAMP)",
+                """INSERT INTO admin_users(
+                id,name,code_hash,role,permissions,active,created_at)
+                VALUES(?,?,?,?,?,1,CURRENT_TIMESTAMP)""",
                 ("admin_owner", "المالك", hash_pin(INITIAL_ADMIN_CODE), "super_admin", jdump(ALL_PERMISSIONS)),
             )
         elif con.execute("SELECT COUNT(*) n FROM admin_users").fetchone()["n"] == 0:
@@ -1365,6 +1470,7 @@ def row_provider(r, private=False, sign_private=False):
     d["cardImage"] = d.pop("card_image", "") or d["imageUrl"]
     d["qualityScore"] = int(d.pop("quality_score", 0) or 0)
     d["responseScore"] = int(d.pop("response_score", 0) or 0)
+    d["qualityBreakdown"] = jload(d.pop("quality_breakdown", "{}"), {})
     d["subscriptionUntil"] = d.pop("subscription_until", "")
     d["subscriptionStart"] = d.pop("subscription_start", "")
     d["providerType"] = d.pop("provider_type", "individual") or "individual"
@@ -1424,10 +1530,35 @@ def provider_request_view(payload, created_at=""):
     return item
 
 
+REVIEW_DIMENSION_KEYS = ("quality", "punctuality", "communication", "value")
+
+
+def normalize_review_dimensions(value, fallback_rating=0):
+    source = jload(value, {}) if isinstance(value, str) else value
+    source = source if isinstance(source, dict) else {}
+    try:
+        fallback = max(1, min(5, int(round(float(fallback_rating or 0)))))
+    except (TypeError, ValueError):
+        fallback = 0
+    result = {}
+    for key in REVIEW_DIMENSION_KEYS:
+        raw = source.get(key, fallback)
+        try:
+            score = int(round(float(raw)))
+        except (TypeError, ValueError):
+            score = fallback
+        if score:
+            result[key] = max(1, min(5, score))
+    return result
+
+
 def row_review(r, private=False):
     d = dict(r)
     d["approved"] = bool(d["approved"])
     d["deleted"] = bool(d.get("deleted_at"))
+    d["dimensions"] = normalize_review_dimensions(
+        d.get("dimensions"), d.get("rating", 0)
+    )
     if not private:
         for key in ("phone", "user_id", "request_id", "deleted_at", "moderation_reason"):
             d.pop(key, None)
@@ -1440,6 +1571,16 @@ def row_complaint(r, private=False):
         for key in ("phone", "user_id"):
             d.pop(key, None)
     return d
+
+
+def secure_complaint_view(item):
+    result = dict(item or {})
+    result["evidence"] = [dict(evidence) for evidence in result.get("evidence", [])]
+    for evidence in result["evidence"]:
+        media_path = evidence.pop("mediaPath", "")
+        if media_path:
+            evidence["mediaUrl"] = secure_media_url(media_path)
+    return result
 
 
 def row_package(r):
@@ -1551,13 +1692,132 @@ def recompute_provider_quality(con, provider_id):
     if not r:
         return
     provider = row_provider(r, private=True)
-    approved = con.execute(
-        """SELECT COUNT(*) n, COALESCE(AVG(rating),0) avg_rating
-        FROM reviews WHERE provider_id=? AND approved=1
-        AND COALESCE(deleted_at,'')=''""",
+    review_rows = list(
+        con.execute(
+            """SELECT rating,dimensions FROM reviews WHERE provider_id=? AND approved=1
+            AND COALESCE(deleted_at,'')=''""",
+            (provider_id,),
+        )
+    )
+    review_count = len(review_rows)
+    average_rating = (
+        sum(float(row["rating"] or 0) for row in review_rows) / review_count
+        if review_count
+        else 0
+    )
+    dimension_values = {key: [] for key in REVIEW_DIMENSION_KEYS}
+    for review in review_rows:
+        dimensions = normalize_review_dimensions(
+            review["dimensions"], review["rating"]
+        )
+        for key in REVIEW_DIMENSION_KEYS:
+            if key in dimensions:
+                dimension_values[key].append(dimensions[key])
+    dimension_averages = {
+        key: round(sum(values) / len(values), 2) if values else 0
+        for key, values in dimension_values.items()
+    }
+
+    response_minutes = []
+    for dispatch in con.execute(
+        """SELECT created_at,offered_at FROM request_dispatches
+        WHERE provider_id=? AND COALESCE(offered_at,'')!=''""",
+        (provider_id,),
+    ):
+        started = parse_iso(dispatch["created_at"])
+        offered = parse_iso(dispatch["offered_at"])
+        if started and offered and offered >= started:
+            response_minutes.append(
+                max(0, (offered - started).total_seconds() / 60)
+            )
+    measured_response = (
+        round(sum(response_minutes) / len(response_minutes))
+        if response_minutes
+        else max(1, int(provider.get("responseMinutes") or 30))
+    )
+    if measured_response <= 15:
+        response_score = 100
+    elif measured_response <= 30:
+        response_score = 90
+    elif measured_response <= 60:
+        response_score = 78
+    elif measured_response <= 180:
+        response_score = 58
+    else:
+        response_score = 38
+
+    job_rows = list(
+        con.execute(
+            """SELECT user_id,status,offers FROM customer_requests
+            WHERE accepted_provider_id=?""",
+            (provider_id,),
+        )
+    )
+    completed_states = {"closed", "completed", "archived"}
+    completed_jobs = sum(
+        1 for row in job_rows if row["status"] in completed_states
+    )
+    cancelled_jobs = sum(1 for row in job_rows if row["status"] == "cancelled")
+    decided_jobs = completed_jobs + cancelled_jobs
+    completion_score = (
+        round(completed_jobs / decided_jobs * 100)
+        if decided_jobs
+        else 70
+    )
+    completed_by_user = {}
+    warranty_offers = 0
+    for job in job_rows:
+        if job["status"] in completed_states and job["user_id"]:
+            completed_by_user[job["user_id"]] = (
+                completed_by_user.get(job["user_id"], 0) + 1
+            )
+        accepted_offer = next(
+            (
+                offer
+                for offer in jload(job["offers"], [])
+                if isinstance(offer, dict)
+                and offer.get("providerId") == provider_id
+                and offer.get("status") == "accepted"
+            ),
+            None,
+        )
+        if accepted_offer and int(accepted_offer.get("warrantyDays") or 0) > 0:
+            warranty_offers += 1
+    repeat_customers = sum(
+        1 for count in completed_by_user.values() if count >= 2
+    )
+
+    open_complaints = int(
+        con.execute(
+            """SELECT COUNT(*) n FROM complaints WHERE provider_id=?
+            AND status NOT IN ('resolved','closed','rejected')""",
+            (provider_id,),
+        ).fetchone()["n"]
+        or 0
+    )
+    complaint_score = max(40, 100 - open_complaints * 12)
+
+    verification = con.execute(
+        """SELECT status FROM provider_verification_cases
+        WHERE provider_id=?""",
         (provider_id,),
     ).fetchone()
-    open_complaints = con.execute("SELECT COUNT(*) n FROM complaints WHERE provider_id=? AND status!='closed'", (provider_id,)).fetchone()["n"]
+    verification_status = (
+        verification["status"]
+        if verification
+        else ("verified" if provider.get("verified") else "unverified")
+    )
+    trust_score = {
+        "verified": 100,
+        "submitted": 72,
+        "under_review": 72,
+        "changes_required": 50,
+        "unverified": 42,
+        "rejected": 20,
+        "expired": 20,
+        "suspended": 10,
+    }.get(verification_status, 42)
+
     profile_score = 0
     profile_score += 15 if provider.get("imagePath") else 0
     profile_score += 15 if provider.get("bio") else 0
@@ -1565,18 +1825,74 @@ def recompute_provider_quality(con, provider_id):
     profile_score += 10 if provider.get("areas") else 0
     profile_score += 10 if provider.get("services") else 0
     profile_score += min(len(provider.get("workImages") or []) * 5, 20)
-    rating_score = int(float(approved["avg_rating"] or 0) * 12)
-    trust_score = 10 if provider.get("verified") else 0
-    complaint_penalty = min(open_complaints * 12, 40)
-    quality = max(0, min(100, profile_score + rating_score + trust_score - complaint_penalty))
-    con.execute("UPDATE providers SET quality_score=?, rating=?, reviews=? WHERE id=?", (quality, round(float(approved["avg_rating"] or provider.get("rating") or 0), 2), int(approved["n"] or 0), provider_id))
+    profile_score += 10 if provider.get("documents") else 0
+    profile_score += 10 if provider.get("commercialNo") else 0
+    profile_score = min(100, profile_score)
+
+    review_quality = (
+        round(
+            sum(dimension_averages.values())
+            / len(REVIEW_DIMENSION_KEYS)
+            * 20
+        )
+        if review_count
+        else 65
+    )
+    quality = round(
+        profile_score * 0.25
+        + review_quality * 0.25
+        + response_score * 0.12
+        + completion_score * 0.15
+        + trust_score * 0.18
+        + complaint_score * 0.05
+    )
+    quality = max(0, min(100, quality))
+    breakdown = {
+        "version": 1,
+        "profile": profile_score,
+        "customerRating": round(average_rating, 2),
+        "quality": dimension_averages["quality"],
+        "punctuality": dimension_averages["punctuality"],
+        "communication": dimension_averages["communication"],
+        "value": dimension_averages["value"],
+        "response": response_score,
+        "responseMinutes": measured_response,
+        "completion": completion_score,
+        "trust": trust_score,
+        "complaintRecord": complaint_score,
+        "reviewCount": review_count,
+        "responseSamples": len(response_minutes),
+        "acceptedJobs": len(job_rows),
+        "completedJobs": completed_jobs,
+        "repeatCustomers": repeat_customers,
+        "warrantyOffers": warranty_offers,
+        "openComplaints": open_complaints,
+    }
+    con.execute(
+        """UPDATE providers SET quality_score=?,response_score=?,
+        response_minutes=?,completed_jobs=?,quality_breakdown=?,rating=?,reviews=?
+        WHERE id=?""",
+        (
+            quality,
+            response_score,
+            measured_response,
+            completed_jobs,
+            jdump(breakdown),
+            round(average_rating, 2),
+            review_count,
+            provider_id,
+        ),
+    )
 
 
 def admin_public(r):
     d = dict(r)
     d.pop("code_hash", None)
+    d.pop("two_factor_secret", None)
+    d.pop("recovery_codes", None)
     d["permissions"] = jload(d["permissions"], [])
     d["active"] = bool(d["active"])
+    d["twoFactorEnabled"] = bool(d.pop("two_factor_enabled", 0))
     return d
 
 
@@ -1921,6 +2237,13 @@ def row_customer_request(r, sign_private=False):
     d["budgetMin"] = d.pop("budget_min", 0)
     d["budgetMax"] = d.pop("budget_max", 0)
     d["locationText"] = d.pop("location_text", "")
+    latitude = d.pop("latitude", None)
+    longitude = d.pop("longitude", None)
+    d["location"] = (
+        {"lat": latitude, "lng": longitude}
+        if latitude is not None and longitude is not None
+        else None
+    )
     d["images"] = jload(d["images"], [])
     if sign_private:
         d["images"] = [secure_media_url(item) for item in d["images"] if item]
@@ -1947,6 +2270,9 @@ def row_customer_request(r, sign_private=False):
     d["expansionAt"] = d.pop("expansion_at", "")
     d["rankingVersion"] = d.pop("ranking_version", "")
     d["assetId"] = d.pop("asset_id", "")
+    d["organizationId"] = d.pop("organization_id", "")
+    d["organizationLocationId"] = d.pop("organization_location_id", "")
+    d["requestedByMemberId"] = d.pop("requested_by_member_id", "")
     d["createdAt"] = d.pop("created_at", "")
     d["updatedAt"] = d.pop("updated_at", "")
     return d
@@ -2061,6 +2387,7 @@ def marketplace_request(item, include_note=False):
     public_item = {key: value for key, value in item.items() if key in allowed}
     public_item["requesterLabel"] = "مستخدم خدماتي"
     public_item["offerCount"] = len(public_item.get("offers") or [])
+    public_item["locationPrecision"] = "area"
     public_item["offers"] = []
     public_item["acceptedProviderId"] = ""
     public_item["note"] = safe_text(public_item.get("note", ""), 280) if include_note else ""
@@ -2096,12 +2423,16 @@ def provider_profile_complete(provider):
 def ranked_suggestion_candidates(con, request_row, *, limit=10):
     request = dict(request_row)
     entitlements = EntitlementService(con)
+    blocks = InteractionBlockService(con)
+    request_user_id = str(request.get("user_id") or request.get("userId") or "")
     candidates = []
     for row in con.execute(
         """SELECT * FROM providers WHERE active=1 AND verified=1 AND status='available'
         AND COALESCE(listing_enabled,1)=1 AND COALESCE(request_enabled,1)=1"""
     ):
         provider = dict(row)
+        if request_user_id and blocks.is_blocked(request_user_id, provider["id"]):
+            continue
         if not provider_profile_complete(provider):
             continue
         try:
@@ -2632,6 +2963,33 @@ def catalog_reference_count(con, category_id, service_id=""):
 def get_bootstrap(session=None):
     with db() as con:
         maintenance = run_domain_maintenance(con)
+        verification_service = ProviderVerificationService(con)
+        expired_verifications = verification_service.expire_managed_cases()
+        for provider_id in expired_verifications:
+            create_notification(
+                con,
+                "provider",
+                provider_id,
+                "انتهت صلاحية التحقق",
+                "تم إيقاف الظهور واستقبال الطلبات الجديدة حتى تحديث وثائق التحقق.",
+                type_="verification",
+                related_id=provider_id,
+                priority="high",
+                action_text="تحديث التحقق",
+                action_route="provider:account:verification",
+            )
+            create_notification(
+                con,
+                "admin",
+                "",
+                "انتهت صلاحية تحقق مزود",
+                f"يحتاج المزود {provider_id} إلى مراجعة وثائقه قبل إعادة تفعيله.",
+                type_="verification",
+                related_id=provider_id,
+                priority="high",
+                action_text="فتح مركز الثقة",
+                action_route=f"admin:trust:{provider_id}",
+            )
         community_maintenance = run_community_maintenance(con)
         for item in community_maintenance["warnings"]:
             target_kind = "user" if item["owner_kind"] == "user" else "provider"
@@ -2689,6 +3047,55 @@ def get_bootstrap(session=None):
             )
             for r in provider_rows
         ]
+        company_ids = [
+            provider["id"]
+            for provider in providers
+            if provider.get("providerType") == "company"
+        ]
+        if company_ids:
+            placeholders = ",".join("?" for _ in company_ids)
+            team_counts = {
+                row["provider_id"]: int(row["n"] or 0)
+                for row in con.execute(
+                    f"""SELECT provider_id,COUNT(*) n FROM provider_team_members
+                    WHERE active=1 AND provider_id IN ({placeholders})
+                    GROUP BY provider_id""",  # nosec B608 - placeholders are generated, not user input
+                    company_ids,
+                )
+            }
+            branch_counts = {
+                row["provider_id"]: int(row["n"] or 0)
+                for row in con.execute(
+                    f"""SELECT provider_id,COUNT(*) n FROM provider_branches
+                    WHERE active=1 AND provider_id IN ({placeholders})
+                    GROUP BY provider_id""",  # nosec B608 - placeholders are generated, not user input
+                    company_ids,
+                )
+            }
+            for provider in providers:
+                if provider.get("providerType") != "company":
+                    continue
+                provider["companySummary"] = {
+                    "teams": team_counts.get(provider["id"], 0),
+                    "branches": branch_counts.get(provider["id"], 0),
+                    "serviceCount": len(provider.get("services") or []),
+                    "coverageCount": len(provider.get("areas") or []),
+                    "responseMinutes": int(provider.get("responseMinutes") or 30),
+                }
+        for provider in providers:
+            verification = verification_service.get(
+                provider["id"],
+                private=bool(
+                    is_admin
+                    or (
+                        is_provider
+                        and provider["id"] == session.get("providerId")
+                    )
+                ),
+            )
+            if verification:
+                provider["verification"] = verification
+                provider["verified"] = bool(verification.get("verified"))
         requests = []
         if has_permission(session, "review_requests") or is_pending_provider:
             if is_pending_provider:
@@ -2747,9 +3154,10 @@ def get_bootstrap(session=None):
                 "SELECT * FROM packages WHERE active=1 AND COALESCE(legacy,0)=0 ORDER BY price,duration_days"
             )
         ]
+        complaint_service = ComplaintCaseService(con)
         if is_admin:
             reviews = [row_review(r, private=True) for r in con.execute("SELECT * FROM reviews ORDER BY created_at DESC")]
-            complaints = [row_complaint(r, private=True) for r in con.execute("SELECT * FROM complaints ORDER BY created_at DESC")]
+            complaints = complaint_service.list_admin()
             subscriptions = [row_subscription(r) for r in con.execute("SELECT * FROM subscriptions ORDER BY created_at DESC")]
             payments = [row_payment(r) for r in con.execute("SELECT * FROM payments ORDER BY created_at DESC")]
             audits = [row_audit(r) for r in con.execute("SELECT * FROM audit_logs ORDER BY created_at DESC LIMIT 80")]
@@ -2764,7 +3172,7 @@ def get_bootstrap(session=None):
                     (pid,),
                 )
             ]
-            complaints = [row_complaint(r) for r in con.execute("SELECT * FROM complaints WHERE provider_id=? ORDER BY created_at DESC", (pid,))]
+            complaints = complaint_service.list_for_provider(pid)
             subscriptions = [row_subscription(r) for r in con.execute("SELECT * FROM subscriptions WHERE provider_id=? ORDER BY created_at DESC", (pid,))]
             payments = [row_payment(r) for r in con.execute("SELECT * FROM payments WHERE provider_id=? ORDER BY created_at DESC", (pid,))]
             leads = [row_lead(r) for r in con.execute("SELECT * FROM leads WHERE provider_id=? ORDER BY created_at DESC LIMIT 80", (pid,))]
@@ -2835,9 +3243,16 @@ def get_bootstrap(session=None):
             ]
             consent_service = ContactConsentService(con)
             for item in customer_requests:
+                accepted_for_provider = item.get("acceptedProviderId") == pid
+                item["locationPrecision"] = (
+                    "exact" if accepted_for_provider else "area"
+                )
+                if not accepted_for_provider:
+                    item["location"] = None
+                    item["locationText"] = ""
                 consent = consent_service.summary(item["id"], pid)
                 item["contactConsent"] = consent
-                if item.get("acceptedProviderId") != pid or not (
+                if not accepted_for_provider or not (
                     consent.get("whatsapp") or consent.get("call")
                 ):
                     item["phone"] = ""
@@ -2866,6 +3281,7 @@ def get_bootstrap(session=None):
             ]
         elif is_user:
             uid = session["userId"]
+            complaints = complaint_service.list_for_user(uid)
             customer_requests = [
                 request_with_workflow(con, item, asset_visible=True)
                 for item in all_customer_requests
@@ -2940,7 +3356,10 @@ def get_bootstrap(session=None):
             "reviews": con.execute(
                 "SELECT COUNT(*) n FROM reviews WHERE approved=1 AND COALESCE(deleted_at,'')=''"
             ).fetchone()["n"],
-            "openComplaints": con.execute("SELECT COUNT(*) n FROM complaints WHERE status!='closed'").fetchone()["n"],
+            "openComplaints": con.execute(
+                """SELECT COUNT(*) n FROM complaints
+                WHERE status NOT IN ('resolved','closed','rejected')"""
+            ).fetchone()["n"],
             "activeSubscriptions": con.execute("SELECT COUNT(*) n FROM subscriptions WHERE status='active'").fetchone()["n"],
             "qualityAverage": round(con.execute("SELECT COALESCE(AVG(quality_score),0) n FROM providers").fetchone()["n"], 1),
             "whatsappLogs": con.execute("SELECT COUNT(*) n FROM whatsapp_logs").fetchone()["n"],
@@ -2981,6 +3400,12 @@ def get_bootstrap(session=None):
         admin_entities = {}
         financial_metrics = {}
         if is_admin:
+            if has_permission(session, "manage_providers"):
+                admin_entities["verificationCases"] = (
+                    verification_service.list_admin()
+                )
+            if has_permission(session, "manage_quality"):
+                admin_entities["trustStatistics"] = trust_statistics(con)
             state_counts = {
                 row["status"]: int(row["n"])
                 for row in con.execute("SELECT status,COUNT(*) n FROM subscriptions GROUP BY status")
@@ -3085,8 +3510,21 @@ def get_bootstrap(session=None):
                 admin_entities["contactConsents"] = [dict(r) for r in con.execute(
                     "SELECT * FROM contact_consents ORDER BY updated_at DESC LIMIT 300"
                 )]
+        for complaint in complaints:
+            for evidence in complaint.get("evidence", []):
+                media_path = evidence.pop("mediaPath", "")
+                evidence["mediaUrl"] = secure_media_url(media_path)
         reward_campaigns = []
         user_loyalty = {}
+        interaction_blocks = []
+        if is_user:
+            interaction_blocks = InteractionBlockService(con).list_for(
+                "user", session["userId"]
+            )
+        elif is_provider:
+            interaction_blocks = InteractionBlockService(con).list_for(
+                "provider", session["providerId"]
+            )
         reward_service = RewardCampaignService(con)
         if is_user:
             reward_campaigns = reward_service.for_subject("user", session["userId"])
@@ -3117,7 +3555,33 @@ def get_bootstrap(session=None):
             reward_campaigns = reward_service.for_subject(
                 subject_kind, session["providerId"]
             )
+        conversation_actor_kind = (
+            "admin" if is_admin else "user" if is_user else "provider" if is_provider else ""
+        )
+        conversation_actor_id = (
+            session.get("id", "") if is_admin else
+            session.get("userId", "") if is_user else
+            session.get("providerId", "") if is_provider else ""
+        )
+        if conversation_actor_kind:
+            conversation_service = ConversationControlService(con)
+            for request_item in customer_requests:
+                if not request_item.get("acceptedProviderId"):
+                    continue
+                try:
+                    request_item["conversationControl"] = conversation_service.summary(
+                        request_item["id"],
+                        conversation_actor_kind,
+                        conversation_actor_id,
+                    )
+                except DomainError:
+                    request_item["conversationControl"] = {
+                        "requestId": request_item["id"],
+                        "status": "open",
+                        "muted": False,
+                    }
         community = community_snapshot_view(CommunityService(con).snapshot(session))
+        platform = platform_snapshot(con, session)
         data = {
             "categories": categories,
             "providers": providers,
@@ -3143,6 +3607,8 @@ def get_bootstrap(session=None):
             "communityFavorites": community.get("favorites", []),
             "communityStats": community.get("stats", {}),
             "communityReports": community.get("reports", []) if is_admin else [],
+            "interactionBlocks": interaction_blocks,
+            "platform": platform,
             "serverTime": datetime.now(UTC).isoformat(),
             "serviceAvailability": service_availability_snapshot(con),
             "providerInsights": provider_operational_insights(
@@ -3637,7 +4103,10 @@ class Handler(SimpleHTTPRequestHandler):
         origin = self.headers.get("Origin", "").rstrip("/")
         if origin in ALLOWED_ORIGINS:
             self.send_header("Access-Control-Allow-Origin", origin)
-            self.send_header("Access-Control-Allow-Headers", "Authorization, Content-Type")
+            self.send_header(
+                "Access-Control-Allow-Headers",
+                "Authorization, Content-Type, X-Khadamati-API-Key",
+            )
             self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
             self.send_header("Access-Control-Expose-Headers", "X-Request-ID")
             self.send_header("Access-Control-Allow-Credentials", "true")
@@ -3804,9 +4273,18 @@ class Handler(SimpleHTTPRequestHandler):
                     or os.environ.get("KHADAMATI_OTP_PEPPER")
                 ):
                     issues.append("media_signing_key_not_configured")
+                if REQUIRE_ADMIN_2FA and not os.environ.get("KHADAMATI_ADMIN_2FA_KEY"):
+                    issues.append("admin_2fa_key_not_configured")
             try:
                 with db() as con:
                     con.execute("SELECT 1").fetchone()
+                    if REQUIRE_ADMIN_2FA:
+                        enabled_admins = con.execute(
+                            """SELECT COUNT(*) n FROM admin_users
+                            WHERE active=1 AND two_factor_enabled=1"""
+                        ).fetchone()["n"]
+                        if not int(enabled_admins or 0):
+                            issues.append("admin_2fa_not_configured")
             except sqlite3.Error:
                 issues.append("database_unavailable")
             storage_writable = (
@@ -3908,6 +4386,50 @@ class Handler(SimpleHTTPRequestHandler):
             if not session:
                 return
             return self.send_json(get_bootstrap(session))
+        if path == "/api/enterprise/v1/summary":
+            api_key = self.headers.get("X-Khadamati-API-Key", "")
+            try:
+                with db() as con:
+                    client_service = EnterpriseAPIService(con)
+                    client = client_service.authenticate(api_key, "reports:read")
+                    if not FeatureFlagService(con).is_enabled(
+                        "enterprise_api", "organization", client["organizationId"]
+                    ):
+                        return self.send_json({"error": "enterprise_api_disabled"}, 403)
+                    organization = con.execute(
+                        """SELECT id,name,organization_type,status FROM customer_organizations
+                        WHERE id=?""",
+                        (client["organizationId"],),
+                    ).fetchone()
+                    locations = [
+                        {
+                            "id": row["id"], "name": row["name"],
+                            "gov": row["gov"], "wilayah": row["wilayah"],
+                        }
+                        for row in con.execute(
+                            """SELECT id,name,gov,wilayah FROM organization_locations
+                            WHERE organization_id=? AND active=1 ORDER BY name""",
+                            (client["organizationId"],),
+                        )
+                    ]
+                    statuses = {
+                        row["status"]: int(row["n"])
+                        for row in con.execute(
+                            """SELECT status,COUNT(*) n FROM customer_requests
+                            WHERE organization_id=? AND status!='deleted' GROUP BY status""",
+                            (client["organizationId"],),
+                        )
+                    }
+                    return self.send_json(
+                        {
+                            "organization": dict(organization) if organization else {},
+                            "locations": locations,
+                            "requestStatusCounts": statuses,
+                            "generatedAt": datetime.now(UTC).isoformat(),
+                        }
+                    )
+            except DomainError as err:
+                return self.send_domain_error(err)
         if path.startswith("/api/reports/"):
             session = self.require_admin("view_reports")
             if not session:
@@ -4178,6 +4700,36 @@ class Handler(SimpleHTTPRequestHandler):
                 return self.send_json({"ok": True, "savedAt": saved_at})
             except ValueError as err:
                 return self.send_json({"error": str(err)}, 400)
+        if path == "/api/admin/2fa/setup":
+            try:
+                with db() as con:
+                    result = AdminTwoFactorService(con, ADMIN_2FA_KEY).confirm(
+                        safe_text(data.get("challengeId"), 160),
+                        data.get("code"),
+                    )
+                    row = con.execute(
+                        "SELECT * FROM admin_users WHERE id=? AND active=1",
+                        (result["adminId"],),
+                    ).fetchone()
+                    if not row:
+                        return self.send_json({"error": "admin_account_not_found"}, 404)
+                    user = admin_public(row)
+                    log_audit(
+                        con,
+                        {"kind": "admin", "id": row["id"]},
+                        "admin.two_factor.enabled",
+                        row["id"],
+                        "totp",
+                    )
+                bundle = issue_session_tokens(
+                    {"kind": "admin", **user}, device_id=data.get("deviceId", "")
+                )
+                return self.send_session_json(
+                    {"user": user, "recoveryCodes": result["recoveryCodes"]},
+                    bundle,
+                )
+            except DomainError as err:
+                return self.send_domain_error(err)
         if path == "/api/admin/login":
             supplied_code = safe_text(data.get("code", ""), 128)
             lock_key = f"ip:{self.client_key()}"
@@ -4203,6 +4755,30 @@ class Handler(SimpleHTTPRequestHandler):
                 if not row:
                     attempts = record_login_failure(con, "admin", lock_key)
                     return self.send_json({"error": "invalid_code", "attempts": attempts}, 403)
+                two_factor = AdminTwoFactorService(con, ADMIN_2FA_KEY)
+                if bool(row["two_factor_enabled"]):
+                    if not data.get("twoFactorCode"):
+                        return self.send_json(
+                            {
+                                "ok": True,
+                                "twoFactorRequired": True,
+                                "message": "admin_2fa_required",
+                            }
+                        )
+                    if not two_factor.verify_admin(row, data.get("twoFactorCode")):
+                        attempts = record_login_failure(con, "admin", lock_key)
+                        return self.send_json(
+                            {"error": "admin_2fa_invalid", "attempts": attempts}, 403
+                        )
+                elif REQUIRE_ADMIN_2FA:
+                    setup = two_factor.begin(row["id"], row["name"])
+                    return self.send_json(
+                        {
+                            "ok": True,
+                            "twoFactorSetupRequired": True,
+                            **setup,
+                        }
+                    )
                 clear_login_failures(con, "admin", lock_key)
             user = admin_public(row)
             bundle = issue_session_tokens(
@@ -4548,9 +5124,17 @@ class Handler(SimpleHTTPRequestHandler):
                 "commercialNo": safe_text(data.get("commercialNo"), 120),
                 "commercialExpiry": safe_text(data.get("commercialExpiry"), 40),
                 "licenseExpiry": safe_text(data.get("licenseExpiry"), 40),
-                "registrationVersion": 57,
+                "registrationVersion": 58,
                 "companySize": safe_text(data.get("companySize"), 80),
                 "businessRole": safe_text(data.get("businessRole"), 80),
+                "legalPath": safe_text(data.get("legalPath"), 40),
+                "residencyStatus": safe_text(data.get("residencyStatus"), 40),
+                "employerName": safe_text(data.get("employerName"), 160),
+                "employerAuthorizationStatus": safe_text(
+                    data.get("employerAuthorizationStatus"), 40
+                ),
+                "workPermitExpiry": safe_text(data.get("workPermitExpiry"), 40),
+                "residencyExpiry": safe_text(data.get("residencyExpiry"), 40),
                 "gender": data.get("gender")
                 if data.get("gender") in {"male", "female", "not_specified"}
                 else "not_specified",
@@ -4607,15 +5191,38 @@ class Handler(SimpleHTTPRequestHandler):
                 return self.send_json({"error": "invalid_age"}, 400)
             if item["providerType"] == "individual" and len(item["nationality"]) < 2:
                 return self.send_json({"error": "nationality_required"}, 400)
-            if not item["commercialNo"]:
-                return self.send_json({"error": "commercial_number_required"}, 400)
-            credential_expiry = (
-                item["commercialExpiry"]
-                if item["providerType"] == "company"
-                else item["licenseExpiry"]
+            nationality_key = re.sub(
+                r"[\u064b-\u065f\u0670]", "", item["nationality"].strip().lower()
             )
-            if not credential_expiry:
+            inferred_path = (
+                "company"
+                if item["providerType"] == "company"
+                else "individual_omani"
+                if nationality_key in {"omani", "oman", "عماني", "عمانية", "سلطنة عمان", "عمان"}
+                else "individual_foreign"
+            )
+            item["legalPath"] = item["legalPath"] or inferred_path
+            if item["legalPath"] not in {
+                "individual_omani", "individual_foreign", "company"
+            }:
+                return self.send_json({"error": "invalid_legal_pathway"}, 400)
+            if item["providerType"] == "company" and item["legalPath"] != "company":
+                return self.send_json({"error": "company_pathway_required"}, 400)
+            if item["providerType"] == "individual" and item["legalPath"] == "company":
+                return self.send_json({"error": "individual_pathway_required"}, 400)
+            if item["providerType"] == "company" and not item["commercialNo"]:
+                return self.send_json({"error": "commercial_number_required"}, 400)
+            credential_expiry = item["commercialExpiry"] if item["providerType"] == "company" else item["licenseExpiry"]
+            if item["providerType"] == "company" and not credential_expiry:
                 return self.send_json({"error": "credential_expiry_required"}, 400)
+            if item["providerType"] == "individual" and item["commercialNo"] and not credential_expiry:
+                return self.send_json({"error": "credential_expiry_required"}, 400)
+            if item["legalPath"] == "individual_foreign" and (
+                not item["employerName"] or not item["workPermitExpiry"]
+            ):
+                return self.send_json(
+                    {"error": "foreign_worker_details_required"}, 400
+                )
             note_words = len(str(item["note"]).split())
             if note_words < 3 or note_words > 20:
                 return self.send_json({"error": "description_word_limit"}, 400)
@@ -4647,7 +5254,22 @@ class Handler(SimpleHTTPRequestHandler):
             except ValueError as err:
                 return self.send_json({"error": str(err)}, 400)
             with db() as con:
+                invitation_id = ""
+                invite_token = safe_text(data.get("inviteToken"), 200)
+                if invite_token:
+                    try:
+                        invitation = KnownProviderInvitationService(
+                            con
+                        ).resolve_for_registration(invite_token, item["phone"])
+                    except DomainError as err:
+                        return self.send_domain_error(err)
+                    invitation_id = invitation["id"]
+                    item["invitationId"] = invitation_id
                 con.execute("INSERT INTO provider_requests(id,payload) VALUES(?,?)", (item["id"], jdump(item)))
+                if invitation_id:
+                    KnownProviderInvitationService(con).mark_registration(
+                        invitation_id, item["id"]
+                    )
                 settings = jload(con.execute("SELECT value FROM settings WHERE key='platform'").fetchone()["value"], {})
                 create_notification(
                     con,
@@ -4692,6 +5314,16 @@ class Handler(SimpleHTTPRequestHandler):
             return self.service_assets(data)
         if path == "/api/community":
             return self.community_post(data)
+        if path == "/api/trust/verification":
+            return self.trust_verification(data)
+        if path == "/api/trust/complaint":
+            return self.trust_complaint(data)
+        if path == "/api/trust/block":
+            return self.trust_block(data)
+        if path == "/api/platform":
+            return self.platform_post(data)
+        if path == "/api/admin/platform":
+            return self.admin_platform_post(data)
         if path == "/api/notifications/action":
             return self.notification_action(data)
         if path == "/api/recovery/request":
@@ -4719,6 +5351,9 @@ class Handler(SimpleHTTPRequestHandler):
         rating = int(data.get("rating", 0) or 0)
         if not provider_id or not request_id or rating < 1 or rating > 5:
             return self.send_json({"error": "invalid_review"}, 400)
+        dimensions = normalize_review_dimensions(data.get("dimensions"), rating)
+        if set(dimensions) != set(REVIEW_DIMENSION_KEYS):
+            return self.send_json({"error": "invalid_review_dimensions"}, 400)
         with db() as con:
             user = con.execute("SELECT * FROM app_users WHERE id=?", (session["userId"],)).fetchone()
             request_row = con.execute(
@@ -4741,14 +5376,17 @@ class Handler(SimpleHTTPRequestHandler):
                 "customer_name": user["name"],
                 "phone": user["phone"],
                 "comment": str(data.get("comment", "") or "").strip()[:900],
+                "dimensions": dimensions,
             }
             con.execute(
                 """INSERT INTO reviews(
-                id,provider_id,rating,customer_name,phone,comment,approved,request_id,user_id)
-                VALUES(?,?,?,?,?,?,1,?,?)""",
+                id,provider_id,rating,customer_name,phone,comment,dimensions,
+                approved,request_id,user_id)
+                VALUES(?,?,?,?,?,?,?,1,?,?)""",
                 (
                     item["id"], item["provider_id"], item["rating"], item["customer_name"],
-                    item["phone"], item["comment"], item["request_id"], item["user_id"],
+                    item["phone"], item["comment"], jdump(item["dimensions"]),
+                    item["request_id"], item["user_id"],
                 ),
             )
             record_loyalty_transaction(
@@ -4782,18 +5420,44 @@ class Handler(SimpleHTTPRequestHandler):
         session = self.require_user()
         if not session:
             return
-        provider_id = data.get("providerId")
+        provider_id = safe_text(data.get("providerId"), 120)
         request_id = str(data.get("requestId", "") or "")
+        complaint_id = slug("cmp")
         with db() as con:
             user = con.execute("SELECT * FROM app_users WHERE id=?", (session["userId"],)).fetchone()
             if not user:
                 return self.send_json({"error": "user_not_found"}, 404)
-            if request_id and not con.execute(
-                "SELECT id FROM customer_requests WHERE id=? AND user_id=?", (request_id, session["userId"])
+            if request_id:
+                request_row = con.execute(
+                    """SELECT id,accepted_provider_id FROM customer_requests
+                    WHERE id=? AND user_id=?""",
+                    (request_id, session["userId"]),
+                ).fetchone()
+                if not request_row:
+                    return self.send_json({"error": "request_not_found"}, 404)
+                selected_provider = request_row["accepted_provider_id"] or ""
+                if selected_provider:
+                    if provider_id and provider_id != selected_provider:
+                        return self.send_json(
+                            {"error": "complaint_provider_mismatch"}, 403
+                        )
+                    provider_id = selected_provider
+            if provider_id and not con.execute(
+                "SELECT 1 FROM providers WHERE id=? AND COALESCE(status,'')!='deleted'",
+                (provider_id,),
             ).fetchone():
-                return self.send_json({"error": "request_not_found"}, 404)
+                return self.send_json({"error": "provider_not_found"}, 404)
+            try:
+                evidence_paths = save_many_documents(
+                    complaint_id,
+                    data.get("evidenceData", []),
+                    "problem",
+                    5,
+                )
+            except ValueError as err:
+                return self.send_json({"error": str(err)}, 400)
             item = {
-                "id": slug("cmp"),
+                "id": complaint_id,
                 "provider_id": provider_id,
                 "request_id": request_id,
                 "user_id": session["userId"],
@@ -4815,12 +5479,58 @@ class Handler(SimpleHTTPRequestHandler):
                     item["request_id"], item["user_id"],
                 ),
             )
+            complaint_service = ComplaintCaseService(con)
+            complaint_service.open_existing(
+                item["id"],
+                actor_kind="user",
+                actor_id=session["userId"],
+                category=item["reason"],
+                source="request" if request_id else "provider_profile",
+            )
+            if evidence_paths:
+                complaint_service.add_evidence(
+                    item["id"],
+                    evidence_paths,
+                    uploader_kind="user",
+                    uploader_id=session["userId"],
+                    labels=data.get("evidenceLabels", []),
+                )
             if provider_id:
                 recompute_provider_quality(con, provider_id)
             log_audit(con, session, "complaint.created", provider_id or "", request_id or item["reason"])
             settings = jload(con.execute("SELECT value FROM settings WHERE key='platform'").fetchone()["value"], {})
+            create_notification(
+                con,
+                "admin",
+                "",
+                "شكوى جديدة تحتاج فرزًا",
+                f"{item['customer_name']} • {item['reason']}",
+                type_="complaint",
+                related_id=item["id"],
+                priority="high" if item["priority"] == "high" else "normal",
+                action_text="فتح ملف الشكوى",
+                action_route=f"admin:complaint:{item['id']}",
+            )
+            if provider_id:
+                create_notification(
+                    con,
+                    "provider",
+                    provider_id,
+                    "وردت ملاحظة جودة مرتبطة بخدمة",
+                    "سيظهر لك ما يلزم الرد عليه بعد فرز الإدارة للبلاغ.",
+                    type_="complaint",
+                    related_id=item["id"],
+                    priority="normal",
+                    action_text="متابعة الحالة",
+                    action_route=f"provider:complaint:{item['id']}",
+                )
+            response_item = complaint_service.get(item["id"])
+            for evidence in response_item.get("evidence", []):
+                evidence["mediaUrl"] = secure_media_url(
+                    evidence.pop("mediaPath", "")
+                )
         send_whatsapp(settings.get("adminWhatsapp"), f"شكوى جديدة في خدماتي: {item['customer_name']} - {item['phone']} - {item['reason']}")
-        return self.send_json({"ok": True, "complaint": item}, 201)
+        return self.send_json({"ok": True, "complaint": response_item}, 201)
 
     def save_lead(self, data):
         kind = data.get("kind", "whatsapp")
@@ -5488,6 +6198,66 @@ class Handler(SimpleHTTPRequestHandler):
                 current_hash = hash_secret(authorization[7:].strip()) if authorization.startswith("Bearer ") else ""
                 revoke_account_sessions(con, "user", user_id, current_hash)
                 return self.send_json({"ok": True})
+            if path == "/api/user/provider-invitations":
+                service = KnownProviderInvitationService(con)
+                action = safe_text(data.get("action", "list"), 20)
+                try:
+                    if action == "list":
+                        return self.send_json(
+                            {"ok": True, "invitations": service.list_for_user(user_id)}
+                        )
+                    if action == "cancel":
+                        cancelled = service.cancel(
+                            user_id, safe_text(data.get("id"), 160)
+                        )
+                        if not cancelled:
+                            return self.send_json(
+                                {"error": "provider_invitation_not_found"}, 404
+                            )
+                        return self.send_json({"ok": True})
+                    if action != "create":
+                        return self.send_json(
+                            {"error": "invalid_provider_invitation_action"}, 400
+                        )
+                    phone = normalize_phone(data.get("phone", ""))
+                    invitation = service.create(
+                        user_id,
+                        safe_text(data.get("requestId"), 160),
+                        phone,
+                    )
+                    raw_token = invitation.pop("token")
+                    invite_url = (
+                        f"{PUBLIC_APP_URL}#provider-invite={quote(raw_token)}"
+                    )
+                    if invitation.get("providerId"):
+                        create_notification(
+                            con,
+                            "provider",
+                            invitation["providerId"],
+                            "طلب مباشر من عميل يعرفك",
+                            "أرسل لك عميل طلبًا مطابقًا لخدمتك.",
+                            type_="request",
+                            related_id=invitation["requestId"],
+                            priority="high",
+                            action_text="فتح الطلب",
+                            action_route=(
+                                f"provider:request:{invitation['requestId']}"
+                            ),
+                        )
+                    return self.send_json(
+                        {
+                            "ok": True,
+                            "invitation": invitation,
+                            "inviteUrl": invite_url,
+                            "shareText": (
+                                "لدي طلب خدمة لك عبر خدماتي. افتح الرابط وسجل "
+                                f"حساب المزود: {invite_url}"
+                            ),
+                        },
+                        201,
+                    )
+                except DomainError as err:
+                    return self.send_domain_error(err)
             if path == "/api/user/requests":
                 request_id = str(data.get("id", "") or "")
                 action = data.get("action", "save")
@@ -5524,6 +6294,16 @@ class Handler(SimpleHTTPRequestHandler):
                             10,
                             "completed_request",
                             f"completed:{request_id}",
+                        )
+                        ProviderCRMService(con).sync(
+                            current["accepted_provider_id"]
+                        )
+                        TrainingAchievementService(con).recompute_achievements(
+                            current["accepted_provider_id"]
+                        )
+                        ReferralService(con).qualify("user", user_id)
+                        ReferralService(con).qualify(
+                            "provider", current["accepted_provider_id"]
                         )
                         updated = con.execute(
                             "SELECT * FROM customer_requests WHERE id=?",
@@ -5672,6 +6452,45 @@ class Handler(SimpleHTTPRequestHandler):
                     return self.send_json({"error": "service_not_found"}, 400)
                 service_value = f"{safe_text(cat_id, 80)}|{safe_text(service_id, 80)}"
                 service_name = service_name or service_row["ar"]
+                preferred_provider_id = safe_text(
+                    data.get("preferredProviderId"), 160
+                )
+                preferred_provider_row = None
+                if preferred_provider_id:
+                    preferred_provider_row = con.execute(
+                        """SELECT * FROM providers WHERE id=? AND active=1 AND verified=1
+                        AND status NOT IN ('unavailable','deleted')
+                        AND COALESCE(listing_enabled,1)=1
+                        AND COALESCE(request_enabled,1)=1""",
+                        (preferred_provider_id,),
+                    ).fetchone()
+                    if not preferred_provider_row:
+                        return self.send_json(
+                            {"error": "provider_no_longer_available"}, 409
+                        )
+                    if InteractionBlockService(con).is_blocked(
+                        user_id, preferred_provider_id
+                    ):
+                        return self.send_json({"error": "interaction_blocked"}, 403)
+                    request_probe = {
+                        "service_value": service_value,
+                        "serviceValue": service_value,
+                        "gov": data.get("gov", user_row["gov"]),
+                        "wilayah": data.get("wilayah", user_row["wilayah"]),
+                    }
+                    if not RankingService.exact_service_match(
+                        request_probe, dict(preferred_provider_row)
+                    ):
+                        return self.send_json(
+                            {"error": "provider_not_eligible_for_request"}, 409
+                        )
+                    allowed, _, _ = EntitlementService(con).can_receive(
+                        preferred_provider_id
+                    )
+                    if not allowed:
+                        return self.send_json(
+                            {"error": "provider_no_longer_available"}, 409
+                        )
                 images = jload(current["images"], []) if request_id and 'current' in locals() else []
                 if data.get("imagesData"):
                     images = save_many_images(request_id, data["imagesData"], "problem", 5)
@@ -5708,6 +6527,46 @@ class Handler(SimpleHTTPRequestHandler):
                 asset_id = safe_text(data.get("assetId"), 120)
                 if asset_id:
                     ServiceAssetService(con).get_for_user(asset_id, user_id)
+                organization_id = safe_text(data.get("organizationId"), 120)
+                organization_location_id = safe_text(
+                    data.get("organizationLocationId"), 120
+                )
+                requested_by_member_id = safe_text(
+                    data.get("requestedByMemberId"), 120
+                )
+                if organization_id:
+                    organization = con.execute(
+                        """SELECT id FROM customer_organizations
+                        WHERE id=? AND owner_user_id=? AND status='active'""",
+                        (organization_id, user_id),
+                    ).fetchone()
+                    if not organization:
+                        return self.send_json(
+                            {"error": "organization_access_denied"}, 403
+                        )
+                    if organization_location_id:
+                        location_row = con.execute(
+                            """SELECT id FROM organization_locations
+                            WHERE id=? AND organization_id=? AND active=1""",
+                            (organization_location_id, organization_id),
+                        ).fetchone()
+                        if not location_row:
+                            return self.send_json(
+                                {"error": "organization_location_not_found"}, 404
+                            )
+                    if requested_by_member_id:
+                        member_row = con.execute(
+                            """SELECT id FROM organization_members
+                            WHERE id=? AND organization_id=? AND active=1""",
+                            (requested_by_member_id, organization_id),
+                        ).fetchone()
+                        if not member_row:
+                            return self.send_json(
+                                {"error": "organization_member_not_found"}, 404
+                            )
+                else:
+                    organization_location_id = ""
+                    requested_by_member_id = ""
                 if data.get("id"):
                     con.execute("DELETE FROM request_dispatches WHERE request_id=?", (request_id,))
                 con.execute(
@@ -5738,8 +6597,15 @@ class Handler(SimpleHTTPRequestHandler):
                     ),
                 )
                 con.execute(
-                    "UPDATE customer_requests SET asset_id=? WHERE id=?",
-                    (asset_id, request_id),
+                    """UPDATE customer_requests SET asset_id=?,organization_id=?,
+                    organization_location_id=?,requested_by_member_id=? WHERE id=?""",
+                    (
+                        asset_id,
+                        organization_id,
+                        organization_location_id,
+                        requested_by_member_id,
+                        request_id,
+                    ),
                 )
                 if not data.get("id"):
                     RequestIdempotencyService(con).remember(
@@ -5766,9 +6632,24 @@ class Handler(SimpleHTTPRequestHandler):
                         from_status=current["status"],
                         to_status="matching",
                     )
-                marketplace = RequestMarketplace(con)
-                ranked = marketplace.schedule(request_id)
-                released = marketplace.release_due(request_id)
+                if preferred_provider_row:
+                    direct_request = con.execute(
+                        "SELECT * FROM customer_requests WHERE id=?", (request_id,)
+                    ).fetchone()
+                    KnownProviderInvitationService(con).attach(
+                        direct_request, preferred_provider_row
+                    )
+                    ranked = [{"providerId": preferred_provider_id, "score": 100}]
+                    released = [{
+                        "requestId": request_id,
+                        "providerId": preferred_provider_id,
+                        "serviceName": service_name,
+                        "area": request_item["wilayah"] or request_item["gov"],
+                    }]
+                else:
+                    marketplace = RequestMarketplace(con)
+                    ranked = marketplace.schedule(request_id)
+                    released = marketplace.release_due(request_id)
                 create_marketplace_notifications(con, released)
                 status = "matching" if ranked else "unavailable"
                 create_notification(
@@ -6071,19 +6952,48 @@ class Handler(SimpleHTTPRequestHandler):
                     or provider_id == item["acceptedProviderId"]
                 )
             )
+            blocks = InteractionBlockService(con)
 
             if action == "offer":
                 if not is_provider or not item["offersOpen"] or item["acceptedProviderId"]:
                     return self.send_json({"error": "offer_not_allowed"}, 403)
+                blocks.assert_allowed(item["userId"], provider_id)
                 try:
                     price = finite_number(
                         data.get("price", 0), minimum=0, maximum=1_000_000
                     )
+                    labor_amount = finite_number(
+                        data.get("laborAmount", 0),
+                        minimum=0,
+                        maximum=1_000_000,
+                    )
+                    materials_amount = finite_number(
+                        data.get("materialsAmount", 0),
+                        minimum=0,
+                        maximum=1_000_000,
+                    )
                 except DomainError:
                     return self.send_json({"error": "invalid_offer_price"}, 400)
+                if labor_amount or materials_amount:
+                    price = round(labor_amount + materials_amount, 3)
                 duration = str(data.get("duration", "") or "").strip()[:100]
                 if not duration:
                     return self.send_json({"error": "offer_duration_required"}, 400)
+                try:
+                    warranty_days = bounded_int(
+                        data.get("warrantyDays", 0),
+                        0,
+                        minimum=0,
+                        maximum=3650,
+                    )
+                    validity_days = bounded_int(
+                        data.get("validityDays", 7),
+                        7,
+                        minimum=1,
+                        maximum=90,
+                    )
+                except DomainError:
+                    return self.send_json({"error": "invalid_offer_terms"}, 400)
                 offers = list(item.get("offers") or [])
                 existing = next(
                     (offer for offer in offers if offer.get("providerId") == provider_id),
@@ -6093,7 +7003,14 @@ class Handler(SimpleHTTPRequestHandler):
                     "id": existing.get("id") if existing else slug("offer"),
                     "providerId": provider_id,
                     "price": price,
+                    "laborAmount": labor_amount,
+                    "materialsAmount": materials_amount,
                     "duration": duration,
+                    "scope": safe_text(data.get("scope"), 600),
+                    "warrantyDays": warranty_days,
+                    "validUntil": (
+                        datetime.now(UTC) + timedelta(days=validity_days)
+                    ).isoformat(),
                     "note": str(data.get("note", "") or "").strip()[:500],
                     "status": "pending",
                     "createdAt": existing.get("createdAt") if existing else datetime.now(UTC).isoformat(),
@@ -6107,6 +7024,12 @@ class Handler(SimpleHTTPRequestHandler):
                     "UPDATE customer_requests SET offers=?,status='viewed',updated_at=CURRENT_TIMESTAMP WHERE id=?",
                     (jdump(offers[-12:]), request_id),
                 )
+                con.execute(
+                    """UPDATE request_dispatches SET status='offered',
+                    offered_at=COALESCE(NULLIF(offered_at,''),CURRENT_TIMESTAMP),
+                    updated_at=CURRENT_TIMESTAMP WHERE request_id=? AND provider_id=?""",
+                    (request_id, provider_id),
+                )
                 RequestLifecycleService(con).record(
                     request_id,
                     "offer_submitted",
@@ -6116,6 +7039,7 @@ class Handler(SimpleHTTPRequestHandler):
                     to_status="viewed",
                     detail={"offerId": offer["id"]},
                 )
+                recompute_provider_quality(con, provider_id)
                 create_notification(
                     con, "user", item["userId"], "وصل عرض جديد لطلبك",
                     f"{session.get('name', 'مزود')} أرسل سعراً ومدة لخدمة {item['serviceName'] or item['serviceValue']}.",
@@ -6131,7 +7055,11 @@ class Handler(SimpleHTTPRequestHandler):
                 selected = next((offer for offer in offers if offer.get("id") == offer_id), None)
                 if not selected:
                     return self.send_json({"error": "offer_not_found"}, 404)
+                valid_until = parse_iso(selected.get("validUntil"))
+                if valid_until and valid_until <= datetime.now(UTC):
+                    return self.send_json({"error": "offer_expired"}, 409)
                 selected_provider = selected.get("providerId", "")
+                blocks.assert_allowed(item["userId"], selected_provider)
                 # In-app chat opens after the customer deliberately selects an offer.
                 # Phone and WhatsApp remain separately consent-gated.
                 chat_granted = True
@@ -6178,6 +7106,14 @@ class Handler(SimpleHTTPRequestHandler):
                         jdump(messages[-120:]),
                         request_id,
                     ),
+                )
+                con.execute(
+                    """INSERT INTO conversation_threads(request_id,status,updated_at)
+                    VALUES(?,'open',CURRENT_TIMESTAMP)
+                    ON CONFLICT(request_id) DO UPDATE SET status='open',
+                    ended_by_kind='',ended_by_id='',end_reason='',ended_at='',
+                    reopened_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP""",
+                    (request_id,),
                 )
                 RequestLifecycleService(con).record(
                     request_id,
@@ -6234,6 +7170,9 @@ class Handler(SimpleHTTPRequestHandler):
             elif action == "start_work":
                 if not is_user or not item["acceptedProviderId"]:
                     return self.send_json({"error": "start_work_not_allowed"}, 403)
+                blocks.assert_allowed(
+                    item["userId"], item["acceptedProviderId"]
+                )
                 if item["status"] not in ("accepted", "appointmentConfirmed", "inProgress"):
                     return self.send_json({"error": "request_stage_not_allowed"}, 409)
                 agreement = RequestAgreementService(con).get(request_id)
@@ -6261,6 +7200,9 @@ class Handler(SimpleHTTPRequestHandler):
             elif action == "contact_consent":
                 if not is_user or not item["acceptedProviderId"]:
                     return self.send_json({"error": "contact_consent_not_allowed"}, 403)
+                blocks.assert_allowed(
+                    item["userId"], item["acceptedProviderId"]
+                )
                 consent_service = ContactConsentService(con)
                 existing_consent = consent_service.summary(request_id, item["acceptedProviderId"])
                 consent = {
@@ -6290,6 +7232,8 @@ class Handler(SimpleHTTPRequestHandler):
 
             elif action == "message":
                 accepted_provider = item["acceptedProviderId"]
+                if accepted_provider:
+                    blocks.assert_allowed(item["userId"], accepted_provider)
                 consent_service = ContactConsentService(con)
                 chat_allowed = bool(
                     accepted_provider
@@ -6299,6 +7243,12 @@ class Handler(SimpleHTTPRequestHandler):
                     return self.send_json({"error": "chat_not_allowed"}, 403)
                 if not chat_allowed:
                     return self.send_json({"error": "chat_consent_required"}, 403)
+                conversation_service = ConversationControlService(con)
+                conversation_service.assert_open(
+                    request_id,
+                    "user" if is_user else "provider",
+                    user_id if is_user else provider_id,
+                )
                 text = str(data.get("text", "") or "").strip()[:1000]
                 try:
                     location = normalized_location(data.get("location"))
@@ -6350,17 +7300,21 @@ class Handler(SimpleHTTPRequestHandler):
                     ).fetchone()
                     sender_name = provider_row["name"] if provider_row else "مزود الخدمة"
                 preview = text[:105] or ("صورة جديدة" if image_path else "رسالة صوتية جديدة" if audio_path else "موقع جديد")
-                create_notification(
-                    con, target_kind, target_id, f"رسالة جديدة من {sender_name}",
-                    f"{item.get('serviceName') or 'طلب خدمة'} • {preview}",
-                    type_="chat", related_id=request_id, priority="normal",
-                    action_text="فتح المحادثة",
-                    action_route=f"{target_kind}:chat:{request_id}",
-                )
+                if not conversation_service.notifications_muted(
+                    request_id, target_kind, target_id
+                ):
+                    create_notification(
+                        con, target_kind, target_id, f"رسالة جديدة من {sender_name}",
+                        f"{item.get('serviceName') or 'طلب خدمة'} • {preview}",
+                        type_="chat", related_id=request_id, priority="normal",
+                        action_text="فتح المحادثة",
+                        action_route=f"{target_kind}:chat:{request_id}",
+                    )
 
             elif action == "arrival":
                 if not is_provider or provider_id != item["acceptedProviderId"]:
                     return self.send_json({"error": "arrival_not_allowed"}, 403)
+                blocks.assert_allowed(item["userId"], provider_id)
                 status = str(data.get("status", "onTheWay") or "onTheWay")
                 if status not in ("onTheWay", "near", "arrived"):
                     return self.send_json({"error": "invalid_arrival_status"}, 400)
@@ -6653,6 +7607,554 @@ class Handler(SimpleHTTPRequestHandler):
                     asset["imageUrl"] = secure_media_url(asset["imagePath"])
                     asset.pop("imagePath", None)
             return self.send_json({"ok": True, "serviceAssets": assets})
+
+    def trust_verification(self, data):
+        session = self.require_provider("documents")
+        if not session:
+            return
+        action = safe_text(data.get("action"), 40) or "get"
+        provider_id = session["providerId"]
+        with db() as con:
+            service = ProviderVerificationService(con)
+            provider = con.execute(
+                """SELECT id,provider_type,verified,verification_expiry
+                FROM providers WHERE id=? AND COALESCE(status,'')!='deleted'""",
+                (provider_id,),
+            ).fetchone()
+            if not provider:
+                return self.send_json({"error": "provider_not_found"}, 404)
+            if action == "submit":
+                case = service.submit(
+                    provider_id,
+                    requirements=data.get("requirements", []),
+                    evidence=data.get("evidence", []),
+                    actor_id=provider_id,
+                )
+                create_notification(
+                    con,
+                    "admin",
+                    "",
+                    "ملف تحقق يحتاج مراجعة",
+                    session.get("name") or provider_id,
+                    type_="verification",
+                    related_id=provider_id,
+                    priority="high",
+                    action_text="فتح مركز الثقة",
+                    action_route=f"admin:trust:{provider_id}",
+                )
+                log_audit(
+                    con,
+                    session,
+                    "verification.submitted",
+                    provider_id,
+                    case["id"],
+                )
+            elif action == "get":
+                case = service.ensure_case(provider)
+            else:
+                return self.send_json(
+                    {"error": "invalid_verification_action"}, 400
+                )
+            case["timeline"] = service.timeline(case["id"], subject_view=True)
+            case["evidence"] = [
+                secure_media_url(path)
+                for path in case.get("evidence", [])
+                if path
+            ]
+            return self.send_json({"ok": True, "verification": case})
+
+    def trust_complaint(self, data):
+        session = self.session()
+        if not session or session.get("kind") not in {"user", "provider"}:
+            return self.send_json({"error": "auth_required"}, 401)
+        complaint_id = safe_text(data.get("id"), 120)
+        action = safe_text(data.get("action"), 40) or "get"
+        if not complaint_id:
+            return self.send_json({"error": "complaint_id_required"}, 400)
+        actor_kind = session["kind"]
+        actor_id = session.get("userId") or session.get("providerId") or ""
+        with db() as con:
+            row = con.execute(
+                "SELECT * FROM complaints WHERE id=?", (complaint_id,)
+            ).fetchone()
+            if not row:
+                return self.send_json({"error": "complaint_not_found"}, 404)
+            owns_case = (
+                actor_kind == "user" and row["user_id"] == actor_id
+            ) or (
+                actor_kind == "provider" and row["provider_id"] == actor_id
+            )
+            if not owns_case:
+                return self.send_json(
+                    {"error": "complaint_access_denied"}, 403
+                )
+            service = ComplaintCaseService(con)
+            if action == "get":
+                complaint = service.get(complaint_id)
+            elif action == "message":
+                service.add_message(
+                    complaint_id,
+                    data.get("message", ""),
+                    actor_kind=actor_kind,
+                    actor_id=actor_id,
+                )
+                complaint = service.get(complaint_id)
+                create_notification(
+                    con,
+                    "admin",
+                    "",
+                    "تحديث جديد في ملف شكوى",
+                    complaint.get("reason") or complaint_id,
+                    type_="complaint",
+                    related_id=complaint_id,
+                    priority="normal",
+                    action_text="فتح ملف الشكوى",
+                    action_route=f"admin:complaint:{complaint_id}",
+                )
+            elif action == "evidence":
+                try:
+                    evidence_paths = save_many_documents(
+                        complaint_id,
+                        data.get("evidenceData", []),
+                        "problem",
+                        5,
+                    )
+                except ValueError as err:
+                    return self.send_json({"error": str(err)}, 400)
+                if not evidence_paths:
+                    return self.send_json(
+                        {"error": "complaint_evidence_required"}, 400
+                    )
+                service.add_evidence(
+                    complaint_id,
+                    evidence_paths,
+                    uploader_kind=actor_kind,
+                    uploader_id=actor_id,
+                    labels=data.get("evidenceLabels", []),
+                )
+                complaint = service.get(complaint_id)
+                create_notification(
+                    con,
+                    "admin",
+                    "",
+                    "أضيف دليل إلى شكوى",
+                    complaint.get("reason") or complaint_id,
+                    type_="complaint",
+                    related_id=complaint_id,
+                    priority="high",
+                    action_text="مراجعة الدليل",
+                    action_route=f"admin:complaint:{complaint_id}",
+                )
+            elif action == "reopen" and actor_kind == "user":
+                complaint = service.reopen(
+                    complaint_id,
+                    data.get("message", ""),
+                    actor_kind=actor_kind,
+                    actor_id=actor_id,
+                )
+                create_notification(
+                    con,
+                    "admin",
+                    "",
+                    "أعاد المستخدم فتح شكوى",
+                    complaint.get("reason") or complaint_id,
+                    type_="complaint",
+                    related_id=complaint_id,
+                    priority="high",
+                    action_text="فتح ملف الشكوى",
+                    action_route=f"admin:complaint:{complaint_id}",
+                )
+            else:
+                return self.send_json(
+                    {"error": "invalid_complaint_action"}, 400
+                )
+            log_audit(
+                con,
+                session,
+                f"complaint.{action}",
+                complaint_id,
+                complaint.get("status", ""),
+            )
+            return self.send_json(
+                {"ok": True, "complaint": secure_complaint_view(complaint)}
+            )
+
+    def trust_block(self, data):
+        session = self.session()
+        if not session or session.get("kind") not in {"user", "provider"}:
+            return self.send_json({"error": "auth_required"}, 401)
+        actor_kind = session["kind"]
+        actor_id = session.get("userId") or session.get("providerId") or ""
+        target_kind = "provider" if actor_kind == "user" else "user"
+        target_id = safe_text(data.get("targetId"), 120)
+        request_id = safe_text(data.get("requestId"), 120)
+        action = safe_text(data.get("action"), 20) or "block"
+        with db() as con:
+            service = InteractionBlockService(con)
+            if action == "block":
+                request = None
+                if request_id:
+                    request = con.execute(
+                        """SELECT user_id,accepted_provider_id,matching_provider_ids
+                        FROM customer_requests WHERE id=?""",
+                        (request_id,),
+                    ).fetchone()
+                    if not request:
+                        return self.send_json(
+                            {"error": "request_not_found"}, 404
+                        )
+                    valid_pair = (
+                        request["user_id"]
+                        == (actor_id if actor_kind == "user" else target_id)
+                        and request["accepted_provider_id"]
+                        == (target_id if actor_kind == "user" else actor_id)
+                    )
+                    if not valid_pair:
+                        return self.send_json(
+                            {"error": "block_request_relationship_invalid"},
+                            403,
+                        )
+                block = service.block(
+                    actor_kind,
+                    actor_id,
+                    target_kind,
+                    target_id,
+                    reason=data.get("reason", ""),
+                    request_id=request_id,
+                )
+                if request:
+                    con.execute(
+                        """UPDATE contact_consents SET status='revoked',
+                        revoked_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP
+                        WHERE request_id=? AND user_id=? AND provider_id=?""",
+                        (
+                            request_id,
+                            request["user_id"],
+                            request["accepted_provider_id"],
+                        ),
+                    )
+                    con.execute(
+                        """UPDATE customer_requests SET contact_consent=?,
+                        updated_at=CURRENT_TIMESTAMP WHERE id=?""",
+                        (
+                            jdump(
+                                {
+                                    "chat": False,
+                                    "whatsapp": False,
+                                    "call": False,
+                                }
+                            ),
+                            request_id,
+                        ),
+                    )
+                log_audit(
+                    con,
+                    session,
+                    "interaction.blocked",
+                    target_id,
+                    request_id,
+                )
+            elif action == "unblock":
+                service.unblock(
+                    actor_kind, actor_id, target_kind, target_id
+                )
+                block = {}
+                log_audit(
+                    con,
+                    session,
+                    "interaction.unblocked",
+                    target_id,
+                    request_id,
+                )
+            else:
+                return self.send_json({"error": "invalid_block_action"}, 400)
+            return self.send_json(
+                {
+                    "ok": True,
+                    "block": block,
+                    "interactionBlocks": service.list_for(
+                        actor_kind, actor_id
+                    ),
+                }
+            )
+
+    def platform_post(self, data):
+        session = self.session()
+        if not session or session.get("kind") not in {"user", "provider"}:
+            return self.send_json({"error": "auth_required"}, 401)
+        kind = session["kind"]
+        actor_id = session.get("userId") or session.get("providerId") or ""
+        action = safe_text(data.get("action"), 80)
+        with db() as con:
+            result = None
+            if action.startswith("conversation:"):
+                request_id = safe_text(data.get("requestId"), 120)
+                conversation_action = action.split(":", 1)[1]
+                service = ConversationControlService(con)
+                if conversation_action == "get":
+                    result = service.summary(request_id, kind, actor_id)
+                else:
+                    result = service.update(
+                        request_id, kind, actor_id, conversation_action, data
+                    )
+                    if conversation_action in {"end", "reopen"}:
+                        row = con.execute(
+                            "SELECT messages,user_id,accepted_provider_id,service_name FROM customer_requests WHERE id=?",
+                            (request_id,),
+                        ).fetchone()
+                        if row:
+                            messages = jload(row["messages"], [])
+                            ended = conversation_action == "end"
+                            messages.append(
+                                {
+                                    "id": slug("msg"),
+                                    "sender": "system",
+                                    "senderId": actor_id,
+                                    "text": (
+                                        "تم إنهاء المحادثة. يبقى السجل محفوظًا ويمكن للطرف الذي أنهى المحادثة إعادة فتحها."
+                                        if ended
+                                        else "تمت إعادة فتح المحادثة."
+                                    ),
+                                    "image": "",
+                                    "audio": "",
+                                    "location": None,
+                                    "systemGenerated": True,
+                                    "createdAt": datetime.now(UTC).isoformat(),
+                                }
+                            )
+                            con.execute(
+                                "UPDATE customer_requests SET messages=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                                (jdump(messages[-120:]), request_id),
+                            )
+                            target_kind = "provider" if kind == "user" else "user"
+                            target_id = row["accepted_provider_id"] if kind == "user" else row["user_id"]
+                            create_notification(
+                                con,
+                                target_kind,
+                                target_id,
+                                "تم إنهاء المحادثة" if ended else "تمت إعادة فتح المحادثة",
+                                row["service_name"] or "طلب خدمة",
+                                type_="chat",
+                                related_id=request_id,
+                                action_text="عرض المحادثة",
+                                action_route=f"{target_kind}:chat:{request_id}",
+                            )
+                    log_audit(
+                        con,
+                        session,
+                        f"conversation.{conversation_action}",
+                        request_id,
+                        safe_text(data.get("reason"), 300),
+                    )
+            elif action == "organization:save" and kind == "user":
+                result = OrganizationService(con).save(actor_id, data)
+            elif action == "organization:add_member" and kind == "user":
+                result = OrganizationService(con).add_member(
+                    safe_text(data.get("organizationId"), 120), actor_id, data
+                )
+            elif action == "organization:add_location" and kind == "user":
+                result = OrganizationService(con).add_location(
+                    safe_text(data.get("organizationId"), 120), actor_id, data
+                )
+            elif action == "contract:create" and kind == "user":
+                result = MaintenanceContractService(con).create(actor_id, data)
+                create_notification(
+                    con,
+                    "provider",
+                    result["providerId"],
+                    "عقد صيانة دوري جديد",
+                    result["title"],
+                    type_="contract",
+                    related_id=result["id"],
+                    priority="high",
+                    action_text="فتح العقود",
+                    action_route="provider:growth:contracts",
+                )
+            elif action == "contract:status":
+                result = MaintenanceContractService(con).update_status(
+                    safe_text(data.get("id"), 120),
+                    kind,
+                    actor_id,
+                    safe_text(data.get("status"), 40),
+                )
+            elif action == "crm:update" and kind == "provider":
+                result = ProviderCRMService(con).update(
+                    actor_id, safe_text(data.get("id"), 120), data
+                )
+            elif action == "referral:create":
+                result = ReferralService(con).create_code(kind, actor_id)
+            elif action == "referral:claim":
+                result = ReferralService(con).claim(
+                    safe_text(data.get("code"), 30), kind, actor_id
+                )
+                RiskReviewService(con).record(
+                    kind,
+                    actor_id,
+                    "referral_claim",
+                    ["new_referral_claim", "human_review_before_reward"],
+                    20,
+                )
+            elif action == "training:complete" and kind == "provider":
+                result = TrainingAchievementService(con).complete(
+                    actor_id,
+                    safe_text(data.get("moduleId"), 120),
+                    bounded_int(data.get("score"), 0, minimum=0, maximum=100),
+                )
+            elif action == "demand:save":
+                result = DemandAlertService(con).save(kind, actor_id, data)
+            elif action == "demand:cancel":
+                DemandAlertService(con).cancel(
+                    kind, actor_id, safe_text(data.get("id"), 120)
+                )
+                result = {"cancelled": True}
+            elif action == "legal:save" and kind == "provider":
+                result = ProviderLegalProfileService(con).save(actor_id, data)
+                create_notification(
+                    con,
+                    "admin",
+                    "",
+                    "مسار قانوني لمزود يحتاج مراجعة",
+                    session.get("name") or actor_id,
+                    type_="verification",
+                    related_id=actor_id,
+                    priority="high",
+                    action_text="فتح مركز التحقق",
+                    action_route=f"admin:trust:{actor_id}",
+                )
+            elif action == "snapshot":
+                result = platform_snapshot(con, session)
+            else:
+                return self.send_json({"error": "invalid_platform_action"}, 400)
+            return self.send_json(
+                {
+                    "ok": True,
+                    "result": result,
+                    "platform": platform_snapshot(con, session),
+                    "serverTime": datetime.now(UTC).isoformat(),
+                }
+            )
+
+    def admin_platform_post(self, data):
+        session = self.require_admin("manage_settings")
+        if not session:
+            return
+        action = safe_text(data.get("action"), 80)
+        with db() as con:
+            result = None
+            if action == "feature:update":
+                result = FeatureFlagService(con).update(
+                    safe_text(data.get("key"), 80), data, session["id"]
+                )
+            elif action == "legal:review":
+                result = ProviderLegalProfileService(con).review(
+                    safe_text(data.get("providerId"), 120),
+                    safe_text(data.get("status"), 40),
+                    session["id"],
+                    safe_text(data.get("note"), 600),
+                )
+                create_notification(
+                    con,
+                    "provider",
+                    result["providerId"],
+                    "تحديث مراجعة المسار القانوني",
+                    result["reviewStatus"],
+                    type_="verification",
+                    related_id=result["providerId"],
+                    action_text="فتح مركز التحقق",
+                    action_route="provider:account:verification",
+                )
+            elif action == "risk:record":
+                signals = data.get("signals", [])
+                if not isinstance(signals, list):
+                    return self.send_json({"error": "invalid_risk_signals"}, 400)
+                result = RiskReviewService(con).record(
+                    safe_text(data.get("subjectKind"), 40),
+                    safe_text(data.get("subjectId"), 160),
+                    safe_text(data.get("signalType"), 80),
+                    signals,
+                    bounded_int(data.get("score"), 0, minimum=0, maximum=100),
+                )
+            elif action == "risk:resolve":
+                result = RiskReviewService(con).resolve(
+                    safe_text(data.get("id"), 120),
+                    session["id"],
+                    safe_text(data.get("decision"), 40),
+                    safe_text(data.get("note"), 600),
+                )
+            elif action == "scenario:calculate":
+                assumptions = data.get("assumptions", {})
+                if not isinstance(assumptions, dict):
+                    return self.send_json({"error": "invalid_scenario_assumptions"}, 400)
+                result = FinancialScenarioService(con).calculate(assumptions)
+            elif action == "scenario:save":
+                assumptions = data.get("assumptions", {})
+                if not isinstance(assumptions, dict):
+                    return self.send_json({"error": "invalid_scenario_assumptions"}, 400)
+                result = FinancialScenarioService(con).save(
+                    safe_text(data.get("name"), 160), assumptions, session["id"]
+                )
+            elif action == "enterprise:create":
+                scopes = data.get("scopes", [])
+                if not isinstance(scopes, list):
+                    return self.send_json({"error": "invalid_enterprise_scopes"}, 400)
+                result = EnterpriseAPIService(con).create_client(
+                    safe_text(data.get("organizationId"), 120),
+                    safe_text(data.get("name"), 120),
+                    scopes,
+                    bounded_int(data.get("rateLimit"), 60, minimum=1, maximum=600),
+                )
+            elif action == "enterprise:revoke":
+                EnterpriseAPIService(con).revoke(safe_text(data.get("id"), 120))
+                result = {"revoked": True}
+            elif action == "adapter:update":
+                key = safe_text(data.get("key"), 80)
+                row = con.execute(
+                    "SELECT * FROM integration_adapters WHERE key=?", (key,)
+                ).fetchone()
+                if not row:
+                    return self.send_json({"error": "integration_adapter_not_found"}, 404)
+                legal_status = safe_text(data.get("legalStatus"), 40) or row["legal_status"]
+                mode = safe_text(data.get("mode"), 40) or row["mode"]
+                enabled = strict_bool(data.get("enabled"), False)
+                config = data.get("config", {})
+                if not isinstance(config, dict):
+                    return self.send_json({"error": "invalid_adapter_config"}, 400)
+                if enabled and (legal_status != "approved" or not config):
+                    return self.send_json(
+                        {"error": "adapter_contract_and_configuration_required"}, 409
+                    )
+                safe_config = {
+                    key_: safe_text(value, 240)
+                    for key_, value in config.items()
+                    if key_ in {"providerName", "endpoint", "agreementReference", "environment"}
+                }
+                con.execute(
+                    """UPDATE integration_adapters SET enabled=?,mode=?,legal_status=?,
+                    config=?,updated_at=CURRENT_TIMESTAMP WHERE key=?""",
+                    (int(enabled), mode, legal_status, jdump(safe_config), key),
+                )
+                result = next(
+                    item for item in adapter_snapshot(con) if item["key"] == key
+                )
+            elif action == "snapshot":
+                result = platform_snapshot(con, session)
+            else:
+                return self.send_json({"error": "invalid_admin_platform_action"}, 400)
+            log_audit(
+                con,
+                session,
+                f"platform.{action}",
+                safe_text(data.get("id") or data.get("key") or data.get("providerId"), 160),
+                "",
+            )
+            return self.send_json(
+                {
+                    "ok": True,
+                    "result": result,
+                    "platform": platform_snapshot(con, session),
+                    "serverTime": datetime.now(UTC).isoformat(),
+                }
+            )
 
     def notification_action(self, data):
         session = self.session()
@@ -7388,6 +8890,8 @@ class Handler(SimpleHTTPRequestHandler):
             "/api/admin/customer-request-action": "review_requests",
             "/api/admin/review-status": "manage_quality",
             "/api/admin/complaint-status": "manage_quality",
+            "/api/admin/complaint-case": "manage_quality",
+            "/api/admin/verification": "manage_providers",
             "/api/admin/packages": "manage_subscriptions",
             "/api/admin/subscriptions": "manage_subscriptions",
             "/api/admin/payments": "manage_finance",
@@ -7408,6 +8912,174 @@ class Handler(SimpleHTTPRequestHandler):
         if not session:
             return
         with db() as con:
+            if path == "/api/admin/verification":
+                provider_id = safe_text(data.get("providerId"), 120)
+                action = safe_text(data.get("action"), 40) or "get"
+                service = ProviderVerificationService(con)
+                if action == "review":
+                    try:
+                        case = service.review(
+                            provider_id,
+                            data,
+                            reviewer_id=session["id"],
+                        )
+                    except DomainError as err:
+                        return self.send_domain_error(err)
+                    create_notification(
+                        con,
+                        "provider",
+                        provider_id,
+                        "تم تحديث حالة التحقق",
+                        case["badge"]["ar"],
+                        type_="verification",
+                        related_id=provider_id,
+                        priority=(
+                            "high"
+                            if case["status"]
+                            in {"changes_required", "rejected", "suspended", "expired"}
+                            else "normal"
+                        ),
+                        action_text="فتح حالة التحقق",
+                        action_route="provider:account:verification",
+                    )
+                    log_audit(
+                        con,
+                        session,
+                        "verification.reviewed",
+                        provider_id,
+                        case["status"],
+                    )
+                elif action == "get":
+                    provider = con.execute(
+                        """SELECT id,provider_type,verified,verification_expiry
+                        FROM providers WHERE id=? AND COALESCE(status,'')!='deleted'""",
+                        (provider_id,),
+                    ).fetchone()
+                    if not provider:
+                        return self.send_json(
+                            {"error": "provider_not_found"}, 404
+                        )
+                    case = service.ensure_case(provider)
+                else:
+                    return self.send_json(
+                        {"error": "invalid_verification_action"}, 400
+                    )
+                case["timeline"] = service.timeline(case["id"])
+                case["evidence"] = [
+                    secure_media_url(path)
+                    for path in case.get("evidence", [])
+                    if path
+                ]
+                return self.send_json(
+                    {"ok": True, "verification": case}
+                )
+            if path == "/api/admin/complaint-case":
+                complaint_id = safe_text(data.get("id"), 120)
+                action = safe_text(data.get("action"), 40) or "get"
+                service = ComplaintCaseService(con)
+                existing = con.execute(
+                    "SELECT * FROM complaints WHERE id=?", (complaint_id,)
+                ).fetchone()
+                if not existing:
+                    return self.send_json(
+                        {"error": "complaint_not_found"}, 404
+                    )
+                try:
+                    if action == "update":
+                        complaint = service.update(
+                            complaint_id, data, admin_id=session["id"]
+                        )
+                    elif action == "message":
+                        service.add_message(
+                            complaint_id,
+                            data.get("message", ""),
+                            actor_kind="admin",
+                            actor_id=session["id"],
+                            visible=bool(data.get("visibleToSubject", True)),
+                        )
+                        complaint = service.get(
+                            complaint_id, private=True
+                        )
+                    elif action == "evidence":
+                        evidence_paths = save_many_documents(
+                            complaint_id,
+                            data.get("evidenceData", []),
+                            "problem",
+                            5,
+                        )
+                        if not evidence_paths:
+                            return self.send_json(
+                                {"error": "complaint_evidence_required"}, 400
+                            )
+                        service.add_evidence(
+                            complaint_id,
+                            evidence_paths,
+                            uploader_kind="admin",
+                            uploader_id=session["id"],
+                            labels=data.get("evidenceLabels", []),
+                        )
+                        complaint = service.get(
+                            complaint_id, private=True
+                        )
+                    elif action == "get":
+                        complaint = service.get(
+                            complaint_id, private=True
+                        )
+                    else:
+                        return self.send_json(
+                            {"error": "invalid_complaint_action"}, 400
+                        )
+                except DomainError as err:
+                    return self.send_domain_error(err)
+                except ValueError as err:
+                    return self.send_json({"error": str(err)}, 400)
+                if action != "get" and bool(
+                    data.get("visibleToSubject", True)
+                ):
+                    status_label = complaint.get("status", "")
+                    if complaint.get("userId"):
+                        create_notification(
+                            con,
+                            "user",
+                            complaint["userId"],
+                            "تحديث في ملف الشكوى",
+                            status_label,
+                            type_="complaint",
+                            related_id=complaint_id,
+                            priority="normal",
+                            action_text="متابعة الشكوى",
+                            action_route=f"user:complaint:{complaint_id}",
+                        )
+                    if complaint.get("providerId"):
+                        create_notification(
+                            con,
+                            "provider",
+                            complaint["providerId"],
+                            "تحديث في ملف الجودة",
+                            status_label,
+                            type_="complaint",
+                            related_id=complaint_id,
+                            priority="normal",
+                            action_text="متابعة الحالة",
+                            action_route=f"provider:complaint:{complaint_id}",
+                        )
+                if complaint.get("providerId"):
+                    recompute_provider_quality(
+                        con, complaint["providerId"]
+                    )
+                log_audit(
+                    con,
+                    session,
+                    f"complaint.{action}",
+                    complaint_id,
+                    complaint.get("status", ""),
+                )
+                return self.send_json(
+                    {
+                        "ok": True,
+                        "complaint": secure_complaint_view(complaint),
+                    }
+                )
             if path == "/api/admin/customer-request-action":
                 request_id = safe_text(data.get("id"), 120)
                 action = safe_text(data.get("action"), 24)
@@ -7645,6 +9317,41 @@ class Handler(SimpleHTTPRequestHandler):
                     "UPDATE providers SET active=?, verified=?, featured=?, status=? WHERE id=?",
                     (*flags, status, provider_id),
                 )
+                provider_row = con.execute(
+                    """SELECT id,provider_type,verified,verification_expiry,status
+                    FROM providers WHERE id=?""",
+                    (provider_id,),
+                ).fetchone()
+                verification_service = ProviderVerificationService(con)
+                verification_case = verification_service.ensure_case(provider_row)
+                if flags[1] and verification_case["status"] != "verified":
+                    verification_service.review(
+                        provider_id,
+                        {
+                            "status": "verified",
+                            "identityStatus": "verified",
+                            "entityStatus": (
+                                "verified"
+                                if provider_row["provider_type"] == "company"
+                                else "not_applicable"
+                            ),
+                            "activityStatus": "verified",
+                            "decisionNote": "اعتماد إداري من شاشة المزود.",
+                        },
+                        reviewer_id=session["id"],
+                    )
+                elif not flags[1] and verification_case["status"] == "verified":
+                    verification_service.review(
+                        provider_id,
+                        {
+                            "status": "changes_required",
+                            "identityStatus": verification_case["identityStatus"],
+                            "entityStatus": verification_case["entityStatus"],
+                            "activityStatus": verification_case["activityStatus"],
+                            "decisionNote": "أوقفت الإدارة الاعتماد لحين المراجعة.",
+                        },
+                        reviewer_id=session["id"],
+                    )
                 recompute_provider_quality(con, provider_id)
                 log_audit(con, session, "provider.status.updated", provider_id, status)
                 return self.send_json({"ok": True})
@@ -7702,15 +9409,19 @@ class Handler(SimpleHTTPRequestHandler):
                 description = safe_text(payload.get("bio") or payload.get("note"), 600)
                 if decision == "accept":
                     note_words = len(description.split())
-                    if not payload.get("commercialNo"):
+                    if (
+                        payload.get("providerType") == "company"
+                        and not payload.get("commercialNo")
+                    ):
                         return self.send_json({"error": "commercial_number_required"}, 400)
-                    credential_expiry = (
-                        payload.get("commercialExpiry")
-                        if payload.get("providerType") == "company"
-                        else payload.get("licenseExpiry")
-                    )
-                    if int(payload.get("registrationVersion") or 0) >= 57 and not credential_expiry:
+                    credential_expiry = payload.get("commercialExpiry") if payload.get("providerType") == "company" else payload.get("licenseExpiry")
+                    requires_credential_expiry = payload.get("providerType") == "company" or bool(payload.get("commercialNo"))
+                    if int(payload.get("registrationVersion") or 0) >= 57 and requires_credential_expiry and not credential_expiry:
                         return self.send_json({"error": "credential_expiry_required"}, 400)
+                    if payload.get("legalPath") == "individual_foreign" and (
+                        not payload.get("employerName") or not payload.get("workPermitExpiry")
+                    ):
+                        return self.send_json({"error": "foreign_worker_details_required"}, 400)
                     if note_words < 3 or note_words > 20:
                         return self.send_json({"error": "description_word_limit"}, 400)
                     if len(payload.get("documents") or []) < 2:
@@ -7731,6 +9442,9 @@ class Handler(SimpleHTTPRequestHandler):
                         "licenseExpiry": payload.get("licenseExpiry", ""),
                         "companySize": payload.get("companySize", ""),
                         "businessRole": payload.get("businessRole", ""),
+                        "email": payload.get("email", ""),
+                        "age": payload.get("age", 0),
+                        "nationality": payload.get("nationality", ""),
                         "gender": payload.get("gender", "not_specified"),
                         "gov": payload.get("gov", ""),
                         "wilayah": payload.get("wilayah", ""),
@@ -7772,6 +9486,60 @@ class Handler(SimpleHTTPRequestHandler):
                         cat_id, service_id = service.split("|", 1)
                         provider["services"] = [{"id": slug("ps"), "catId": cat_id, "serviceId": service_id, "priceFrom": float(payload.get("priceFrom") or 0), "active": True, "areas": [payload.get("wilayah", "")]}]
                     upsert_provider(con, provider)
+                    legal_profile_service = ProviderLegalProfileService(con)
+                    legal_profile_service.save(
+                        provider["id"],
+                        {
+                            "pathway": payload.get("legalPath") or (
+                                "company"
+                                if provider["providerType"] == "company"
+                                else "individual_omani"
+                            ),
+                            "nationality": payload.get("nationality", ""),
+                            "residencyStatus": payload.get("residencyStatus", ""),
+                            "employerName": payload.get("employerName", ""),
+                            "employerAuthorizationStatus": payload.get(
+                                "employerAuthorizationStatus", ""
+                            ),
+                            "workPermitExpiry": payload.get("workPermitExpiry", ""),
+                            "residencyExpiry": payload.get("residencyExpiry", ""),
+                            "commercialExpiry": payload.get("commercialExpiry", ""),
+                            "activityLicenseExpiry": payload.get("licenseExpiry", ""),
+                        },
+                    )
+                    legal_profile_service.review(
+                        provider["id"],
+                        "approved",
+                        session["id"],
+                        "تمت مراجعة المسار والوثائق عند قبول التسجيل.",
+                    )
+                    provider_row_for_verification = con.execute(
+                        """SELECT id,provider_type,verified,verification_expiry,status
+                        FROM providers WHERE id=?""",
+                        (provider["id"],),
+                    ).fetchone()
+                    verification_service = ProviderVerificationService(con)
+                    verification_service.ensure_case(
+                        provider_row_for_verification
+                    )
+                    verification_service.review(
+                        provider["id"],
+                        {
+                            "status": "verified",
+                            "identityStatus": "verified",
+                            "entityStatus": (
+                                "verified"
+                                if provider["providerType"] == "company"
+                                else "not_applicable"
+                            ),
+                            "activityStatus": "verified",
+                            "expiresAt": credential_expiry,
+                            "decisionNote": (
+                                "تمت مراجعة الهوية والوثائق والنشاط عند قبول التسجيل."
+                            ),
+                        },
+                        reviewer_id=session["id"],
+                    )
                     promoted_session = {
                         "kind": "provider", "providerId": provider["id"],
                         "name": provider["name"], "role": "provider_owner", "memberId": "",
@@ -7811,6 +9579,40 @@ class Handler(SimpleHTTPRequestHandler):
                             f"{provider['name']}: {err.code}", type_="subscription",
                             related_id=provider["id"], priority="high",
                             action_text="فتح المزود", action_route=f"admin:provider:{provider['id']}",
+                        )
+                    linked_invitations = KnownProviderInvitationService(
+                        con
+                    ).match_approved_provider(provider["id"], provider["phone"])
+                    for linked in linked_invitations:
+                        request_owner = con.execute(
+                            "SELECT user_id,service_name,service_value FROM customer_requests WHERE id=?",
+                            (linked["requestId"],),
+                        ).fetchone()
+                        if not request_owner:
+                            continue
+                        create_notification(
+                            con,
+                            "provider",
+                            provider["id"],
+                            "طلب العميل الذي دعاك أصبح متاحًا",
+                            request_owner["service_name"] or request_owner["service_value"],
+                            type_="request",
+                            related_id=linked["requestId"],
+                            priority="high",
+                            action_text="فتح الطلب",
+                            action_route=f"provider:request:{linked['requestId']}",
+                        )
+                        create_notification(
+                            con,
+                            "user",
+                            request_owner["user_id"],
+                            "انضم مزودك إلى خدماتي",
+                            f"تم ربط {provider['name']} بطلبك ويمكنه الآن إرسال عرضه.",
+                            type_="request",
+                            related_id=linked["requestId"],
+                            priority="high",
+                            action_text="فتح الطلب",
+                            action_route=f"user:request:{linked['requestId']}",
                         )
                     log_audit(con, session, "provider.request.accepted", provider["id"], provider["name"])
                     send_whatsapp(provider["phone"], "تم قبول حسابك كمزود في خدماتي. يمكنك الدخول من بوابة المزودين.")
@@ -7861,23 +9663,39 @@ class Handler(SimpleHTTPRequestHandler):
                 return self.send_json({"ok": True})
             if path == "/api/admin/complaint-status":
                 complaint_id = data.get("id")
-                row = con.execute("SELECT provider_id FROM complaints WHERE id=?", (complaint_id,)).fetchone()
+                row = con.execute(
+                    "SELECT provider_id FROM complaints WHERE id=?",
+                    (complaint_id,),
+                ).fetchone()
                 if not row:
                     return self.send_json({"error": "not_found"}, 404)
                 status = safe_text(data.get("status", "open"), 30)
                 priority = safe_text(data.get("priority", "normal"), 30)
-                if status not in ("open", "reviewing", "closed"):
-                    return self.send_json({"error": "invalid_complaint_status"}, 400)
-                if priority not in ("low", "normal", "high"):
-                    return self.send_json({"error": "invalid_complaint_priority"}, 400)
-                con.execute(
-                    "UPDATE complaints SET status=?, priority=?, resolution=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
-                    (status, priority, data.get("resolution", ""), complaint_id),
+                status = (
+                    "investigating" if status == "reviewing" else status
                 )
+                try:
+                    complaint = ComplaintCaseService(con).update(
+                        complaint_id,
+                        {
+                            "status": status,
+                            "priority": priority,
+                            "resolution": data.get("resolution", ""),
+                            "visibleToSubject": True,
+                        },
+                        admin_id=session["id"],
+                    )
+                except DomainError as err:
+                    return self.send_domain_error(err)
                 if row["provider_id"]:
                     recompute_provider_quality(con, row["provider_id"])
                 log_audit(con, session, "complaint.status.updated", complaint_id, status)
-                return self.send_json({"ok": True})
+                return self.send_json(
+                    {
+                        "ok": True,
+                        "complaint": secure_complaint_view(complaint),
+                    }
+                )
             if path == "/api/admin/recovery-code":
                 recovery_id = safe_text(data.get("id"), 120)
                 account_id = safe_text(data.get("accountId"), 120)

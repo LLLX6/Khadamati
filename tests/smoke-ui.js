@@ -156,6 +156,32 @@ async function clickAdminTab(page, tab) {
     endsAt: '2027-01-01T00:00:00Z',
     cycleMode: 'cap',
   };
+  const mockUserPlatform = {
+    featureFlags: { growth_hub: true, enterprise_api: false },
+    organizations: [{ id: 'ui-org', name: 'مؤسسة العميل', organizationType: 'business', approvalMode: 'two_step', members: [{ id: 'm1', name: 'مستخدم الاختبار الآلي', role: 'owner' }], locations: [{ id: 'l1', name: 'الفرع الرئيسي', gov: 'مسقط', wilayah: 'السيب' }] }],
+    maintenanceContracts: [{ id: 'contract-ui', providerId: 'p1', requestId: 'ui-request', title: 'صيانة كهربائية دورية', amount: 12, frequencyDays: 30, nextDueAt: '2026-09-15T08:00:00Z', status: 'active' }],
+    referrals: [{ id: 'ref-ui', code: 'TEST4826', status: 'claimed', riskStatus: 'pending_review', rewardStatus: 'not_eligible' }],
+    demandAlerts: [{ id: 'alert-ui', serviceValue: 'homecare|electrician', gov: 'مسقط', wilayah: 'السيب', status: 'active' }],
+  };
+  const mockProviderPlatform = {
+    featureFlags: { growth_hub: true, enterprise_api: false },
+    legalProfile: { providerId: 'p1', pathway: 'individual_omani', nationality: 'عُماني', reviewStatus: 'approved' },
+    maintenanceContracts: mockUserPlatform.maintenanceContracts,
+    crm: [{ id: 'crm-ui', requestId: 'ui-request', displayName: 'مستخدم الاختبار الآلي', stage: 'active', nextActionAt: '2026-08-10T08:00:00Z', invoiceStatus: 'not_issued' }],
+    referrals: [{ id: 'ref-provider-ui', code: 'PRO4826', status: 'created', riskStatus: 'clear', rewardStatus: 'not_eligible' }],
+    training: [{ id: 'training-ui', titleAr: 'التواصل الواضح', titleEn: 'Clear communication', contentAr: 'تأكيد النطاق والموعد قبل البدء.', contentEn: 'Confirm scope and timing before work.', passScore: 80, score: 100, status: 'passed' }],
+    achievements: [{ code: 'trained_provider', earnedAt: '2026-08-01T08:00:00Z' }],
+    demandAlerts: [],
+  };
+  const mockAdminPlatform = {
+    featureFlagDetails: [{ key: 'growth_hub', enabled: true, rolloutPercentage: 100, audiences: ['user', 'provider'], config: {} }, { key: 'enterprise_api', enabled: false, rolloutPercentage: 0, audiences: ['organization'], config: {} }],
+    legalReviewQueue: [{ providerId: 'p1', providerName: 'سالم البلوشي', pathway: 'individual_omani', nationality: 'عُماني', reviewStatus: 'pending', updatedAt: '2026-08-01T08:00:00Z' }],
+    riskReviewQueue: [{ id: 'risk-ui', subjectKind: 'referral', subjectId: 'ref-ui', signalType: 'referral_claim', score: 20, status: 'pending_review', signals: ['human_review_before_reward'] }],
+    demandGapReport: [{ serviceValue: 'homecare|electrician', gov: 'مسقط', wilayah: 'السيب', requests: 8, matched: 5, gap: 3 }],
+    financialScenarios: [{ id: 'scenario-ui', name: 'سيناريو نمو محافظ', projectedRevenue: 1250, projectedCost: 760, projectedNet: 490, createdAt: '2026-08-01T08:00:00Z' }],
+    integrationAdapters: [{ key: 'insurance', enabled: false, mode: 'disabled', legalStatus: 'pending', config: {} }, { key: 'government', enabled: false, mode: 'disabled', legalStatus: 'pending', config: {} }],
+    enterpriseClients: [],
+  };
 
   // Keep the visual smoke test deterministic while still exercising authenticated UI paths.
   await context.route('**/api/**', async route => {
@@ -182,8 +208,17 @@ async function clickAdminTab(page, tab) {
     }
     if (url.pathname === '/api/provider/support') return json({ ok: true, notificationId: 'ui-provider-support' });
     if (url.pathname === '/api/admin/login') return json({ token: 'ui-admin-token', user: { id: 'ui-admin', name: 'إدارة خدماتي', role: 'super_admin' } });
-    if (url.pathname === '/api/admin/session') return json({ adminEntities: { rewardCampaigns: [mockRewardCampaign], campaignEligibility: [] } });
-    if (url.pathname === '/api/bootstrap') return json({});
+    if (url.pathname === '/api/platform') {
+      const auth = route.request().headers().authorization || '';
+      const platform = auth.includes('provider') ? mockProviderPlatform : mockUserPlatform;
+      return json({ ok: true, result: platform, platform, serverTime: '2026-08-01T08:00:00Z' });
+    }
+    if (url.pathname === '/api/admin/platform') return json({ ok: true, result: mockAdminPlatform, platform: mockAdminPlatform, serverTime: '2026-08-01T08:00:00Z' });
+    if (url.pathname === '/api/admin/session') return json({ adminEntities: { rewardCampaigns: [mockRewardCampaign], campaignEligibility: [] }, platform: mockAdminPlatform });
+    if (url.pathname === '/api/bootstrap') {
+      const auth = route.request().headers().authorization || '';
+      return json({ platform: auth.includes('provider') ? mockProviderPlatform : mockUserPlatform });
+    }
     if (url.pathname === '/api/push/public-key') return json({ publicKey: '' });
     return route.fulfill({ status: 503, contentType: 'application/json', body: JSON.stringify({ error: 'request_failed' }) });
   });
@@ -226,12 +261,17 @@ async function clickAdminTab(page, tab) {
   assert(await page.locator('#customerLoginPin').isVisible(), 'Submitting without a PIN must keep the sign-in sheet open.');
   await page.locator('#customerLoginPin').fill('2468');
   await page.locator('[data-action="customerLogin"]').click();
-  await page.waitForSelector('.role-onboarding');
-  const onboardingImage = page.locator('.role-onboarding .onboarding-visual img');
-  assert(/assets\/onboarding\/core\//.test(await onboardingImage.getAttribute('src')), 'The square role onboarding image is missing.');
-  await onboardingImage.evaluate(image => image.complete ? true : new Promise(resolve => image.addEventListener('load', () => resolve(true), { once: true })));
-  assert(await onboardingImage.evaluate(image => image.naturalWidth >= 900 && image.naturalHeight >= 900 && Math.abs(image.naturalWidth - image.naturalHeight) <= 2), 'The onboarding image is not a high-resolution square launch asset.');
-  assert(await onboardingImage.evaluate(image => getComputedStyle(image).objectFit === 'cover'), 'Mobile onboarding artwork must fill the square frame without side gaps.');
+  await page.waitForSelector(IS_MOBILE ? '.role-onboarding' : '.role-onboarding,.app-top');
+  const onboardingVisible = await page.locator('.role-onboarding').isVisible().catch(() => false);
+  if (onboardingVisible) {
+    const onboardingImage = page.locator('.role-onboarding .onboarding-visual img');
+    assert(/assets\/onboarding\/core\//.test(await onboardingImage.getAttribute('src')), 'The square role onboarding image is missing.');
+    await onboardingImage.evaluate(image => image.complete ? true : new Promise(resolve => image.addEventListener('load', () => resolve(true), { once: true })));
+    assert(await onboardingImage.evaluate(image => image.naturalWidth >= 900 && image.naturalHeight >= 900 && Math.abs(image.naturalWidth - image.naturalHeight) <= 2), 'The onboarding image is not a high-resolution square launch asset.');
+    assert(await onboardingImage.evaluate(image => getComputedStyle(image).objectFit === 'cover'), 'Mobile onboarding artwork must fill the square frame without side gaps.');
+  } else {
+    assert(!IS_MOBILE && await page.locator('.app-top').isVisible(), 'Desktop sign-in reached neither onboarding nor the authenticated application.');
+  }
   const onboardingSets = [
     { role: 'user', slides: ['user-service', 'user-direct-request', 'user-matching', 'user-track'] },
     { role: 'guest', slides: ['guest-browse', 'guest-compare', 'guest-signin', 'guest-privacy'] },
@@ -256,8 +296,10 @@ async function clickAdminTab(page, tab) {
     return Promise.all(sources.map(async src => ({ src, ok: (await fetch(src, { cache: 'no-store' })).ok })));
   }, launchSources);
   assert(launchImages.every(item => item.ok), `A launch image failed to load: ${launchImages.filter(item => !item.ok).map(item => item.src).join(', ')}`);
-  await capture(page, '00b-user-onboarding');
-  await page.locator('[data-action="skipOnboarding"]').click();
+  if (onboardingVisible) {
+    await capture(page, '00b-user-onboarding');
+    await page.locator('[data-action="skipOnboarding"]').click();
+  }
   assert(await page.locator('#toastRoot .toast').count() === 0, 'A validation toast remained visible after successful sign-in.');
   const persistedUserAuth = await page.evaluate(() => JSON.parse(sessionStorage.getItem('KHADAMATI_AUTH_V3') || '{}'));
   assert(persistedUserAuth.userToken === 'ui-user-token', 'User authentication was not persisted for the next app launch.');
@@ -583,6 +625,12 @@ async function clickAdminTab(page, tab) {
   assert(await page.locator('.requests-disclosure[open] .request-item-disclosure').count(), 'Created request is missing from the active request section.');
   assert((await page.locator('.requests-disclosure[open] .request-disclosure-main small').first().textContent()).trim().length > 0, 'Request date and time are missing from the customer request summary.');
   assert(await page.locator('.requests-disclosure[open] [data-action="repeatRequest"]').count() === 0, 'An active request should not offer a duplicate repeat action.');
+  await clickFirstAction(page, 'openUserOperationsCenter');
+  await page.waitForSelector('.platform-center-sheet');
+  assert(await page.locator('.platform-center-sheet .platform-summary-card').count() >= 2, 'User operations center is missing organization and maintenance summaries.');
+  assert(await page.locator('.platform-center-sheet').evaluate(() => document.documentElement.scrollWidth <= window.innerWidth + 1), 'User operations center overflows the mobile viewport.');
+  await capture(page, '01h-user-operations', { fullPage: false });
+  await page.locator('.platform-center-sheet [data-action="closeModal"]').click();
   const requestItem = page.locator('.requests-disclosure[open] .request-item-disclosure').first();
   await requestItem.locator(':scope > summary').click();
   const requestStatusShape = await requestItem.locator('.request-status').first().evaluate(element => {
@@ -644,6 +692,8 @@ async function clickAdminTab(page, tab) {
   assert(await page.locator('body').getAttribute('data-theme') === 'light', 'Light theme was not restored immediately.');
   await page.locator('[data-action="setDisplayScale"][data-value="large"]').click();
   assert(await page.locator('body').getAttribute('data-scale') === 'large', 'Large text mode was not applied.');
+  await page.locator('[data-action="setDisplayScale"][data-value="normal"]').click();
+  assert(await page.locator('body').getAttribute('data-scale') === 'normal', 'Default text mode was not restored after the accessibility check.');
   await page.locator('[data-action="closeModal"]').click();
   await clickUserNav(page, 'home');
 
@@ -652,6 +702,13 @@ async function clickAdminTab(page, tab) {
   await page.locator('[data-action="openProviderAccess"][data-mode="register"]').click();
   assert(await page.locator('#providerRegisterForm').count(), 'Register provider must open the registration form directly.');
   assert(await page.locator('#regCredentialExpiry').count(), 'Provider registration must collect the licence or registration expiry date.');
+  assert(await page.locator('#regLegalPath').count(), 'Individual provider registration is missing the legal pathway selector.');
+  assert(!(await page.locator('#regCredentialExpiry').getAttribute('required')), 'Omani individual registration incorrectly requires a commercial licence expiry.');
+  await page.locator('#regLegalPath').selectOption('individual_foreign');
+  assert(await page.locator('#regEmployerName').isVisible(), 'Non-Omani registration did not reveal employer details.');
+  assert(await page.locator('#regWorkPermitExpiry').isVisible(), 'Non-Omani registration did not reveal work permit expiry.');
+  await page.locator('#regLegalPath').selectOption('individual_omani');
+  assert(!(await page.locator('#regEmployerName').isVisible()), 'Foreign-worker fields remained visible for an Omani individual.');
   assert(await page.locator('#providerRegisterForm .registration-subservice.show').count() === 0, 'Optional sub-services should start collapsed.');
   const progressDirection = await page.locator('.provider-reg-progress').evaluate(element => getComputedStyle(element).direction);
   assert(progressDirection === 'rtl', 'Arabic provider registration progress must run right to left.');
@@ -676,6 +733,7 @@ async function clickAdminTab(page, tab) {
   assert(await page.locator('.image-input-previews[data-for="regAvatar"] [data-action="editSelectedImage"]').count(), 'Uploaded image preview is missing its edit action.');
   assert(await page.locator('.image-input-previews[data-for="regAvatar"] [data-action="removeSelectedImage"]').count(), 'Uploaded image preview is missing its delete action.');
   await page.locator('[data-action="setProviderRegisterType"][data-value="company"]').click();
+  assert(await page.locator('#regCredentialExpiry').getAttribute('required') !== null, 'Company registration does not require the commercial registration expiry.');
   assert(await page.locator('[data-action="addRegistrationSubservice"]').isVisible(), 'Company registration must offer plan-limited services.');
   await page.locator('[data-action="addRegistrationSubservice"]').click();
   assert(await page.locator('#providerRegisterForm .registration-subservice.show').count() === 3, 'Company add-service should reveal one optional field at a time while preserving existing choices.');
@@ -769,6 +827,19 @@ async function clickAdminTab(page, tab) {
   await page.waitForFunction(() => document.querySelector('.quote-manager-list')?.textContent?.includes('عرض فحص مخصص'));
   assert(await page.locator('.quote-manager-list').getByText('عرض فحص مخصص').count(), 'Provider quote template edit was not retained.');
   await page.locator('[data-action="closeModal"]').click();
+
+  if (IS_MOBILE) {
+    await page.locator('[data-action="openProviderTools"]').click();
+    await page.locator('.workspace-tools-sheet [data-action="providerToolTab"][data-tab="business"]').click();
+  } else {
+    await page.locator('.provider-nav-secondary[data-action="providerToolTab"][data-tab="business"]').click();
+  }
+  await page.waitForSelector('.platform-dashboard-grid');
+  assert(await page.locator('.legal-profile-card').count(), 'Provider legal pathway summary is missing from the business center.');
+  assert(await page.locator('.platform-workspace-section').count() >= 3, 'Provider CRM, contracts, or training workspace is incomplete.');
+  assert(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth + 1), 'Provider business center overflows the mobile viewport.');
+  await capture(page, '02c-provider-business');
+  await page.locator('.side-nav [data-action="providerTab"][data-tab="home"]').click();
 
   await page.locator('.side-nav [data-action="providerTab"][data-tab="leads"]').click();
   await page.locator('.community-tabs [data-value="packages"]').click();
@@ -1146,6 +1217,16 @@ async function clickAdminTab(page, tab) {
   await clickAdminTab(page, 'quality');
   assert(await page.locator('.system-health').count(), 'System health monitoring panel is missing.');
   await capture(page, '03-admin-quality');
+  await clickAdminTab(page, 'platform');
+  await page.waitForSelector('.platform-admin-section');
+  assert(await page.locator('.platform-feature-list article').count() >= 2, 'Feature rollout controls are missing from administration.');
+  assert(await page.locator('[data-action="adminLegalReviewForm"]').count(), 'Legal pathway review queue is missing from administration.');
+  await page.locator('[data-action="adminLegalReviewForm"]').first().click();
+  assert(await page.locator('.legal-review-summary').count(), 'Legal pathway review details did not open from the queue.');
+  await page.locator('[data-action="closeModal"]').click();
+  assert(await page.locator('.demand-gap-grid article').count(), 'Aggregate demand gaps are missing from administration.');
+  assert(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth + 1), 'Platform administration overflows the mobile viewport.');
+  await capture(page, '03b-admin-platform');
 
   await page.locator('.topbar [data-action="toggleLang"]').click();
   assert(await page.locator('html').getAttribute('dir') === 'ltr', 'English mode did not switch the document to LTR.');

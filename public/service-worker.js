@@ -1,4 +1,4 @@
-const CACHE_NAME = 'khadamati-app-shell-v1.1.1-mobile-polish-r1';
+const CACHE_NAME = 'khadamati-app-shell-v1.1.1-transformation-r1';
 const SHELL = [
   './',
   './index.html',

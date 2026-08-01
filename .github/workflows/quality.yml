@@ -32,15 +32,19 @@ jobs:
           python -m pip install pip-audit==2.10.1 bandit==1.8.6
           python -m pip_audit -r requirements.txt --no-deps --disable-pip
       - name: Scan Python source
-        run: python -m bandit -q -r server.py khadamati_domain.py khadamati_workflow.py scripts -x scripts/__pycache__
+        run: python -m bandit -q -r server.py khadamati_domain.py khadamati_workflow.py khadamati_security.py khadamati_trust.py khadamati_growth.py khadamati_platform.py scripts -x scripts/__pycache__
       - name: Verify repository
         run: python scripts/verify_repository.py
       - name: Compile Python
-        run: python -m py_compile server.py khadamati_domain.py khadamati_workflow.py export_khadamati_data.py tests/*.py scripts/*.py
+        run: python -m py_compile server.py khadamati_domain.py khadamati_workflow.py khadamati_security.py khadamati_trust.py khadamati_growth.py khadamati_platform.py export_khadamati_data.py tests/*.py scripts/*.py
       - name: Unit tests
         run: python -m unittest discover -s tests -p "test_*.py" -v
       - name: Security API tests
         run: python tests/security-api.py
+      - name: Trust and platform API tests
+        run: |
+          python tests/trust-api.py
+          python tests/platform-api.py
       - name: Isolated API smoke test
         run: python tests/run-smoke-isolated.py
       - name: Isolated low-load API performance

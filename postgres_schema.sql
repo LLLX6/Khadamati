@@ -10,8 +10,27 @@ CREATE TABLE IF NOT EXISTS admin_users (
   role TEXT NOT NULL,
   permissions JSONB NOT NULL,
   active BOOLEAN NOT NULL DEFAULT TRUE,
+  two_factor_enabled BOOLEAN NOT NULL DEFAULT FALSE,
+  two_factor_secret TEXT NOT NULL DEFAULT '',
+  recovery_codes JSONB NOT NULL DEFAULT '[]',
   created_at TIMESTAMPTZ DEFAULT now()
 );
+
+ALTER TABLE admin_users ADD COLUMN IF NOT EXISTS two_factor_enabled BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE admin_users ADD COLUMN IF NOT EXISTS two_factor_secret TEXT NOT NULL DEFAULT '';
+ALTER TABLE admin_users ADD COLUMN IF NOT EXISTS recovery_codes JSONB NOT NULL DEFAULT '[]';
+
+CREATE TABLE IF NOT EXISTS admin_two_factor_challenges (
+  id TEXT PRIMARY KEY,
+  admin_id TEXT NOT NULL REFERENCES admin_users(id) ON DELETE CASCADE,
+  secret_ciphertext TEXT NOT NULL,
+  expires_at TIMESTAMPTZ NOT NULL,
+  used_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_admin_2fa_challenge
+  ON admin_two_factor_challenges(admin_id, expires_at, used_at);
 
 CREATE TABLE IF NOT EXISTS categories (
   id TEXT PRIMARY KEY,
@@ -63,6 +82,7 @@ CREATE TABLE IF NOT EXISTS providers (
   documents JSONB DEFAULT '[]',
   quality_score INTEGER DEFAULT 60,
   response_score INTEGER DEFAULT 70,
+  quality_breakdown JSONB NOT NULL DEFAULT '{}',
   subscription_until TEXT DEFAULT '',
   stats JSONB NOT NULL DEFAULT '{"views":0,"whatsapp":0,"calls":0}',
   created_at TIMESTAMPTZ DEFAULT now()
@@ -108,6 +128,7 @@ CREATE TABLE IF NOT EXISTS reviews (
   customer_name TEXT,
   phone TEXT,
   comment TEXT,
+  dimensions JSONB NOT NULL DEFAULT '{}',
   approved BOOLEAN NOT NULL DEFAULT TRUE,
   created_at TIMESTAMPTZ DEFAULT now()
 );
@@ -115,16 +136,100 @@ CREATE TABLE IF NOT EXISTS reviews (
 CREATE TABLE IF NOT EXISTS complaints (
   id TEXT PRIMARY KEY,
   provider_id TEXT REFERENCES providers(id) ON DELETE SET NULL,
+  request_id TEXT DEFAULT '',
+  user_id TEXT DEFAULT '',
   customer_name TEXT,
   phone TEXT,
   reason TEXT,
+  category TEXT DEFAULT '',
+  source TEXT DEFAULT 'request',
   detail TEXT,
   status TEXT NOT NULL DEFAULT 'open',
   priority TEXT NOT NULL DEFAULT 'normal',
   resolution TEXT DEFAULT '',
+  assigned_admin_id TEXT DEFAULT '',
+  due_at TIMESTAMPTZ,
+  outcome TEXT DEFAULT '',
+  closed_at TIMESTAMPTZ,
+  escalation_route TEXT DEFAULT '',
+  reopen_count INTEGER NOT NULL DEFAULT 0,
   created_at TIMESTAMPTZ DEFAULT now(),
   updated_at TIMESTAMPTZ DEFAULT now()
 );
+
+CREATE TABLE IF NOT EXISTS provider_verification_cases (
+  id TEXT PRIMARY KEY,
+  provider_id TEXT NOT NULL UNIQUE REFERENCES providers(id) ON DELETE CASCADE,
+  provider_kind TEXT NOT NULL DEFAULT 'individual',
+  status TEXT NOT NULL DEFAULT 'unverified',
+  level TEXT NOT NULL DEFAULT 'basic',
+  identity_status TEXT NOT NULL DEFAULT 'pending',
+  entity_status TEXT NOT NULL DEFAULT 'not_applicable',
+  activity_status TEXT NOT NULL DEFAULT 'pending',
+  requirements JSONB NOT NULL DEFAULT '[]',
+  evidence JSONB NOT NULL DEFAULT '[]',
+  reviewer_id TEXT DEFAULT '',
+  decision_note TEXT DEFAULT '',
+  submitted_at TIMESTAMPTZ,
+  reviewed_at TIMESTAMPTZ,
+  expires_at TIMESTAMPTZ,
+  managed BOOLEAN NOT NULL DEFAULT FALSE,
+  created_at TIMESTAMPTZ DEFAULT now(),
+  updated_at TIMESTAMPTZ DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS trust_case_events (
+  id TEXT PRIMARY KEY,
+  case_kind TEXT NOT NULL,
+  case_id TEXT NOT NULL,
+  actor_kind TEXT NOT NULL DEFAULT 'system',
+  actor_id TEXT DEFAULT '',
+  event_type TEXT NOT NULL,
+  from_status TEXT DEFAULT '',
+  to_status TEXT DEFAULT '',
+  message TEXT DEFAULT '',
+  metadata JSONB NOT NULL DEFAULT '{}',
+  visible_to_subject BOOLEAN NOT NULL DEFAULT TRUE,
+  created_at TIMESTAMPTZ DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS complaint_evidence (
+  id TEXT PRIMARY KEY,
+  complaint_id TEXT NOT NULL REFERENCES complaints(id) ON DELETE CASCADE,
+  uploader_kind TEXT NOT NULL,
+  uploader_id TEXT NOT NULL,
+  media_path TEXT NOT NULL,
+  media_type TEXT NOT NULL DEFAULT 'document',
+  label TEXT DEFAULT '',
+  created_at TIMESTAMPTZ DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS interaction_blocks (
+  id TEXT PRIMARY KEY,
+  blocker_kind TEXT NOT NULL,
+  blocker_id TEXT NOT NULL,
+  blocked_kind TEXT NOT NULL,
+  blocked_id TEXT NOT NULL,
+  request_id TEXT DEFAULT '',
+  reason TEXT DEFAULT '',
+  active BOOLEAN NOT NULL DEFAULT TRUE,
+  created_at TIMESTAMPTZ DEFAULT now(),
+  updated_at TIMESTAMPTZ DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_verification_status
+  ON provider_verification_cases(status, expires_at);
+CREATE INDEX IF NOT EXISTS idx_trust_events_case
+  ON trust_case_events(case_kind, case_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_complaint_evidence_case
+  ON complaint_evidence(complaint_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_interaction_blocks_actor
+  ON interaction_blocks(blocker_kind, blocker_id, active);
+CREATE INDEX IF NOT EXISTS idx_interaction_blocks_target
+  ON interaction_blocks(blocked_kind, blocked_id, active);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_interaction_blocks_unique_active
+  ON interaction_blocks(blocker_kind, blocker_id, blocked_kind, blocked_id)
+  WHERE active = TRUE;
 
 CREATE TABLE IF NOT EXISTS packages (
   id TEXT PRIMARY KEY,
@@ -148,8 +253,21 @@ ALTER TABLE providers ADD COLUMN IF NOT EXISTS map_visible BOOLEAN NOT NULL DEFA
 ALTER TABLE providers ADD COLUMN IF NOT EXISTS primary_service_id TEXT DEFAULT '';
 ALTER TABLE providers ADD COLUMN IF NOT EXISTS listing_enabled BOOLEAN NOT NULL DEFAULT TRUE;
 ALTER TABLE providers ADD COLUMN IF NOT EXISTS request_enabled BOOLEAN NOT NULL DEFAULT TRUE;
+ALTER TABLE providers ADD COLUMN IF NOT EXISTS provider_type TEXT DEFAULT 'individual';
+ALTER TABLE providers ADD COLUMN IF NOT EXISTS verification_expiry TIMESTAMPTZ;
+ALTER TABLE providers ADD COLUMN IF NOT EXISTS quality_breakdown JSONB NOT NULL DEFAULT '{}';
 ALTER TABLE packages ADD COLUMN IF NOT EXISTS max_categories INTEGER NOT NULL DEFAULT 1;
 ALTER TABLE packages ADD COLUMN IF NOT EXISTS max_wilayats INTEGER NOT NULL DEFAULT 5;
+ALTER TABLE complaints ADD COLUMN IF NOT EXISTS request_id TEXT DEFAULT '';
+ALTER TABLE complaints ADD COLUMN IF NOT EXISTS user_id TEXT DEFAULT '';
+ALTER TABLE complaints ADD COLUMN IF NOT EXISTS category TEXT DEFAULT '';
+ALTER TABLE complaints ADD COLUMN IF NOT EXISTS source TEXT DEFAULT 'request';
+ALTER TABLE complaints ADD COLUMN IF NOT EXISTS assigned_admin_id TEXT DEFAULT '';
+ALTER TABLE complaints ADD COLUMN IF NOT EXISTS due_at TIMESTAMPTZ;
+ALTER TABLE complaints ADD COLUMN IF NOT EXISTS outcome TEXT DEFAULT '';
+ALTER TABLE complaints ADD COLUMN IF NOT EXISTS closed_at TIMESTAMPTZ;
+ALTER TABLE complaints ADD COLUMN IF NOT EXISTS escalation_route TEXT DEFAULT '';
+ALTER TABLE complaints ADD COLUMN IF NOT EXISTS reopen_count INTEGER NOT NULL DEFAULT 0;
 
 CREATE TABLE IF NOT EXISTS subscriptions (
   id TEXT PRIMARY KEY,
@@ -391,6 +509,7 @@ ALTER TABLE policy_acceptances ADD COLUMN IF NOT EXISTS withdrawn_at TIMESTAMPTZ
 ALTER TABLE policy_acceptances ADD COLUMN IF NOT EXISTS metadata JSONB DEFAULT '{}';
 ALTER TABLE reviews ADD COLUMN IF NOT EXISTS request_id TEXT DEFAULT '';
 ALTER TABLE reviews ADD COLUMN IF NOT EXISTS user_id TEXT DEFAULT '';
+ALTER TABLE reviews ADD COLUMN IF NOT EXISTS dimensions JSONB NOT NULL DEFAULT '{}';
 ALTER TABLE complaints ADD COLUMN IF NOT EXISTS request_id TEXT DEFAULT '';
 ALTER TABLE complaints ADD COLUMN IF NOT EXISTS user_id TEXT DEFAULT '';
 
@@ -608,3 +727,189 @@ CREATE INDEX IF NOT EXISTS idx_community_offer_listing
   ON community_offers(listing_id, status, updated_at);
 CREATE INDEX IF NOT EXISTS idx_community_reports_status
   ON community_reports(status, created_at);
+CREATE TABLE IF NOT EXISTS provider_invitations (
+  id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL REFERENCES app_users(id) ON DELETE CASCADE,
+  request_id TEXT NOT NULL REFERENCES customer_requests(id) ON DELETE CASCADE,
+  phone TEXT NOT NULL,
+  token_hash TEXT NOT NULL UNIQUE,
+  provider_id TEXT DEFAULT '',
+  provider_request_id TEXT DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'pending',
+  expires_at TIMESTAMPTZ NOT NULL,
+  matched_at TIMESTAMPTZ,
+  cancelled_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE(user_id, request_id, phone)
+);
+
+CREATE INDEX IF NOT EXISTS idx_provider_invitation_phone
+  ON provider_invitations(phone, status, expires_at);
+CREATE INDEX IF NOT EXISTS idx_provider_invitation_owner
+  ON provider_invitations(user_id, created_at);
+
+-- Production-readiness marketplace platform (backward-compatible additions).
+ALTER TABLE customer_requests ADD COLUMN IF NOT EXISTS organization_id TEXT DEFAULT '';
+ALTER TABLE customer_requests ADD COLUMN IF NOT EXISTS organization_location_id TEXT DEFAULT '';
+ALTER TABLE customer_requests ADD COLUMN IF NOT EXISTS requested_by_member_id TEXT DEFAULT '';
+
+CREATE TABLE IF NOT EXISTS conversation_threads (
+  request_id TEXT PRIMARY KEY REFERENCES customer_requests(id) ON DELETE CASCADE,
+  status TEXT NOT NULL DEFAULT 'open',
+  ended_by_kind TEXT NOT NULL DEFAULT '', ended_by_id TEXT NOT NULL DEFAULT '',
+  end_reason TEXT NOT NULL DEFAULT '', ended_at TIMESTAMPTZ,
+  reopened_at TIMESTAMPTZ, updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS conversation_preferences (
+  request_id TEXT NOT NULL REFERENCES customer_requests(id) ON DELETE CASCADE,
+  actor_kind TEXT NOT NULL, actor_id TEXT NOT NULL, muted_until TIMESTAMPTZ,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY(request_id, actor_kind, actor_id)
+);
+
+CREATE TABLE IF NOT EXISTS provider_legal_profiles (
+  provider_id TEXT PRIMARY KEY REFERENCES providers(id) ON DELETE CASCADE,
+  pathway TEXT NOT NULL DEFAULT 'individual_omani', nationality TEXT NOT NULL DEFAULT '',
+  residency_status TEXT NOT NULL DEFAULT 'not_applicable', employer_name TEXT NOT NULL DEFAULT '',
+  employer_authorization_status TEXT NOT NULL DEFAULT 'not_applicable',
+  work_permit_expiry DATE, residency_expiry DATE, commercial_expiry DATE,
+  activity_license_expiry DATE, review_status TEXT NOT NULL DEFAULT 'pending',
+  review_note TEXT NOT NULL DEFAULT '', reviewed_by TEXT NOT NULL DEFAULT '',
+  reviewed_at TIMESTAMPTZ, created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS customer_organizations (
+  id TEXT PRIMARY KEY, owner_user_id TEXT NOT NULL REFERENCES app_users(id),
+  name TEXT NOT NULL, organization_type TEXT NOT NULL DEFAULT 'business',
+  status TEXT NOT NULL DEFAULT 'active', approval_mode TEXT NOT NULL DEFAULT 'owner',
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(), updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS organization_members (
+  id TEXT PRIMARY KEY, organization_id TEXT NOT NULL REFERENCES customer_organizations(id) ON DELETE CASCADE,
+  user_id TEXT DEFAULT '', name TEXT NOT NULL, phone TEXT NOT NULL DEFAULT '',
+  role TEXT NOT NULL DEFAULT 'requester', active BOOLEAN NOT NULL DEFAULT TRUE,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(), updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE(organization_id, phone)
+);
+
+CREATE TABLE IF NOT EXISTS organization_locations (
+  id TEXT PRIMARY KEY, organization_id TEXT NOT NULL REFERENCES customer_organizations(id) ON DELETE CASCADE,
+  name TEXT NOT NULL, gov TEXT NOT NULL DEFAULT '', wilayah TEXT NOT NULL DEFAULT '',
+  address TEXT NOT NULL DEFAULT '', active BOOLEAN NOT NULL DEFAULT TRUE,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(), updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS maintenance_contracts (
+  id TEXT PRIMARY KEY, owner_user_id TEXT NOT NULL REFERENCES app_users(id),
+  organization_id TEXT DEFAULT '', provider_id TEXT NOT NULL REFERENCES providers(id),
+  request_id TEXT DEFAULT '', service_asset_id TEXT DEFAULT '', service_value TEXT NOT NULL,
+  title TEXT NOT NULL, frequency_days INTEGER NOT NULL CHECK(frequency_days BETWEEN 1 AND 730),
+  amount NUMERIC NOT NULL DEFAULT 0, next_due_at TIMESTAMPTZ NOT NULL,
+  auto_renew BOOLEAN NOT NULL DEFAULT FALSE, status TEXT NOT NULL DEFAULT 'active',
+  last_completed_at TIMESTAMPTZ, created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS provider_crm_records (
+  id TEXT PRIMARY KEY, provider_id TEXT NOT NULL REFERENCES providers(id) ON DELETE CASCADE,
+  user_id TEXT NOT NULL, request_id TEXT NOT NULL REFERENCES customer_requests(id),
+  display_name TEXT NOT NULL DEFAULT '', stage TEXT NOT NULL DEFAULT 'active',
+  next_action_at TIMESTAMPTZ, note TEXT NOT NULL DEFAULT '',
+  invoice_status TEXT NOT NULL DEFAULT 'not_issued', warranty_until TIMESTAMPTZ,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(), updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE(provider_id, request_id)
+);
+
+CREATE TABLE IF NOT EXISTS referrals (
+  id TEXT PRIMARY KEY, code TEXT NOT NULL UNIQUE, referrer_kind TEXT NOT NULL,
+  referrer_id TEXT NOT NULL, referred_kind TEXT NOT NULL DEFAULT '', referred_id TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'created', risk_status TEXT NOT NULL DEFAULT 'clear',
+  qualified_at TIMESTAMPTZ, reward_status TEXT NOT NULL DEFAULT 'not_eligible',
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(), updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE(referred_kind, referred_id)
+);
+
+CREATE TABLE IF NOT EXISTS training_modules (
+  id TEXT PRIMARY KEY, title_ar TEXT NOT NULL, title_en TEXT NOT NULL DEFAULT '',
+  audience TEXT NOT NULL DEFAULT 'provider', content_ar TEXT NOT NULL DEFAULT '',
+  content_en TEXT NOT NULL DEFAULT '', pass_score INTEGER NOT NULL DEFAULT 70,
+  sort_order INTEGER NOT NULL DEFAULT 0, active BOOLEAN NOT NULL DEFAULT TRUE,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(), updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS training_progress (
+  module_id TEXT NOT NULL REFERENCES training_modules(id) ON DELETE CASCADE,
+  provider_id TEXT NOT NULL REFERENCES providers(id) ON DELETE CASCADE,
+  score INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL DEFAULT 'started',
+  completed_at TIMESTAMPTZ, updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY(module_id, provider_id)
+);
+
+CREATE TABLE IF NOT EXISTS provider_achievements (
+  id TEXT PRIMARY KEY, provider_id TEXT NOT NULL REFERENCES providers(id) ON DELETE CASCADE,
+  code TEXT NOT NULL, evidence JSONB NOT NULL DEFAULT '{}', earned_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE(provider_id, code)
+);
+
+CREATE TABLE IF NOT EXISTS demand_alerts (
+  id TEXT PRIMARY KEY, target_kind TEXT NOT NULL, target_id TEXT NOT NULL,
+  service_value TEXT NOT NULL, gov TEXT NOT NULL DEFAULT '', wilayah TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'active', last_notified_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(), updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE(target_kind, target_id, service_value, gov, wilayah)
+);
+
+CREATE TABLE IF NOT EXISTS platform_feature_flags (
+  key TEXT PRIMARY KEY, enabled BOOLEAN NOT NULL DEFAULT FALSE,
+  rollout_percentage INTEGER NOT NULL DEFAULT 0 CHECK(rollout_percentage BETWEEN 0 AND 100),
+  audiences JSONB NOT NULL DEFAULT '[]', config JSONB NOT NULL DEFAULT '{}',
+  updated_by TEXT NOT NULL DEFAULT '', updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS risk_reviews (
+  id TEXT PRIMARY KEY, subject_kind TEXT NOT NULL, subject_id TEXT NOT NULL,
+  signal_type TEXT NOT NULL, score INTEGER NOT NULL DEFAULT 0 CHECK(score BETWEEN 0 AND 100),
+  signals JSONB NOT NULL DEFAULT '[]', status TEXT NOT NULL DEFAULT 'pending_review',
+  reviewer_id TEXT NOT NULL DEFAULT '', decision TEXT NOT NULL DEFAULT '', note TEXT NOT NULL DEFAULT '',
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(), updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS enterprise_api_clients (
+  id TEXT PRIMARY KEY, organization_id TEXT NOT NULL REFERENCES customer_organizations(id),
+  name TEXT NOT NULL, key_prefix TEXT NOT NULL, key_hash TEXT NOT NULL UNIQUE,
+  scopes JSONB NOT NULL DEFAULT '[]', rate_limit INTEGER NOT NULL DEFAULT 60,
+  active BOOLEAN NOT NULL DEFAULT TRUE, expires_at TIMESTAMPTZ, last_used_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(), updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS enterprise_api_audit (
+  id TEXT PRIMARY KEY, client_id TEXT NOT NULL REFERENCES enterprise_api_clients(id) ON DELETE CASCADE,
+  scope TEXT NOT NULL, resource TEXT NOT NULL DEFAULT '', created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS integration_adapters (
+  key TEXT PRIMARY KEY, kind TEXT NOT NULL, enabled BOOLEAN NOT NULL DEFAULT FALSE,
+  mode TEXT NOT NULL DEFAULT 'disabled', legal_status TEXT NOT NULL DEFAULT 'not_approved',
+  config JSONB NOT NULL DEFAULT '{}', updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS financial_scenarios (
+  id TEXT PRIMARY KEY, name TEXT NOT NULL, assumptions JSONB NOT NULL DEFAULT '{}',
+  results JSONB NOT NULL DEFAULT '{}', created_by TEXT NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(), updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_conversation_preferences_actor
+  ON conversation_preferences(actor_kind, actor_id, updated_at);
+CREATE INDEX IF NOT EXISTS idx_legal_review ON provider_legal_profiles(review_status, updated_at);
+CREATE INDEX IF NOT EXISTS idx_org_owner ON customer_organizations(owner_user_id, status);
+CREATE INDEX IF NOT EXISTS idx_contract_owner ON maintenance_contracts(owner_user_id, status, next_due_at);
+CREATE INDEX IF NOT EXISTS idx_contract_provider ON maintenance_contracts(provider_id, status, next_due_at);
+CREATE INDEX IF NOT EXISTS idx_crm_provider ON provider_crm_records(provider_id, stage, updated_at);
+CREATE INDEX IF NOT EXISTS idx_training_provider ON training_progress(provider_id, status);
+CREATE INDEX IF NOT EXISTS idx_demand_alert ON demand_alerts(service_value, gov, wilayah, status);
+CREATE INDEX IF NOT EXISTS idx_risk_queue ON risk_reviews(status, score, created_at);

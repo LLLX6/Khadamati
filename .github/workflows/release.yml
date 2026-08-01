@@ -19,7 +19,7 @@ jobs:
       - name: Verify tag points to a tested commit
         run: |
           python scripts/verify_repository.py
-          python -m py_compile server.py khadamati_domain.py khadamati_workflow.py
+          python -m py_compile server.py khadamati_domain.py khadamati_workflow.py khadamati_security.py khadamati_trust.py khadamati_growth.py khadamati_platform.py
           python -m unittest discover -s tests -p "test_*.py"
       - name: Create source package
         run: |
