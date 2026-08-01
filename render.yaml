@@ -37,3 +37,19 @@ services:
         value: 900
       - key: KHADAMATI_PAYMENT_WEBHOOK_SECRET
         sync: false
+      - key: KHADAMATI_SMTP_HOST
+        value: smtp.gmail.com
+      - key: KHADAMATI_SMTP_PORT
+        value: 587
+      - key: KHADAMATI_SMTP_USER
+        sync: false
+      - key: KHADAMATI_SMTP_PASSWORD
+        sync: false
+      - key: KHADAMATI_SMTP_FROM_EMAIL
+        value: om.khadamati@gmail.com
+      - key: KHADAMATI_SMTP_FROM_NAME
+        value: Khadamati Administration
+      - key: KHADAMATI_SMTP_USE_TLS
+        value: 1
+      - key: KHADAMATI_SMTP_USE_SSL
+        value: 0

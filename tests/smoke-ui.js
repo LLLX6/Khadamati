@@ -256,6 +256,16 @@ async function clickAdminTab(page, tab) {
   await page.locator('[data-action="openUserRegistration"]').click();
   await capture(page, '00d-user-registration', { fullPage: false });
   assert(await page.locator('#customerRegisterName').isVisible(), 'The separate user registration sheet did not open.');
+  assert(await page.locator('body.modal-open').count() === 1, 'Registration must lock the page behind the active sheet.');
+  if (IS_MOBILE) {
+    const registrationViewport = await page.locator('.registration-flow').evaluate(flow => ({
+      height: flow.getBoundingClientRect().height,
+      viewport: window.innerHeight,
+      scrollable: flow.querySelector('.auth-flow-body').scrollHeight >= flow.querySelector('.auth-flow-body').clientHeight,
+    }));
+    assert(Math.abs(registrationViewport.height - registrationViewport.viewport) <= 2, 'Mobile registration does not own the full viewport.');
+    assert(registrationViewport.scrollable, 'Registration content is not scrollable inside its foreground sheet.');
+  }
   assert(await page.locator('.registration-progress [data-action="userRegistrationStep"]').count() === 3, 'User registration must use three focused stages.');
   assert(await page.locator('#customerRegisterNationality').count(), 'User registration is missing its nationality field.');
   await page.locator('.registration-flow [data-action="openUserLogin"]').click();
@@ -617,6 +627,7 @@ async function clickAdminTab(page, tab) {
   assert((await page.locator('.account-menu [data-action="editAccount"] b').textContent()).trim() === 'إعدادات الحساب', 'Account settings label is still long or unclear.');
   assert(await page.locator('.requests-disclosure').count(), 'Grouped request sections are missing from My Account.');
   assert(await page.locator('.requests-disclosure[open]').count() === 0, 'Request groups should start collapsed.');
+  await capture(page, '01i-account', { fullPage: false });
   await page.locator('.requests-disclosure summary').first().click();
   assert(await page.locator('.requests-disclosure[open] .request-item-disclosure').count(), 'Created request is missing from the active request section.');
   assert((await page.locator('.requests-disclosure[open] .request-disclosure-main small').first().textContent()).trim().length > 0, 'Request date and time are missing from the customer request summary.');

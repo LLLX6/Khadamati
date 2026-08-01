@@ -18,10 +18,14 @@ import mimetypes
 import os
 import re
 import secrets
+import smtplib
 import sqlite3
+import ssl
 import threading
 import time
 import zipfile
+from email.message import EmailMessage
+from email.utils import formataddr
 
 from khadamati_domain import (
     MIGRATION_KEY,
@@ -3703,6 +3707,60 @@ def whatsapp_configured():
     return bool(os.environ.get("WHATSAPP_ACCESS_TOKEN") and os.environ.get("WHATSAPP_PHONE_NUMBER_ID"))
 
 
+def smtp_configured():
+    return all(
+        str(os.environ.get(key, "")).strip()
+        for key in ("KHADAMATI_SMTP_HOST", "KHADAMATI_SMTP_USER", "KHADAMATI_SMTP_PASSWORD")
+    )
+
+
+def send_recovery_email(to, account_name, code):
+    address = safe_text(to, 254).strip().lower()
+    if not smtp_configured() or not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", address):
+        return {"ok": False, "configured": smtp_configured(), "channel": "email"}
+    host = str(os.environ.get("KHADAMATI_SMTP_HOST", "")).strip()
+    user = str(os.environ.get("KHADAMATI_SMTP_USER", "")).strip()
+    password = str(os.environ.get("KHADAMATI_SMTP_PASSWORD", "")).strip()
+    sender = str(os.environ.get("KHADAMATI_SMTP_FROM_EMAIL", user or SUPPORT_EMAIL)).strip()
+    sender_name = str(os.environ.get("KHADAMATI_SMTP_FROM_NAME", "إدارة خدماتي | Khadamati")).strip()
+    try:
+        port = int(os.environ.get("KHADAMATI_SMTP_PORT", "587"))
+    except ValueError:
+        port = 587
+    use_ssl = environment_flag("KHADAMATI_SMTP_USE_SSL", port == 465)
+    use_tls = environment_flag("KHADAMATI_SMTP_USE_TLS", not use_ssl)
+    message = EmailMessage()
+    message["Subject"] = "رمز استعادة حساب خدماتي | Khadamati recovery code"
+    message["From"] = formataddr((sender_name, sender))
+    message["To"] = address
+    display_name = safe_text(account_name, 100) or "مستخدم خدماتي"
+    message.set_content(
+        f"مرحباً {display_name}،\n\n"
+        f"رمز التحقق المؤقت لاستعادة حساب خدماتي هو: {code}\n"
+        "صالح لمدة 10 دقائق. لا تشارك هذا الرمز مع أي شخص.\n\n"
+        "Hello,\n\n"
+        f"Your temporary Khadamati account recovery code is: {code}\n"
+        "It expires in 10 minutes. Do not share this code with anyone.\n"
+    )
+    try:
+        client_class = smtplib.SMTP_SSL if use_ssl else smtplib.SMTP
+        kwargs = {"host": host, "port": port, "timeout": 12}
+        if use_ssl:
+            kwargs["context"] = ssl.create_default_context()
+        with client_class(**kwargs) as client:
+            client.ehlo()
+            if use_tls:
+                client.starttls(context=ssl.create_default_context())
+                client.ehlo()
+            client.login(user, password)
+            client.send_message(message)
+        log_event("recovery.email_sent", destination=f"***@{address.rsplit('@', 1)[-1]}")
+        return {"ok": True, "configured": True, "channel": "email"}
+    except (OSError, smtplib.SMTPException) as err:
+        log_event("recovery.email_failed", level="warning", errorType=type(err).__name__)
+        return {"ok": False, "configured": True, "channel": "email"}
+
+
 def log_whatsapp(target, status, detail):
     digits = normalize_phone(target)
     masked_target = f"***{digits[-4:]}" if len(digits) >= 4 else "***"
@@ -3759,7 +3817,7 @@ def send_whatsapp(to, text):
                 "sent",
                 jdump({"status": response.status, "messageId": message_id}),
             )
-            return {"ok": True, "configured": True, "messageId": message_id}
+            return {"ok": True, "configured": True, "channel": "whatsapp", "messageId": message_id}
         error_data = response_data.get("error", {}) if isinstance(response_data, dict) else {}
         log_whatsapp(
             target,
@@ -8197,10 +8255,10 @@ class Handler(SimpleHTTPRequestHandler):
             if int(recent or 0) >= 5:
                 return self.send_json({"error": "recovery_rate_limited"}, 429)
             if kind == "user":
-                row = con.execute("SELECT id,name FROM app_users WHERE phone=? AND status='active'", (phone,)).fetchone()
+                row = con.execute("SELECT id,name,email FROM app_users WHERE phone=? AND status='active'", (phone,)).fetchone()
             else:
                 row = con.execute(
-                    """SELECT id,name FROM providers WHERE active=1 AND status!='deleted'
+                    """SELECT id,name,email FROM providers WHERE active=1 AND status!='deleted'
                     AND (phone=? OR phone=?)""",
                     (phone, phone.replace("968", "", 1)),
                 ).fetchone()
@@ -8210,7 +8268,8 @@ class Handler(SimpleHTTPRequestHandler):
                     {
                         "ok": True,
                         "recoveryId": slug("rcv"),
-                        "deliveryConfigured": whatsapp_configured(),
+                        "deliveryConfigured": smtp_configured() or whatsapp_configured(),
+                        "deliveryChannel": "pending",
                     },
                     202,
                 )
@@ -8233,13 +8292,16 @@ class Handler(SimpleHTTPRequestHandler):
                 priority="high", action_text="مراجعة الاسترجاع",
                 action_route=f"admin:recovery:{recovery_id}",
             )
-        delivery = send_whatsapp(phone, f"رمز استعادة حساب خدماتي هو: {code}. صالح لمدة 10 دقائق.")
+        delivery = send_recovery_email(row["email"], row["name"], code)
+        if not delivery.get("ok"):
+            delivery = send_whatsapp(phone, f"رمز استعادة حساب خدماتي هو: {code}. صالح لمدة 10 دقائق.")
         # Keep the recovery request for secure manual handling when the messaging
         # integration is unavailable. The code remains hashed and is never exposed.
         response = {
             "ok": True,
             "recoveryId": recovery_id,
             "deliveryConfigured": bool(delivery.get("ok")),
+            "deliveryChannel": delivery.get("channel") if delivery.get("ok") else "manual",
             "manualReview": not bool(delivery.get("ok")),
         }
         if APP_ENV != "production" and development_code:
@@ -9721,12 +9783,12 @@ class Handler(SimpleHTTPRequestHandler):
                     return self.send_json({"error": "invalid_recovery_account"}, 400)
                 if account_kind == "provider":
                     account = con.execute(
-                        "SELECT id,name,phone FROM providers WHERE id=?",
+                        "SELECT id,name,phone,email FROM providers WHERE id=?",
                         (account_id,),
                     ).fetchone()
                 else:
                     account = con.execute(
-                        "SELECT id,name,phone FROM app_users WHERE id=?",
+                        "SELECT id,name,phone,email FROM app_users WHERE id=?",
                         (account_id,),
                     ).fetchone()
                 if not account:
@@ -9760,6 +9822,9 @@ class Handler(SimpleHTTPRequestHandler):
                     f"مرحباً {account['name']}، رمز التحقق المؤقت لاستعادة حساب خدماتي هو: "
                     f"{temporary_code}. صالح لمدة 10 دقائق. لا تشاركه مع أي شخص آخر."
                 )
+                email_delivery = send_recovery_email(
+                    account["email"], account["name"], temporary_code
+                )
                 log_audit(con, session, "recovery.code.issued", recovery_id, account_id)
                 return self.send_json({
                     "ok": True,
@@ -9770,6 +9835,8 @@ class Handler(SimpleHTTPRequestHandler):
                     "name": account["name"],
                     "accountKind": account_kind,
                     "whatsappMessage": message,
+                    "emailDelivered": bool(email_delivery.get("ok")),
+                    "deliveryChannel": "email" if email_delivery.get("ok") else "manual",
                 })
             if path == "/api/admin/packages":
                 package_id = str(data.get("id", "") or "")
