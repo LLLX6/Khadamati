@@ -297,6 +297,69 @@ class CommunityServiceTests(unittest.TestCase):
             )
         self.assertEqual("community_disabled", disabled.exception.code)
 
+    def test_admin_can_disable_board_packages_and_provider_offers_independently(self):
+        platform = json.loads(
+            self.con.execute(
+                "SELECT value FROM settings WHERE key='platform'"
+            ).fetchone()["value"]
+        )
+        platform["communityBoardEnabled"] = False
+        self.con.execute(
+            "UPDATE settings SET value=? WHERE key='platform'",
+            (json.dumps(platform),),
+        )
+        with self.assertRaises(DomainError) as board_disabled:
+            self.service.save(
+                self.user,
+                self.wanted_payload(idempotencyKey="board-disabled"),
+                listing_id="wanted-board-disabled",
+            )
+        self.assertEqual("community_board_disabled", board_disabled.exception.code)
+
+        platform["communityBoardEnabled"] = True
+        platform["communityPackagesEnabled"] = False
+        self.con.execute(
+            "UPDATE settings SET value=? WHERE key='platform'",
+            (json.dumps(platform),),
+        )
+        with self.assertRaises(DomainError) as packages_disabled:
+            self.service.save(
+                self.provider,
+                self.package_payload("package-disabled"),
+                listing_id="package-disabled",
+            )
+        self.assertEqual(
+            "community_packages_disabled", packages_disabled.exception.code
+        )
+
+        platform["communityPackagesEnabled"] = True
+        self.con.execute(
+            "UPDATE settings SET value=? WHERE key='platform'",
+            (json.dumps(platform),),
+        )
+        listing = self.service.save(
+            self.user,
+            self.wanted_payload(idempotencyKey="offers-disabled"),
+            listing_id="wanted-offers-disabled",
+        )
+        platform["communityProviderOffersEnabled"] = False
+        self.con.execute(
+            "UPDATE settings SET value=? WHERE key='platform'",
+            (json.dumps(platform),),
+        )
+        with self.assertRaises(DomainError) as offers_disabled:
+            self.service.offer(
+                self.provider,
+                listing["id"],
+                {
+                    "amount": 28,
+                    "durationText": "يوم واحد",
+                    "idempotencyKey": "offer-disabled",
+                },
+                offer_id="offer-disabled",
+            )
+        self.assertEqual("community_offers_disabled", offers_disabled.exception.code)
+
 
 if __name__ == "__main__":
     unittest.main()

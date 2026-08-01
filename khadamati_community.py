@@ -34,6 +34,10 @@ BILLING_PERIODS = {"one_time", "daily", "monthly", "yearly"}
 CONTACT_CHANNELS = {"app", "whatsapp"}
 DEFAULT_SETTINGS = {
     "communityEnabled": True,
+    "communityPackagesEnabled": True,
+    "communityBoardEnabled": True,
+    "communityProviderOffersEnabled": True,
+    "communityUserRecommendationsEnabled": True,
     "communityModerationRequired": False,
     "communityWantedExpiryDays": 30,
     "communityPackageExpiryDays": 30,
@@ -238,6 +242,18 @@ def community_settings(con: sqlite3.Connection) -> dict[str, Any]:
         if key in platform:
             result[key] = platform[key]
     result["communityEnabled"] = _bool(result.get("communityEnabled"), True)
+    result["communityPackagesEnabled"] = _bool(
+        result.get("communityPackagesEnabled"), True
+    )
+    result["communityBoardEnabled"] = _bool(
+        result.get("communityBoardEnabled"), True
+    )
+    result["communityProviderOffersEnabled"] = _bool(
+        result.get("communityProviderOffersEnabled"), True
+    )
+    result["communityUserRecommendationsEnabled"] = _bool(
+        result.get("communityUserRecommendationsEnabled"), True
+    )
     result["communityModerationRequired"] = _bool(
         result.get("communityModerationRequired"), False
     )
@@ -274,6 +290,22 @@ def save_community_settings(
         {
             "communityEnabled": _bool(
                 payload.get("communityEnabled"), current["communityEnabled"]
+            ),
+            "communityPackagesEnabled": _bool(
+                payload.get("communityPackagesEnabled"),
+                current["communityPackagesEnabled"],
+            ),
+            "communityBoardEnabled": _bool(
+                payload.get("communityBoardEnabled"),
+                current["communityBoardEnabled"],
+            ),
+            "communityProviderOffersEnabled": _bool(
+                payload.get("communityProviderOffersEnabled"),
+                current["communityProviderOffersEnabled"],
+            ),
+            "communityUserRecommendationsEnabled": _bool(
+                payload.get("communityUserRecommendationsEnabled"),
+                current["communityUserRecommendationsEnabled"],
             ),
             "communityModerationRequired": _bool(
                 payload.get("communityModerationRequired"),
@@ -591,6 +623,11 @@ class CommunityService:
         listing_kind = _clean(payload.get("kind"), 20)
         if listing_kind not in LISTING_KINDS:
             raise DomainError("invalid_community_listing_kind", 400)
+        settings = community_settings(self.con)
+        if listing_kind == "wanted" and not settings["communityBoardEnabled"]:
+            raise DomainError("community_board_disabled", 409)
+        if listing_kind == "package" and not settings["communityPackagesEnabled"]:
+            raise DomainError("community_packages_disabled", 409)
         if listing_kind == "wanted" and actor_kind != "user":
             raise DomainError("community_user_required", 403)
         if listing_kind == "package" and actor_kind != "provider":
@@ -890,6 +927,8 @@ class CommunityService:
         offer_id: str,
     ) -> dict[str, Any]:
         self._require_enabled()
+        if not community_settings(self.con)["communityProviderOffersEnabled"]:
+            raise DomainError("community_offers_disabled", 409)
         if session.get("kind") != "provider":
             raise DomainError("community_provider_required", 403)
         provider_id = session["providerId"]

@@ -233,10 +233,10 @@ async function clickAdminTab(page, tab) {
   await page.waitForSelector('[data-action="openUserLogin"]');
   await capture(page, '00-entry');
   if (IS_MOBILE && VIEWPORT_HEIGHT > 700) {
-    const entryLayout = await page.locator('.entry-card-focus').evaluate(card => {
+    const entryLayout = await page.locator('.access-stage').evaluate(card => {
       const cardBox = card.getBoundingClientRect();
-      const utilities = card.querySelector('.entry-utilities')?.getBoundingClientRect();
-      const trust = card.querySelector('.entry-trust-line')?.getBoundingClientRect();
+      const utilities = card.querySelector('.access-utility')?.getBoundingClientRect();
+      const trust = card.querySelector('.access-assurance')?.getBoundingClientRect();
       return {
         cardHeight: cardBox.height,
         viewportHeight: window.innerHeight,
@@ -249,13 +249,16 @@ async function clickAdminTab(page, tab) {
   }
 
   await page.locator('[data-action="openUserLogin"]').click();
+  await capture(page, '00c-user-login', { fullPage: false });
   await page.locator('#customerLoginPhone').click();
   assert(await page.locator('#customerLoginPhone').isVisible(), 'Clicking inside the sign-in sheet closed it unexpectedly.');
   assert(await page.locator('#customerLoginName').count() === 0, 'Sign-in must not ask for registration details.');
   await page.locator('[data-action="openUserRegistration"]').click();
+  await capture(page, '00d-user-registration', { fullPage: false });
   assert(await page.locator('#customerRegisterName').isVisible(), 'The separate user registration sheet did not open.');
-  assert(await page.locator('#customerRegisterNationality').isVisible(), 'User registration is missing its nationality field.');
-  await page.locator('.registration-sheet [data-action="openUserLogin"]').click();
+  assert(await page.locator('.registration-progress [data-action="userRegistrationStep"]').count() === 3, 'User registration must use three focused stages.');
+  assert(await page.locator('#customerRegisterNationality').count(), 'User registration is missing its nationality field.');
+  await page.locator('.registration-flow [data-action="openUserLogin"]').click();
   await page.locator('#customerLoginPhone').fill('95550001');
   await page.locator('[data-action="customerLogin"]').click();
   assert(await page.locator('#customerLoginPin').isVisible(), 'Submitting without a PIN must keep the sign-in sheet open.');
@@ -508,8 +511,8 @@ async function clickAdminTab(page, tab) {
   await page.reload({ waitUntil: 'domcontentloaded' });
   await clickUserNav(page, 'community');
   assert(await page.locator('.community-page').count(), 'The Community destination did not open.');
-  assert(await page.locator('.community-tabs [data-value="packages"]').count(), 'The packages Community tab is missing.');
-  assert(await page.locator('.community-tabs [data-value="board"]').count(), 'The merged request-board Community tab is missing.');
+  assert(await page.locator('.community-v3-tabs [data-value="packages"]').count(), 'The packages Community tab is missing.');
+  assert(await page.locator('.community-v3-tabs [data-value="board"]').count(), 'The merged request-board Community tab is missing.');
   assert(await page.locator('.community-card').count() === 1, 'Community package card is missing.');
   await capture(page, '08-community-user-packages', { fullPage: false });
   await page.locator('[data-action="toggleLang"]:visible').first().click();
@@ -523,24 +526,17 @@ async function clickAdminTab(page, tab) {
   await page.locator('[data-action="openCommunityListing"]').first().click();
   await capture(page, '08a-community-package-details', { fullPage: false });
   await page.locator('.community-detail-sheet [data-action="closeModal"]').click();
-  await page.locator('.community-tabs [data-value="board"]').click();
-  assert(await page.locator('.community-card').count() === 1, 'Community wanted card is missing.');
-  assert(await page.locator('.request-board-view').count(), 'The merged request board did not open.');
+  await page.locator('.community-v3-tabs [data-value="board"]').click();
+  assert(await page.locator('.community-need-card').count() >= 1, 'The unified Community request feed is empty.');
+  assert(await page.locator('.community-board-unified').count(), 'The merged request board did not open.');
   assert(await page.locator('.bottom-nav [data-view="community"][aria-current="page"]').count(), 'Community is not represented as its active bottom-navigation destination.');
-  assert(await page.locator('.request-board-guide').count(), 'Request board guidance is missing.');
   await capture(page, '08b-community-user-wanted', { fullPage: false });
   await page.locator('.community-fab').click();
-  assert(await page.locator('.community-editor').count(), 'Community wanted editor did not open.');
+  assert(await page.locator('.direct-request-guide,.request-wizard').count(), 'The Community add action did not open the central request journey.');
   await capture(page, '08c-community-wanted-editor', { fullPage: false });
-  await page.locator('.community-editor [data-action="closeModal"]').click();
+  await page.locator('#modalRoot [data-action="closeModal"]').click();
   await capture(page, '08d-community-request-board', { fullPage: false });
-  assert(await page.locator('.request-board-guide').evaluate(element => element.getBoundingClientRect().right <= window.innerWidth + 1), 'Request board guidance overflows the mobile viewport.');
-  await page.locator('.request-board-guide summary').click();
-  const recommendationGuide = page.locator('.request-board-guide img');
-  assert(/assets\/onboarding\/core\/user-matching\.webp/.test(await recommendationGuide.getAttribute('src')), 'Provider recommendation guidance artwork is missing.');
-  await recommendationGuide.evaluate(image => image.complete ? true : new Promise(resolve => image.addEventListener('load', () => resolve(true), { once: true })));
-  assert(await recommendationGuide.evaluate(image => image.naturalWidth >= 900 && image.naturalHeight >= 900), 'Provider recommendation guidance is not high resolution.');
-  assert(await recommendationGuide.evaluate(image => getComputedStyle(image).objectFit === 'cover'), 'Provider recommendation artwork does not fill its square frame.');
+  assert(await page.locator('.community-board-unified').evaluate(element => element.getBoundingClientRect().right <= window.innerWidth + 1), 'Unified request board overflows the mobile viewport.');
   await clickUserNav(page, 'home');
   await page.locator('.direct-request-card [data-action="quickRequestForm"]').click();
   await page.waitForTimeout(150);
@@ -613,8 +609,8 @@ async function clickAdminTab(page, tab) {
   await page.locator('[data-action="saveQuickRequest"]').click();
   await page.waitForSelector('.active-request-home');
   await clickUserNav(page, 'community');
-  await page.locator('.community-tabs [data-value="board"]').click();
-  assert(await page.locator('.request-opportunity').count(), 'New request is missing from the request board.');
+  await page.locator('.community-v3-tabs [data-value="board"]').click();
+  assert(await page.locator('.community-need-card').count(), 'New request is missing from the unified request board.');
   await clickUserNav(page, 'myAccount');
   assert(await page.locator('.app-back:visible').count() === 1, 'My Account shows a duplicate back control.');
   assert(await page.locator('.account-profile-card [data-action="editAccount"] svg').count() === 1, 'Account edit action is not using the familiar edit icon.');
@@ -699,7 +695,9 @@ async function clickAdminTab(page, tab) {
 
   await page.locator('[data-action="goBack"]').click();
   await page.locator('[data-action="enterProvider"]').click();
+  await capture(page, '00e-provider-entry', { fullPage: false });
   await page.locator('[data-action="openProviderAccess"][data-mode="register"]').click();
+  await capture(page, '00g-provider-registration-basics', { fullPage: false });
   assert(await page.locator('#providerRegisterForm').count(), 'Register provider must open the registration form directly.');
   assert(await page.locator('#regCredentialExpiry').count(), 'Provider registration must collect the licence or registration expiry date.');
   assert(await page.locator('#regLegalPath').count(), 'Individual provider registration is missing the legal pathway selector.');
@@ -709,6 +707,14 @@ async function clickAdminTab(page, tab) {
   assert(await page.locator('#regWorkPermitExpiry').isVisible(), 'Non-Omani registration did not reveal work permit expiry.');
   await page.locator('#regLegalPath').selectOption('individual_omani');
   assert(!(await page.locator('#regEmployerName').isVisible()), 'Foreign-worker fields remained visible for an Omani individual.');
+  assert(await page.locator('.provider-reg-progress [data-action="providerRegistrationStep"]').count() === 3, 'Provider registration must use three focused stages.');
+  await page.locator('#regName').fill('مزود اختبار');
+  await page.locator('#regPhone').fill('91234567');
+  await page.locator('#regAge').fill('30');
+  await page.locator('#regNationality').fill('عماني');
+  await page.locator('#regPin').fill('2468');
+  await page.locator('[data-action="providerRegistrationNext"]').click();
+  assert(await page.locator('.provider-registration-flow[data-step="2"]').count(), 'Provider registration did not open its services stage.');
   assert(await page.locator('#providerRegisterForm .registration-subservice.show').count() === 0, 'Optional sub-services should start collapsed.');
   const progressDirection = await page.locator('.provider-reg-progress').evaluate(element => getComputedStyle(element).direction);
   assert(progressDirection === 'rtl', 'Arabic provider registration progress must run right to left.');
@@ -732,8 +738,13 @@ async function clickAdminTab(page, tab) {
   await page.locator('.image-editor-modern [data-action="closeImageEditor"]').click();
   assert(await page.locator('.image-input-previews[data-for="regAvatar"] [data-action="editSelectedImage"]').count(), 'Uploaded image preview is missing its edit action.');
   assert(await page.locator('.image-input-previews[data-for="regAvatar"] [data-action="removeSelectedImage"]').count(), 'Uploaded image preview is missing its delete action.');
+  await page.locator('[data-action="providerRegistrationBack"]').click();
   await page.locator('[data-action="setProviderRegisterType"][data-value="company"]').click();
   assert(await page.locator('#regCredentialExpiry').getAttribute('required') !== null, 'Company registration does not require the commercial registration expiry.');
+  await page.locator('#regCompanyName').fill('شركة الاختبار');
+  await page.locator('#regCommercialNo').fill('1234567');
+  await page.locator('#regCredentialExpiry').fill('2028-12-31');
+  await page.locator('[data-action="providerRegistrationNext"]').click();
   assert(await page.locator('[data-action="addRegistrationSubservice"]').isVisible(), 'Company registration must offer plan-limited services.');
   await page.locator('[data-action="addRegistrationSubservice"]').click();
   assert(await page.locator('#providerRegisterForm .registration-subservice.show').count() === 3, 'Company add-service should reveal one optional field at a time while preserving existing choices.');
@@ -741,6 +752,9 @@ async function clickAdminTab(page, tab) {
   await page.locator('#modalRoot [data-action="closeModal"]').click();
   await page.locator('[data-action="toggleLang"]').first().click();
   await page.locator('[data-action="openProviderAccess"][data-mode="register"]').click();
+  while ((await page.locator('#providerRegisterForm').getAttribute('data-step')) !== '1') {
+    await page.locator('[data-action="providerRegistrationBack"]').click();
+  }
   const registrationHasArabic = async () => page.locator('#providerRegisterForm').evaluate(form => [...form.querySelectorAll('label,button,option,[placeholder],.account-type-note,.upload-hint,h3')].some(element => /[\u0600-\u06ff]/.test((element.getAttribute('placeholder') || element.textContent || '').trim())));
   assert(!(await registrationHasArabic()), 'English individual-provider registration still contains Arabic interface labels.');
   await page.locator('[data-action="setProviderRegisterType"][data-value="company"]').click();
@@ -748,6 +762,7 @@ async function clickAdminTab(page, tab) {
   assert(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth + 1), 'English provider registration overflows horizontally.');
   await page.locator('#modalRoot [data-action="closeModal"]').click();
   await page.locator('[data-action="toggleLang"]').first().click();
+  await capture(page, '00f-provider-login', { fullPage: false });
   await page.locator('#loginPhone').fill('91234567');
   await page.locator('#loginOtp').fill('1234');
   await page.locator('[data-action="providerLogin"]').click();
@@ -842,7 +857,7 @@ async function clickAdminTab(page, tab) {
   await page.locator('.side-nav [data-action="providerTab"][data-tab="home"]').click();
 
   await page.locator('.side-nav [data-action="providerTab"][data-tab="leads"]').click();
-  await page.locator('.community-tabs [data-value="packages"]').click();
+  await page.locator('.community-v3-tabs [data-value="packages"]').click();
   assert(await page.locator('.community-page[data-community-mode="provider"]').count(), 'Provider Community destination is missing.');
   await page.locator('#toastRoot').evaluate(element => { element.innerHTML = ''; });
   await capture(page, '08e-community-provider-packages', { fullPage: false });
@@ -850,9 +865,9 @@ async function clickAdminTab(page, tab) {
   assert(await page.locator('.community-editor').count(), 'Provider package editor did not open.');
   await capture(page, '08f-community-package-editor', { fullPage: false });
   await page.locator('.community-editor [data-action="closeModal"]').click();
-  await page.locator('.community-tabs [data-value="board"]').click();
-  assert(await page.locator('.request-opportunity').count(), 'Provider request board is empty.');
-  assert(await page.locator('.request-opportunity [data-action="providerAcceptRequest"]').count(), 'Matching provider cannot offer from the request board.');
+  await page.locator('.community-v3-tabs [data-value="board"]').click();
+  assert(await page.locator('.community-need-card').count(), 'Provider request board is empty.');
+  assert(await page.locator('.community-need-card [data-action="providerAcceptRequest"]').count(), 'Matching provider cannot offer from the request board.');
   await capture(page, '02b-provider-opportunities');
   await page.locator('[data-action="providerAcceptRequest"]').first().click();
   await page.locator('#offerPrice').fill('12');
@@ -1168,8 +1183,18 @@ async function clickAdminTab(page, tab) {
   assert(await page.locator('.finance-command-grid').count(), 'Financial control center is missing.');
   await clickAdminTab(page, 'community');
   assert(await page.locator('.admin-community').count(), 'Community management center is missing.');
+  await page.locator('[data-action="adminCommunityView"][data-value="board"]').click();
+  assert(await page.locator('.admin-market-health').count(), 'Administration is missing request-board health indicators.');
+  if (await page.locator('.admin-request-card').count()) {
+    assert(await page.locator('.admin-request-card [data-action="adminOpenCustomerRequest"]').count(), 'Administration is missing its request operations action.');
+    assert(await page.locator('.admin-request-card [data-action="adminCustomerRequestAction"]').count(), 'Administration cannot pause or resume a request independently.');
+  }
   await page.locator('[data-action="adminCommunityView"][data-value="settings"]').click();
   assert(await page.locator('#communityEnabledSetting').count(), 'Community activation control is missing.');
+  assert(await page.locator('#communityPackagesEnabledSetting').count(), 'Independent package activation control is missing.');
+  assert(await page.locator('#communityBoardEnabledSetting').count(), 'Independent request-board activation control is missing.');
+  assert(await page.locator('#communityProviderOffersSetting').count(), 'Provider-quote control is missing.');
+  assert(await page.locator('#communityRecommendationsSetting').count(), 'User-recommendation control is missing.');
   assert(await page.locator('[data-action="saveCommunitySettings"]').count(), 'Community revenue settings cannot be saved.');
   await capture(page, '08g-community-admin', { fullPage: false });
   assert(await page.locator('[data-action="openAssistant"]').count() === 0, 'The obsolete assistant test control is still visible in administration.');
