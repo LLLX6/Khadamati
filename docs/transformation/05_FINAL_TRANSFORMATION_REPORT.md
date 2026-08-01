@@ -48,8 +48,8 @@
 
 ## صور التحقق
 
-- `artifacts/transformation-final/smoke-320`: ثلاثون لقطة لمسارات الهاتف الضيق.
-- `artifacts/transformation-final/smoke-390`: ثلاثون لقطة لمقاس هاتف شائع.
+- `artifacts/transformation-final/smoke-320`: 33 لقطة لمسارات الهاتف الضيق.
+- `artifacts/transformation-final/smoke-390`: 33 لقطة لمقاس هاتف شائع.
 - تشمل الدخول، الرئيسية، الطلب، العمليات، المجتمع، المحادثة، تسجيل المزود، مركز أعمال المزود، الإدارة والإشعارات.
 
 ## الجاهزية الموزونة
