@@ -50,7 +50,7 @@ REQUEST_TRANSITIONS = {
 }
 
 ASSET_TYPES = {"home", "vehicle", "appliance", "property", "other"}
-AGREEMENT_STATES = {"draft", "pending_confirmation", "confirmed"}
+AGREEMENT_STATES = {"draft", "pending_confirmation", "confirmed", "rejected"}
 IDEMPOTENCY_RE = re.compile(r"^[A-Za-z0-9._:-]{8,128}$")
 
 
@@ -343,13 +343,14 @@ class RequestAgreementService:
             request_id,provider_id,version,appointment_at,duration_minutes,price_amount,
             currency,notes,location_text,status,user_confirmed_version,
             provider_confirmed_version,updated_by_kind,updated_by_id,created_at,updated_at)
-            VALUES(?,?,?,?,?,?,'OMR',?,?,'pending_confirmation',0,0,?,?,?,?)
+            VALUES(?,?,?,?,?,?,'OMR',?,?,'pending_confirmation',?,?,?,?,?,?)
             ON CONFLICT(request_id) DO UPDATE SET
             provider_id=excluded.provider_id,version=excluded.version,
             appointment_at=excluded.appointment_at,duration_minutes=excluded.duration_minutes,
             price_amount=excluded.price_amount,currency='OMR',notes=excluded.notes,
             location_text=excluded.location_text,status='pending_confirmation',
-            user_confirmed_version=0,provider_confirmed_version=0,
+            user_confirmed_version=excluded.user_confirmed_version,
+            provider_confirmed_version=excluded.provider_confirmed_version,
             updated_by_kind=excluded.updated_by_kind,updated_by_id=excluded.updated_by_id,
             updated_at=excluded.updated_at""",
             (
@@ -361,6 +362,8 @@ class RequestAgreementService:
                 price,
                 _safe_text(data.get("notes"), 500),
                 _safe_text(data.get("locationText"), 240),
+                version if actor_kind == "user" else 0,
+                version if actor_kind == "provider" else 0,
                 actor_kind,
                 actor_id,
                 iso(self.now),
@@ -386,6 +389,8 @@ class RequestAgreementService:
             raise DomainError("agreement_not_found", 404)
         if int(version or 0) != int(agreement["version"]):
             raise DomainError("agreement_version_changed", 409)
+        if actor_kind == agreement.get("updatedByKind"):
+            raise DomainError("agreement_sender_cannot_confirm", 409)
         update_params = (
             agreement["version"],
             actor_kind,
@@ -439,6 +444,32 @@ class RequestAgreementService:
                 actor_id=actor_id,
                 detail={"version": agreement["version"]},
             )
+        return self.get(request_id) or {}
+
+    def reject(
+        self, request_id: str, actor_kind: str, actor_id: str, version: int, reason: str = ""
+    ) -> dict[str, Any]:
+        request = _request(self.con, request_id)
+        self._authorize(request, actor_kind, actor_id)
+        agreement = self.get(request_id)
+        if not agreement:
+            raise DomainError("agreement_not_found", 404)
+        if int(version or 0) != int(agreement["version"]):
+            raise DomainError("agreement_version_changed", 409)
+        if actor_kind == agreement.get("updatedByKind"):
+            raise DomainError("agreement_sender_cannot_reject", 409)
+        self.con.execute(
+            """UPDATE request_agreements SET status='rejected',updated_at=?
+            WHERE request_id=?""",
+            (iso(self.now), request_id),
+        )
+        RequestLifecycleService(self.con, now=self.now).record(
+            request_id,
+            "agreement_rejected",
+            actor_kind=actor_kind,
+            actor_id=actor_id,
+            detail={"version": agreement["version"], "reason": _safe_text(reason, 240)},
+        )
         return self.get(request_id) or {}
 
 

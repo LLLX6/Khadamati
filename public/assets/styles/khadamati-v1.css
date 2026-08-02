@@ -9262,3 +9262,50 @@ canvas{
 
 .provider-section-guide{overflow:hidden}.provider-section-guide-visual{position:relative;aspect-ratio:16/10;overflow:hidden;background:var(--panel2)}.provider-section-guide-visual>img{width:100%;height:100%;object-fit:cover;object-position:center}.provider-section-guide-visual>.close-btn{position:absolute;inset:12px auto auto 12px;background:rgba(255,255,255,.92);color:#062a3b;box-shadow:0 8px 24px rgba(2,22,34,.18)}[dir="ltr"] .provider-section-guide-visual>.close-btn{inset:12px 12px auto auto}.provider-section-guide .modal-body{display:grid;gap:12px;padding:18px}.provider-section-guide-kicker{display:flex;align-items:center;gap:7px;color:var(--accent);font-size:.78rem;font-weight:900}.provider-section-guide-kicker svg{width:18px}.provider-section-guide h2{margin:0;color:var(--ink);font-size:1.35rem;line-height:1.35}.provider-section-guide p{margin:0;color:var(--muted);line-height:1.75}.provider-section-guide-actions{display:grid;grid-template-columns:auto minmax(0,1fr);align-items:center;gap:10px}.provider-section-guide-actions .pill-btn{width:100%}
 @media(max-width:560px){.provider-section-guide{width:calc(100vw - 20px)!important;max-height:calc(100dvh - 20px)!important}.provider-section-guide-visual{aspect-ratio:16/11}.provider-section-guide .modal-body{padding:15px}.provider-section-guide h2{font-size:1.22rem}}
+
+/* Plan coverage, request state, and direct-request clarity. */
+.provider-plan-limits{grid-template-columns:repeat(4,minmax(0,1fr))}
+.provider-coverage-sheet .modal-body{display:grid;gap:12px}
+.coverage-limit-summary{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}
+.coverage-limit-summary>span{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:10px 12px;border:1px solid var(--line);border-radius:13px;background:var(--panel2);color:var(--muted);font-size:.75rem;font-weight:850}
+.coverage-limit-summary b{color:var(--ink);font-size:.86rem}
+.coverage-governorates{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:9px}
+.coverage-governorate{min-width:0;overflow:hidden;border:1px solid var(--line);border-radius:16px;background:var(--panel)}
+.coverage-governorate.selected{border-color:color-mix(in srgb,var(--accent) 44%,var(--line));box-shadow:0 0 0 3px color-mix(in srgb,var(--accent) 7%,transparent)}
+.coverage-governorate-head{display:block;padding:11px;cursor:pointer}
+.coverage-governorate-head>input{position:absolute;opacity:0;pointer-events:none}
+.coverage-governorate-head>span{display:grid;grid-template-columns:34px minmax(0,1fr);grid-template-rows:auto auto;align-items:center;gap:2px 9px}
+.coverage-governorate-head svg{grid-row:1/3;width:34px;height:34px;padding:8px;border-radius:11px;background:var(--panel2);color:var(--accent)}
+.coverage-governorate-head small{color:var(--muted);font-size:.65rem}
+.coverage-wilayats{display:flex;flex-wrap:wrap;gap:6px;padding:0 10px 10px}
+.coverage-wilayats label{cursor:pointer}.coverage-wilayats input{position:absolute;opacity:0;pointer-events:none}
+.coverage-wilayats span{display:block;padding:6px 8px;border:1px solid var(--line);border-radius:9px;background:var(--panel2);color:var(--muted);font-size:.68rem;font-weight:850}
+.coverage-wilayats input:checked+span{border-color:var(--accent);background:color-mix(in srgb,var(--accent) 10%,var(--panel));color:var(--accent)}
+.request-wizard-step[data-step="2"] .request-step-heading{position:relative;padding-inline-start:50px}
+.request-step-top-back{position:absolute;inset-block-start:0;inset-inline-start:0;width:42px;height:42px;display:grid;place-items:center;border:1px solid color-mix(in srgb,var(--accent) 28%,var(--line));border-radius:13px;background:var(--panel);color:var(--accent);font-size:1.2rem;font-weight:950;box-shadow:0 7px 18px rgba(4,49,67,.08)}
+.request-location-stage{border-color:color-mix(in srgb,var(--accent) 22%,var(--line))!important;background:linear-gradient(180deg,color-mix(in srgb,var(--accent) 5%,var(--panel)),var(--panel2))!important}
+.request-card.status-closed .request-status,.request-item-disclosure.status-closed .request-status,.request-card.status-archived .request-status,.request-item-disclosure.status-archived .request-status{background:color-mix(in srgb,var(--ok) 13%,var(--panel));color:var(--ok)}
+.request-card.status-inProgress .request-status,.request-item-disclosure.status-inProgress .request-status{background:color-mix(in srgb,var(--danger) 11%,var(--panel));color:var(--danger)}
+.request-card.status-accepted .request-status,.request-item-disclosure.status-accepted .request-status,.request-card.status-appointmentConfirmed .request-status,.request-item-disclosure.status-appointmentConfirmed .request-status{background:color-mix(in srgb,var(--muted) 12%,var(--panel));color:var(--muted)}
+.provider-task-card.status-inProgress .request-status{background:color-mix(in srgb,var(--danger) 11%,var(--panel));color:var(--danger)}
+.provider-task-card.status-accepted .request-status,.provider-task-card.status-appointmentConfirmed .request-status{background:color-mix(in srgb,var(--muted) 12%,var(--panel));color:var(--muted)}
+.request-agreement-card.rejected{border-color:color-mix(in srgb,var(--danger) 34%,var(--line));background:color-mix(in srgb,var(--danger) 6%,var(--panel))}
+.request-availability-card.available{border-color:#08734f!important;background:#08734f!important;color:#fff!important;box-shadow:0 8px 18px rgba(8,115,79,.16)}
+.request-availability-card.available .request-availability-icon{background:rgba(255,255,255,.14)!important;color:#fff!important}.request-availability-card.available small{color:#d9fff0!important}
+.request-availability-card.available.selected{border-color:#4ce0af!important;box-shadow:0 0 0 3px rgba(11,193,140,.24)}
+@media(max-width:700px){.provider-plan-limits,.coverage-governorates{grid-template-columns:repeat(2,minmax(0,1fr))}}
+@media(max-width:360px){.coverage-governorates{grid-template-columns:1fr}.request-wizard-step[data-step="2"] .request-step-heading{padding-inline-start:46px}.request-step-top-back{width:38px;height:38px}}
+
+/* Community header is a compact command row on light and dark surfaces. */
+.community-v3-header{min-height:62px;padding:9px 12px!important}
+.community-v3-header .community-filter-trigger{border-color:color-mix(in srgb,var(--accent) 28%,var(--line))!important;background:color-mix(in srgb,var(--accent) 8%,var(--panel))!important;color:var(--accent)!important;backdrop-filter:none!important}
+.community-v3-header .community-filter-trigger.active{background:color-mix(in srgb,var(--accent) 16%,var(--panel))!important}
+.community-v3-header .community-filter-trigger small{color:#fff;background:var(--accent)}
+
+.request-selection-strip{grid-template-columns:38px minmax(0,1fr)!important}
+.request-selection-strip>button{display:none!important}
+[dir="rtl"] .request-wizard-step[data-step="2"] .request-step-heading{padding-right:50px!important;padding-left:0!important}
+[dir="rtl"] .request-step-top-back{right:0!important;left:auto!important}
+[dir="ltr"] .request-wizard-step[data-step="2"] .request-step-heading{padding-left:50px!important;padding-right:0!important}
+[dir="ltr"] .request-step-top-back{left:0!important;right:auto!important}
+@media(max-width:360px){[dir="rtl"] .request-wizard-step[data-step="2"] .request-step-heading{padding-right:46px!important}[dir="ltr"] .request-wizard-step[data-step="2"] .request-step-heading{padding-left:46px!important}}

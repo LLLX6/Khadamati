@@ -433,7 +433,7 @@ def main():
         {
             "action": "request",
             "providerId": provider_id,
-            "packageId": "basic_6m",
+            "packageId": "individual_silver_6m",
         },
         admin_token,
     )
@@ -458,7 +458,7 @@ def main():
         {
             "action": "record",
             "subscriptionId": pending_id,
-            "amount": 6,
+            "amount": pending_subscription["subscription"]["amount"],
             "method": "bank",
             "note": "Verified smoke-test transfer",
         },
@@ -472,7 +472,7 @@ def main():
         {
             "action": "request",
             "providerId": provider_id,
-            "packageId": "professional_12m",
+            "packageId": "individual_gold_6m",
             "approveWithoutPayment": True,
         },
         admin_token,
@@ -487,12 +487,12 @@ def main():
     status, upgraded_provider_state = request("/api/bootstrap", token=provider_token)
     expect(status, upgraded_provider_state, {200}, "Provider state after plan activation failed")
     upgraded_provider = upgraded_provider_state.get("currentProvider", {})
-    assert upgraded_provider.get("packageId") == "professional_12m", "Admin plan activation did not reach the provider account"
+    assert upgraded_provider.get("packageId") == "individual_gold_6m", "Admin plan activation did not reach the provider account"
     assert upgraded_provider.get("subscriptionState") in {"active", "expiring", "grace"}, "Activated plan did not grant provider entitlements"
 
     status, provider_upgrade_request = request(
         "/api/provider/subscription-request",
-        {"packageId": "professional_12m"},
+        {"packageId": "individual_gold_6m"},
         provider_token,
     )
     expect(status, provider_upgrade_request, {200}, "Provider plan request failed")
@@ -603,7 +603,7 @@ def main():
             "communityPackageExpiryDays": 30,
             "communityFirstPackageFreeDays": 30,
             "communityRenewalFee": 2,
-            "communityPlanQuotas": {"professional_12m": 5},
+            "communityPlanQuotas": {"individual_gold_6m": 5},
         },
         admin_token,
     )
@@ -1259,6 +1259,21 @@ def main():
     )
     expect(status, agreement_saved, {200}, "Saving work agreement failed")
     agreement_version = agreement_saved["request"]["agreement"]["version"]
+    assert agreement_saved["request"]["agreement"].get("userConfirmed") is True
+    assert agreement_saved["request"]["agreement"].get("providerConfirmed") is False
+
+    status, sender_reconfirm = request(
+        "/api/request/workflow",
+        {
+            "id": request_id,
+            "action": "agreement_confirm",
+            "version": agreement_version,
+        },
+        user_token,
+    )
+    assert status == 409 and sender_reconfirm.get("error") == "agreement_sender_cannot_confirm", (
+        f"Agreement sender was allowed to confirm twice: HTTP {status} {sender_reconfirm}"
+    )
 
     status, blocked_start = request(
         "/api/request/workflow",
@@ -1281,19 +1296,8 @@ def main():
     )
     expect(status, provider_confirmed, {200}, "Provider agreement confirmation failed")
     assert provider_confirmed["request"]["agreement"].get("providerConfirmed") is True
-    assert provider_confirmed["request"]["agreement"].get("userConfirmed") is False
-
-    status, both_confirmed = request(
-        "/api/request/workflow",
-        {
-            "id": request_id,
-            "action": "agreement_confirm",
-            "version": agreement_version,
-        },
-        user_token,
-    )
-    expect(status, both_confirmed, {200}, "Customer agreement confirmation failed")
-    assert both_confirmed["request"].get("status") == "appointmentConfirmed", (
+    assert provider_confirmed["request"]["agreement"].get("userConfirmed") is True
+    assert provider_confirmed["request"].get("status") == "appointmentConfirmed", (
         "Request did not enter the confirmed-appointment stage"
     )
 

@@ -6,6 +6,7 @@ from decimal import Decimal, ROUND_HALF_UP
 import hashlib
 import hmac
 import json
+import math
 import os
 import secrets
 from typing import Any, Callable, Iterable
@@ -13,169 +14,52 @@ from typing import Any, Callable, Iterable
 
 SUPPORT_EMAIL = os.environ.get("KHADAMATI_SUPPORT_EMAIL", "om.khadamati@gmail.com").strip()
 POLICY_VERSION = "2026-08-02.1"
-MIGRATION_KEY = "KHADAMATI_SUBSCRIPTION_MIGRATION_V1"
+MIGRATION_KEY = "KHADAMATI_SUBSCRIPTION_MIGRATION_V2"
 RANKING_VERSION = "khadamati-ranking-v1"
 OMR = "OMR"
 
 
 PLAN_DEFINITIONS: tuple[dict[str, Any], ...] = (
-    {
-        "id": "foundation_12m",
-        "ar": "فترة التأسيس",
-        "en": "Foundation - 12 months",
-        "price": 0,
-        "currency": OMR,
-        "duration_days": 365,
-        "max_services": 3,
-        "max_categories": 1,
-        "max_images": 5,
-        "max_wilayats": 5,
-        "max_governorates": 1,
-        "monthly_response_limit": 30,
-        "lead_delay_minutes": 15,
-        "max_team_members": 1,
-        "max_branches": 1,
-        "shared_inbox": 0,
-        "advanced_reports": 0,
-        "badge_ar": "",
-        "badge_en": "",
-        "foundation_once": 1,
-        "verified_required": 1,
-    },
-    {
-        "id": "basic_6m",
-        "ar": "الأساسي - 6 أشهر",
-        "en": "Basic - 6 months",
-        "price": 6,
-        "currency": OMR,
-        "duration_days": 183,
-        "max_services": 5,
-        "max_categories": 2,
-        "max_images": 5,
-        "max_wilayats": 10,
-        "max_governorates": 1,
-        "monthly_response_limit": 60,
-        "lead_delay_minutes": 10,
-        "max_team_members": 1,
-        "max_branches": 1,
-        "shared_inbox": 0,
-        "advanced_reports": 0,
-        "badge_ar": "",
-        "badge_en": "",
-        "foundation_once": 0,
-        "verified_required": 0,
-    },
-    {
-        "id": "basic_12m",
-        "ar": "الأساسي - سنوي",
-        "en": "Basic - annual",
-        "price": 10,
-        "currency": OMR,
-        "duration_days": 365,
-        "max_services": 5,
-        "max_categories": 2,
-        "max_images": 5,
-        "max_wilayats": 10,
-        "max_governorates": 1,
-        "monthly_response_limit": 60,
-        "lead_delay_minutes": 10,
-        "max_team_members": 1,
-        "max_branches": 1,
-        "shared_inbox": 0,
-        "advanced_reports": 0,
-        "badge_ar": "",
-        "badge_en": "",
-        "foundation_once": 0,
-        "verified_required": 0,
-    },
-    {
-        "id": "professional_12m",
-        "ar": "الاحترافي - سنوي",
-        "en": "Professional - annual",
-        "price": 20,
-        "currency": OMR,
-        "duration_days": 365,
-        "max_services": 10,
-        "max_categories": 3,
-        "max_images": 10,
-        "max_wilayats": 25,
-        "max_governorates": 2,
-        "monthly_response_limit": 150,
-        "lead_delay_minutes": 0,
-        "max_team_members": 1,
-        "max_branches": 1,
-        "shared_inbox": 0,
-        "advanced_reports": 1,
-        "badge_ar": "الأكثر اختيارًا",
-        "badge_en": "Most selected",
-        "foundation_once": 0,
-        "verified_required": 0,
-    },
-    {
-        "id": "business_12m",
-        "ar": "الأعمال - سنوي",
-        "en": "Business - annual",
-        "price": 40,
-        "currency": OMR,
-        "duration_days": 365,
-        "max_services": 20,
-        "max_categories": 5,
-        "max_images": 15,
-        "max_wilayats": 0,
-        "max_governorates": 5,
-        "monthly_response_limit": 0,
-        "lead_delay_minutes": 0,
-        "max_team_members": 3,
-        "max_branches": 3,
-        "shared_inbox": 1,
-        "advanced_reports": 1,
-        "badge_ar": "فريق أعمال",
-        "badge_en": "Business team",
-        "foundation_once": 0,
-        "verified_required": 0,
-    },
+    # Individual plans
+    {"id": "individual_free_3m", "account_scope": "individual", "ar": "التجربة المجانية", "en": "Free trial", "price": 0, "currency": OMR, "duration_days": 90, "max_services": 2, "max_categories": 1, "max_images": 2, "max_wilayats": 1, "max_governorates": 1, "monthly_response_limit": 0, "lead_delay_seconds": 120, "max_team_members": 1, "max_branches": 1, "shared_inbox": 0, "advanced_reports": 0, "community_package_quota": 1, "community_package_days": 30, "badge_ar": "3 أشهر مجانًا", "badge_en": "3 months free", "foundation_once": 1, "verified_required": 1},
+    {"id": "individual_silver_6m", "account_scope": "individual", "ar": "الفضية", "en": "Silver", "price": 10, "currency": OMR, "duration_days": 183, "max_services": 2, "max_categories": 1, "max_images": 4, "max_wilayats": 1, "max_governorates": 1, "monthly_response_limit": 0, "lead_delay_seconds": 60, "max_team_members": 1, "max_branches": 1, "shared_inbox": 0, "advanced_reports": 0, "community_package_quota": 1, "community_package_days": 30, "badge_ar": "", "badge_en": "", "foundation_once": 0, "verified_required": 0},
+    {"id": "individual_gold_6m", "account_scope": "individual", "ar": "الذهبية", "en": "Gold", "price": 15, "currency": OMR, "duration_days": 183, "max_services": 3, "max_categories": 2, "max_images": 8, "max_wilayats": 1, "max_governorates": 1, "monthly_response_limit": 0, "lead_delay_seconds": 30, "max_team_members": 1, "max_branches": 1, "shared_inbox": 0, "advanced_reports": 0, "community_package_quota": 2, "community_package_days": 60, "badge_ar": "الأكثر اختيارًا", "badge_en": "Most selected", "foundation_once": 0, "verified_required": 0},
+    {"id": "individual_elite_6m", "account_scope": "individual", "ar": "النخبة", "en": "Elite", "price": 25, "currency": OMR, "duration_days": 183, "max_services": 6, "max_categories": 3, "max_images": 15, "max_wilayats": 2, "max_governorates": 2, "monthly_response_limit": 0, "lead_delay_seconds": 0, "max_team_members": 1, "max_branches": 1, "shared_inbox": 0, "advanced_reports": 1, "community_package_quota": 4, "community_package_days": 90, "badge_ar": "وصول فوري", "badge_en": "Instant access", "foundation_once": 0, "verified_required": 0},
+    # Company plans. max_wilayats=0 means any wilayah inside the allowed governorates.
+    {"id": "company_free_3m", "account_scope": "company", "ar": "تجربة الشركات", "en": "Company trial", "price": 0, "currency": OMR, "duration_days": 90, "max_services": 3, "max_categories": 3, "max_images": 2, "max_wilayats": 0, "max_governorates": 1, "monthly_response_limit": 0, "lead_delay_seconds": 60, "max_team_members": 3, "max_branches": 1, "shared_inbox": 1, "advanced_reports": 0, "community_package_quota": 2, "community_package_days": 30, "badge_ar": "3 أشهر مجانًا", "badge_en": "3 months free", "foundation_once": 1, "verified_required": 1},
+    {"id": "company_silver_6m", "account_scope": "company", "ar": "فضية الشركات", "en": "Company Silver", "price": 30, "currency": OMR, "duration_days": 183, "max_services": 3, "max_categories": 3, "max_images": 4, "max_wilayats": 0, "max_governorates": 1, "monthly_response_limit": 0, "lead_delay_seconds": 0, "max_team_members": 5, "max_branches": 1, "shared_inbox": 1, "advanced_reports": 0, "community_package_quota": 2, "community_package_days": 30, "badge_ar": "", "badge_en": "", "foundation_once": 0, "verified_required": 0},
+    {"id": "company_gold_6m", "account_scope": "company", "ar": "ذهبية الشركات", "en": "Company Gold", "price": 50, "currency": OMR, "duration_days": 183, "max_services": 5, "max_categories": 5, "max_images": 8, "max_wilayats": 0, "max_governorates": 2, "monthly_response_limit": 0, "lead_delay_seconds": 0, "max_team_members": 12, "max_branches": 3, "shared_inbox": 1, "advanced_reports": 1, "community_package_quota": 4, "community_package_days": 60, "badge_ar": "الأكثر اختيارًا", "badge_en": "Most selected", "foundation_once": 0, "verified_required": 0},
+    {"id": "company_elite_6m", "account_scope": "company", "ar": "نخبة الشركات", "en": "Company Elite", "price": 85, "currency": OMR, "duration_days": 183, "max_services": 10, "max_categories": 8, "max_images": 20, "max_wilayats": 0, "max_governorates": 4, "monthly_response_limit": 0, "lead_delay_seconds": 0, "max_team_members": 30, "max_branches": 6, "shared_inbox": 1, "advanced_reports": 1, "community_package_quota": 8, "community_package_days": 90, "badge_ar": "أوسع صلاحيات", "badge_en": "Maximum access", "foundation_once": 0, "verified_required": 0},
 )
 
 PLAN_IDS = tuple(plan["id"] for plan in PLAN_DEFINITIONS)
 PLAN_ACCOUNT_LIMITS: dict[str, dict[str, dict[str, int]]] = {
-    "foundation_12m": {
-        "individual": {"maxServices": 3, "maxCategories": 1, "maxImages": 5, "maxWilayats": 5},
-        "company": {"maxServices": 6, "maxCategories": 3, "maxImages": 10, "maxWilayats": 5},
-    },
-    "basic_6m": {
-        "individual": {"maxServices": 5, "maxCategories": 1, "maxImages": 5, "maxWilayats": 10},
-        "company": {"maxServices": 8, "maxCategories": 4, "maxImages": 10, "maxWilayats": 10},
-    },
-    "basic_12m": {
-        "individual": {"maxServices": 5, "maxCategories": 1, "maxImages": 5, "maxWilayats": 10},
-        "company": {"maxServices": 8, "maxCategories": 4, "maxImages": 10, "maxWilayats": 10},
-    },
-    "professional_12m": {
-        "individual": {"maxServices": 10, "maxCategories": 1, "maxImages": 5, "maxWilayats": 25},
-        "company": {"maxServices": 12, "maxCategories": 4, "maxImages": 10, "maxWilayats": 25},
-    },
-    "business_12m": {
-        "individual": {"maxServices": 20, "maxCategories": 1, "maxImages": 5, "maxWilayats": 25},
-        "company": {"maxServices": 20, "maxCategories": 5, "maxImages": 10, "maxWilayats": 61},
-    },
+    plan["id"]: {
+        plan["account_scope"]: {
+            "maxServices": plan["max_services"],
+            "maxCategories": plan["max_categories"],
+            "maxImages": plan["max_images"],
+            "maxWilayats": plan["max_wilayats"],
+            "maxTeamMembers": plan["max_team_members"],
+            "maxBranches": plan["max_branches"],
+        }
+    }
+    for plan in PLAN_DEFINITIONS
 }
 LEGACY_PLAN_MAP = {
-    "intro": "foundation_12m",
-    "intro_90": "foundation_12m",
-    "basic_90": "basic_6m",
-    "individual_6m": "basic_6m",
-    "active_90": "basic_6m",
-    "individual_year": "basic_12m",
-    "featured_90": "professional_12m",
-    "local_visibility": "professional_12m",
-    "service_priority": "professional_12m",
-    "company_90": "business_12m",
-    "company_year": "business_12m",
-    "company_growth": "business_12m",
-    "plus": "professional_12m",
-    "growth": "business_12m",
-    "basic": "basic_6m",
+    "intro": "individual_free_3m", "intro_90": "individual_free_3m",
+    "basic_90": "individual_silver_6m", "individual_6m": "individual_silver_6m",
+    "active_90": "individual_silver_6m", "individual_year": "individual_silver_6m",
+    "featured_90": "individual_gold_6m", "local_visibility": "individual_gold_6m",
+    "service_priority": "individual_gold_6m", "plus": "individual_gold_6m",
+    "basic": "individual_silver_6m", "growth": "individual_elite_6m",
+    "company_90": "company_free_3m", "company_year": "company_gold_6m",
+    "company_growth": "company_elite_6m",
 }
+LEGACY_PLAN_IDS = tuple(dict.fromkeys((
+    "foundation_12m", "basic_6m", "basic_12m", "professional_12m", "business_12m",
+    *LEGACY_PLAN_MAP.keys(),
+)))
 
 SUBSCRIPTION_STATES = {
     "foundation",
@@ -261,6 +145,41 @@ def row_dict(row: Any) -> dict[str, Any]:
 
 class PlanCatalog:
     @staticmethod
+    def foundation_for(account_type: str) -> str:
+        return "company_free_3m" if account_type == "company" else "individual_free_3m"
+
+    @staticmethod
+    def scope(plan: dict[str, Any] | None) -> str:
+        plan = plan or {}
+        entitlements = plan.get("entitlements") if isinstance(plan.get("entitlements"), dict) else {}
+        scope = str(plan.get("account_scope") or entitlements.get("accountScope") or "all")
+        return scope if scope in {"individual", "company", "all"} else "all"
+
+    @staticmethod
+    def supports_account(plan: dict[str, Any] | None, account_type: str) -> bool:
+        scope = PlanCatalog.scope(plan)
+        normalized = "company" if account_type == "company" else "individual"
+        return scope in {"all", normalized}
+
+    @staticmethod
+    def compatible_id(plan_id: str, account_type: str) -> str:
+        normalized = "company" if account_type == "company" else "individual"
+        special = {
+            "foundation_12m": PlanCatalog.foundation_for(normalized),
+            "basic_6m": "company_silver_6m" if normalized == "company" else "individual_silver_6m",
+            "basic_12m": "company_silver_6m" if normalized == "company" else "individual_silver_6m",
+            "professional_12m": "company_gold_6m" if normalized == "company" else "individual_gold_6m",
+            "business_12m": "company_elite_6m" if normalized == "company" else "individual_elite_6m",
+        }
+        mapped = special.get(str(plan_id), LEGACY_PLAN_MAP.get(str(plan_id), str(plan_id)))
+        if normalized == "company" and mapped.startswith("individual_"):
+            tier = mapped.removeprefix("individual_")
+            company_candidate = f"company_{tier}"
+            if company_candidate in PLAN_IDS:
+                return company_candidate
+        return mapped
+
+    @staticmethod
     def account_limits(plan: dict[str, Any] | None, account_type: str) -> dict[str, int]:
         plan = plan or {}
         normalized_type = "company" if account_type == "company" else "individual"
@@ -271,11 +190,13 @@ class PlanCatalog:
             "maxCategories": int(limits.get("maxCategories") or plan.get("max_categories") or 0),
             "maxImages": int(limits.get("maxImages") or plan.get("max_images") or 0),
             "maxWilayats": int(limits.get("maxWilayats") or plan.get("max_wilayats") or 0),
+            "maxGovernorates": int(
+                limits.get("maxGovernorates") or plan.get("max_governorates") or 0
+            ),
             "maxTeamMembers": int(limits.get("maxTeamMembers") or plan.get("max_team_members") or entitlements.get("teamMembers") or 1),
             "maxBranches": int(limits.get("maxBranches") or plan.get("max_branches") or entitlements.get("branches") or 1),
         }
         if normalized_type == "individual":
-            result["maxCategories"] = 1
             result["maxTeamMembers"] = 1
         return result
 
@@ -289,30 +210,36 @@ class PlanCatalog:
                 "maxWilayats": plan["max_wilayats"],
                 "maxGovernorates": plan["max_governorates"],
                 "monthlyResponses": plan["monthly_response_limit"],
-                "leadDelayMinutes": plan["lead_delay_minutes"],
+                "leadDelaySeconds": plan["lead_delay_seconds"],
+                "leadDelayMinutes": math.ceil(plan["lead_delay_seconds"] / 60),
                 "teamMembers": plan["max_team_members"],
                 "branches": plan["max_branches"],
                 "sharedInbox": bool(plan["shared_inbox"]),
                 "advancedReports": bool(plan["advanced_reports"]),
+                "accountScope": plan["account_scope"],
+                "communityPackageQuota": plan["community_package_quota"],
+                "communityPackageDays": plan["community_package_days"],
                 "accountLimits": PLAN_ACCOUNT_LIMITS.get(plan["id"], {}),
             }
             con.execute(
                 """INSERT INTO packages(
                 id,ar,en,price,duration_days,featured_boost,max_services,max_images,active,
                 currency,max_categories,max_wilayats,max_governorates,monthly_response_limit,
-                lead_delay_minutes,max_team_members,max_branches,shared_inbox,
+                lead_delay_minutes,lead_delay_seconds,max_team_members,max_branches,shared_inbox,
                 advanced_reports,badge_ar,badge_en,foundation_once,verified_required,
-                legacy,entitlements)
-                VALUES(?,?,?,?,?,?,?,?,1,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0,?)
+                legacy,account_scope,community_package_quota,community_package_days,entitlements)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(id) DO NOTHING""",
                 (
                     plan["id"], plan["ar"], plan["en"], plan["price"],
-                    plan["duration_days"], 0, plan["max_services"], plan["max_images"],
+                    plan["duration_days"], 0, plan["max_services"], plan["max_images"], 1,
                     plan["currency"], plan["max_categories"], plan["max_wilayats"], plan["max_governorates"],
-                    plan["monthly_response_limit"], plan["lead_delay_minutes"],
+                    plan["monthly_response_limit"], math.ceil(plan["lead_delay_seconds"] / 60),
+                    plan["lead_delay_seconds"],
                     plan["max_team_members"], plan["max_branches"], plan["shared_inbox"],
                     plan["advanced_reports"], plan["badge_ar"], plan["badge_en"],
-                    plan["foundation_once"], plan["verified_required"], dump(entitlements),
+                    plan["foundation_once"], plan["verified_required"], 0, plan["account_scope"],
+                    plan["community_package_quota"], plan["community_package_days"], dump(entitlements),
                 ),
             )
             current = con.execute(
@@ -334,9 +261,10 @@ class PlanCatalog:
                     "UPDATE packages SET entitlements=? WHERE id=?",
                     (dump(current_entitlements), plan["id"]),
                 )
+        placeholders = ",".join("?" for _ in LEGACY_PLAN_IDS)
         con.execute(
-            "UPDATE packages SET active=0,legacy=1 WHERE id NOT IN (?,?,?,?,?)",
-            PLAN_IDS,
+            f"UPDATE packages SET active=0,legacy=1 WHERE id IN ({placeholders})",
+            LEGACY_PLAN_IDS,
         )
 
     @staticmethod
@@ -356,7 +284,7 @@ class PlanCatalog:
     @staticmethod
     def active(con) -> list[dict[str, Any]]:
         return [PlanCatalog.get(con, row["id"], False) for row in con.execute(
-            "SELECT id FROM packages WHERE active=1 AND legacy=0 ORDER BY price,duration_days"
+            "SELECT id FROM packages WHERE active=1 AND legacy=0 ORDER BY account_scope,price,duration_days"
         )]
 
 
@@ -389,11 +317,13 @@ class SubscriptionService:
         if not end:
             return "pending_payment" if stored not in {"foundation", "active"} else stored
         remaining = (end.date() - self.now.date()).days
+        if stored == "foundation" and remaining < 0:
+            return "expired"
         if remaining < -self.grace_days:
             return "expired"
         if remaining < 0:
             return "grace"
-        if remaining <= 30:
+        if remaining <= 14:
             return "expiring"
         if stored == "foundation":
             return "foundation"
@@ -461,15 +391,17 @@ class SubscriptionService:
         payment_required: bool = True,
         actor: str = "provider",
     ) -> dict[str, Any]:
-        plan = PlanCatalog.get(self.con, plan_id)
         provider = self.con.execute("SELECT * FROM providers WHERE id=?", (provider_id,)).fetchone()
-        if not plan:
-            raise DomainError("package_not_found", 404)
         if not provider:
             raise DomainError("provider_not_found", 404)
-        if plan_id == "business_12m" and str(provider["provider_type"] or "individual") != "company":
-            raise DomainError("business_plan_requires_company", 409)
-        if plan_id == "foundation_12m":
+        account_type = "company" if str(provider["provider_type"] or "individual") == "company" else "individual"
+        plan_id = PlanCatalog.compatible_id(plan_id, account_type)
+        plan = PlanCatalog.get(self.con, plan_id)
+        if not plan:
+            raise DomainError("package_not_found", 404)
+        if not PlanCatalog.supports_account(plan, account_type):
+            raise DomainError("package_account_type_mismatch", 409)
+        if int(plan.get("foundation_once") or 0):
             eligible, reason = self.foundation_eligible(provider_id)
             if not eligible:
                 raise DomainError(reason, 409)
@@ -483,7 +415,7 @@ class SubscriptionService:
         is_downgrade = bool(
             current and current_state in self.ACTIVE_ACCESS_STATES
             and as_money(plan["price"]) < as_money((current_plan or {}).get("price"))
-            and plan_id != "foundation_12m"
+            and not int(plan.get("foundation_once") or 0)
         )
         is_renewal = bool(
             current and current_state in self.ACTIVE_ACCESS_STATES
@@ -509,7 +441,7 @@ class SubscriptionService:
         discount = self._coupon_discount(coupon_code, provider_id, plan_id, quote["amountDue"])
         amount_due = max(Decimal("0.000"), quote["amountDue"] - discount)
         subscription_id = public_id("sub")
-        status = "foundation" if plan_id == "foundation_12m" else "pending_payment"
+        status = "foundation" if int(plan.get("foundation_once") or 0) else "pending_payment"
         start = self.now
         end = start + timedelta(days=int(plan["duration_days"]))
         self.con.execute(
@@ -614,7 +546,7 @@ class SubscriptionService:
                 (iso(start), old["id"]),
             )
             self._event(old["id"], "superseded", old["status"], "cancelled", actor)
-        state = "foundation" if plan["id"] == "foundation_12m" else "active"
+        state = "foundation" if int(plan.get("foundation_once") or 0) else "active"
         self.con.execute(
             """UPDATE subscriptions SET status=?,start_date=?,end_date=?,activated_at=?,
             grace_until=?,payment_id=?,updated_at=CURRENT_TIMESTAMP WHERE id=?""",
@@ -642,7 +574,7 @@ class SubscriptionService:
         base = max(self.now, current_end) if current_end else self.now
         new_end = base + timedelta(days=extension_days)
         old_state = subscription.get("status", "")
-        state = "foundation" if subscription["package_id"] == "foundation_12m" else "active"
+        state = "foundation" if int(plan.get("foundation_once") or 0) else "active"
         self.con.execute(
             """UPDATE subscriptions SET status=?,end_date=?,grace_until=?,
             updated_at=CURRENT_TIMESTAMP WHERE id=?""",
@@ -784,10 +716,25 @@ class EntitlementService:
             "maxGovernorates": int((plan or {}).get("max_governorates") or 0),
             "monthlyResponses": int((plan or {}).get("monthly_response_limit") or 0),
             "leadDelayMinutes": int((plan or {}).get("lead_delay_minutes") or 0),
+            "leadDelaySeconds": int(
+                (plan or {}).get("lead_delay_seconds")
+                or plan_entitlements.get("leadDelaySeconds")
+                or int((plan or {}).get("lead_delay_minutes") or 0) * 60
+            ),
             "teamMembers": int((plan or {}).get("max_team_members") or 1),
             "branches": int((plan or {}).get("max_branches") or 1),
             "sharedInbox": bool((plan or {}).get("shared_inbox")),
             "advancedReports": bool((plan or {}).get("advanced_reports")),
+            "communityPackageQuota": int(
+                (plan or {}).get("community_package_quota")
+                or plan_entitlements.get("communityPackageQuota")
+                or 0
+            ),
+            "communityPackageDays": int(
+                (plan or {}).get("community_package_days")
+                or plan_entitlements.get("communityPackageDays")
+                or 30
+            ),
             "badgeAr": (plan or {}).get("badge_ar", ""),
             "badgeEn": (plan or {}).get("badge_en", ""),
         }
@@ -798,7 +745,8 @@ class EntitlementService:
         if not preserve_existing:
             return entitlements
         provider = self.con.execute(
-            "SELECT provider_type,services,areas FROM providers WHERE id=?", (provider_id,)
+            "SELECT provider_type,services,areas,governorates,gov FROM providers WHERE id=?",
+            (provider_id,),
         ).fetchone()
         if not provider:
             return entitlements
@@ -813,25 +761,49 @@ class EntitlementService:
             for item in existing_services
             if isinstance(item, dict) and item.get("catId") and item.get("serviceId")
         })
+        existing_governorates = {
+            str(item).strip()
+            for item in load(provider["governorates"], [])
+            if str(item).strip()
+        }
+        if str(provider["gov"] or "").strip():
+            existing_governorates.add(str(provider["gov"]).strip())
         existing_area_count = len({
-            str(area).strip() for area in load(provider["areas"], []) if str(area).strip()
+            str(area).strip()
+            for area in load(provider["areas"], [])
+            if str(area).strip() and str(area).strip() not in existing_governorates
         })
+        existing_governorate_count = len(existing_governorates)
         is_company = str(provider["provider_type"] or "individual") == "company"
         service_limit = int(entitlements.get("maxServices") or 0)
+        wilayah_limit = int(entitlements.get("maxWilayats") or 0)
         return {
             **entitlements,
             "accountType": "company" if is_company else "individual",
             "maxServices": max(service_limit, existing_service_count),
             "maxCategories": max(int(entitlements.get("maxCategories") or 0), len(existing_categories)),
-            "maxWilayats": max(int(entitlements.get("maxWilayats") or 0), existing_area_count),
+            "maxWilayats": 0 if wilayah_limit == 0 else max(wilayah_limit, existing_area_count),
+            "maxGovernorates": max(
+                int(entitlements.get("maxGovernorates") or 0),
+                existing_governorate_count,
+            ),
             "grandfathered": bool(
                 existing_service_count > service_limit
                 or len(existing_categories) > int(entitlements.get("maxCategories") or 0)
-                or existing_area_count > int(entitlements.get("maxWilayats") or 0)
+                or (wilayah_limit > 0 and existing_area_count > wilayah_limit)
+                or existing_governorate_count
+                > int(entitlements.get("maxGovernorates") or 0)
             ),
         }
 
-    def validate_profile(self, provider_id: str, *, services: Iterable[Any], areas: Iterable[Any]) -> dict[str, Any]:
+    def validate_profile(
+        self,
+        provider_id: str,
+        *,
+        services: Iterable[Any],
+        areas: Iterable[Any],
+        governorates: Iterable[Any] = (),
+    ) -> dict[str, Any]:
         entitlements = self.profile_limits(provider_id, preserve_existing=True)
         categories = {
             str(item.get("catId", "")).strip()
@@ -843,12 +815,20 @@ class EntitlementService:
             for item in services if isinstance(item, dict) and item.get("catId") and item.get("serviceId")
         })
         areas_count = len({str(area).strip() for area in areas if str(area).strip()})
+        governorates_count = len(
+            {str(item).strip() for item in governorates if str(item).strip()}
+        )
         if entitlements["maxCategories"] and len(categories) > entitlements["maxCategories"]:
             raise DomainError("provider_category_limit", 409)
         if entitlements["maxServices"] and services_count > entitlements["maxServices"]:
             raise DomainError("service_limit_exceeded", 409)
         if entitlements["maxWilayats"] and areas_count > entitlements["maxWilayats"]:
             raise DomainError("wilayah_limit_exceeded", 409)
+        if (
+            entitlements["maxGovernorates"]
+            and governorates_count > entitlements["maxGovernorates"]
+        ):
+            raise DomainError("governorate_limit_exceeded", 409)
         return entitlements
 
     def can_receive(self, provider_id: str) -> tuple[bool, str, dict[str, Any]]:
@@ -967,11 +947,14 @@ class RankingService:
         "plan": 0.04,
     }
     PLAN_PRIORITY = {
-        "foundation_12m": 0.10,
-        "basic_6m": 0.35,
-        "basic_12m": 0.40,
-        "professional_12m": 0.85,
-        "business_12m": 1.00,
+        "individual_free_3m": 0.10,
+        "individual_silver_6m": 0.40,
+        "individual_gold_6m": 0.75,
+        "individual_elite_6m": 1.00,
+        "company_free_3m": 0.10,
+        "company_silver_6m": 0.40,
+        "company_gold_6m": 0.75,
+        "company_elite_6m": 1.00,
     }
 
     @classmethod
@@ -1117,7 +1100,7 @@ class RequestMarketplace:
                 "providerId": provider["id"],
                 "score": score,
                 "breakdown": breakdown,
-                "delay": grants["leadDelayMinutes"] if apply_plan_delay else 0,
+                "delaySeconds": grants["leadDelaySeconds"] if apply_plan_delay else 0,
                 "planId": grants["planId"],
             })
         ranked.sort(key=lambda item: (-item["score"], item["providerId"]))
@@ -1129,7 +1112,7 @@ class RequestMarketplace:
         for index, item in enumerate(ranked):
             wave = 1 if index < 5 else 2
             base = self.now if wave == 1 else expansion_at
-            release = base + timedelta(minutes=item["delay"])
+            release = base + timedelta(seconds=item["delaySeconds"])
             self.con.execute(
                 """INSERT INTO request_dispatches(
                 id,request_id,provider_id,rank,score,score_breakdown,wave,release_at,status)
@@ -1465,10 +1448,33 @@ def run_subscription_migration_v1(con) -> dict[str, Any]:
     if existing:
         return load(existing["value"], {"alreadyApplied": True})
     PlanCatalog.seed(con)
+
+    def mapped_plan(old_plan: str, provider_type: str) -> str:
+        account_type = "company" if provider_type == "company" else "individual"
+        if old_plan in PLAN_IDS:
+            plan = PlanCatalog.get(con, old_plan, False)
+            if PlanCatalog.supports_account(plan, account_type):
+                return old_plan
+        existing_plan = PlanCatalog.get(con, old_plan, False) if old_plan else None
+        if existing_plan and not existing_plan.get("legacy") and PlanCatalog.supports_account(existing_plan, account_type):
+            return old_plan
+        if old_plan in {"foundation_12m", "intro", "intro_90"}:
+            return f"{account_type}_free_3m"
+        if old_plan in {"professional_12m", "featured_90", "local_visibility", "service_priority", "plus"}:
+            return f"{account_type}_gold_6m"
+        if old_plan in {"business_12m", "company_year"}:
+            return "company_gold_6m" if account_type == "company" else "individual_gold_6m"
+        if old_plan in {"company_growth", "growth"}:
+            return f"{account_type}_elite_6m"
+        return f"{account_type}_silver_6m"
+
     mapped_subscriptions = 0
-    for row in list(con.execute("SELECT id,package_id,status FROM subscriptions")):
+    for row in list(con.execute(
+        """SELECT s.id,s.package_id,s.status,COALESCE(p.provider_type,'individual') provider_type
+        FROM subscriptions s LEFT JOIN providers p ON p.id=s.provider_id"""
+    )):
         old_plan = row["package_id"]
-        new_plan = LEGACY_PLAN_MAP.get(old_plan, old_plan if old_plan in PLAN_IDS else "basic_6m")
+        new_plan = mapped_plan(old_plan, row["provider_type"])
         old_status = str(row["status"] or "pending")
         status_map = {
             "pending": "pending_payment",
@@ -1478,7 +1484,8 @@ def run_subscription_migration_v1(con) -> dict[str, Any]:
             "inactive": "expired",
         }
         new_status = status_map.get(old_status, old_status if old_status in SUBSCRIPTION_STATES else "active")
-        if new_plan == "foundation_12m" and new_status in {"active", "foundation"}:
+        migrated_plan = PlanCatalog.get(con, new_plan, False) or {}
+        if int(migrated_plan.get("foundation_once") or 0) and new_status in {"active", "foundation"}:
             new_status = "foundation"
         con.execute(
             """UPDATE subscriptions SET package_id=?,legacy_package_id=CASE
@@ -1491,7 +1498,7 @@ def run_subscription_migration_v1(con) -> dict[str, Any]:
     today = utcnow()
     for provider in list(con.execute("SELECT * FROM providers")):
         old_plan = str(provider["package_id"] or "")
-        plan_id = LEGACY_PLAN_MAP.get(old_plan, old_plan if old_plan in PLAN_IDS else "basic_6m")
+        plan_id = mapped_plan(old_plan, str(provider["provider_type"] or "individual"))
         con.execute("UPDATE providers SET package_id=? WHERE id=?", (plan_id, provider["id"]))
         subscription = con.execute(
             "SELECT id FROM subscriptions WHERE provider_id=? ORDER BY created_at DESC LIMIT 1",
@@ -1502,12 +1509,12 @@ def run_subscription_migration_v1(con) -> dict[str, Any]:
         plan = PlanCatalog.get(con, plan_id, False)
         start = parse_datetime(provider["subscription_start"]) or parse_datetime(provider["created_at"]) or today
         end = parse_datetime(provider["subscription_until"]) or (start + timedelta(days=int(plan["duration_days"])))
-        state = "foundation" if plan_id == "foundation_12m" else "active"
+        state = "foundation" if int(plan.get("foundation_once") or 0) else "active"
         if end < today - timedelta(days=14):
             state = "expired"
         elif end < today:
             state = "grace"
-        elif (end.date() - today.date()).days <= 30:
+        elif (end.date() - today.date()).days <= 14:
             state = "expiring"
         subscription_id = public_id("subm")
         con.execute(
@@ -1522,7 +1529,7 @@ def run_subscription_migration_v1(con) -> dict[str, Any]:
                 (end + timedelta(days=14)).date().isoformat(), dump({"migration": MIGRATION_KEY}),
             ),
         )
-        if plan_id == "foundation_12m" and int(provider["verified"] or 0):
+        if int(plan.get("foundation_once") or 0) and int(provider["verified"] or 0):
             phone = normalized_phone(provider["phone"])
             commercial = str(provider["commercial_no"] or "").strip().casefold()
             fingerprint = hashlib.sha256(f"{phone}|{commercial}".encode("utf-8")).hexdigest()
@@ -1551,7 +1558,7 @@ def run_subscription_migration_v1(con) -> dict[str, Any]:
                     pass
     changes = SubscriptionService(con).synchronize_all()
     summary = {
-        "version": 1,
+        "version": 2,
         "completedAt": iso(),
         "mappedSubscriptions": mapped_subscriptions,
         "createdSubscriptions": created_subscriptions,

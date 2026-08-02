@@ -120,7 +120,7 @@ def environment_flag(name, default=False):
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
-APP_RELEASE = os.environ.get("KHADAMATI_RELEASE", "v1.1.2").strip() or "v1.1.2"
+APP_RELEASE = os.environ.get("KHADAMATI_RELEASE", "v1.1.3").strip() or "v1.1.3"
 TRUST_MIGRATION_KEY = "TRUST_SCHEMA_V1"
 QUALITY_MIGRATION_KEY = "QUALITY_SCHEMA_V1"
 PLATFORM_MIGRATION_KEY = "PLATFORM_SCHEMA_V1"
@@ -147,12 +147,12 @@ ALLOWED_ORIGINS = {
 }
 SESSION_DAYS = int(os.environ.get("KHADAMATI_SESSION_DAYS", "30"))
 ACCESS_TOKEN_MINUTES = max(
-    5, int(os.environ.get("KHADAMATI_ACCESS_TOKEN_MINUTES", "30"))
+    5, int(os.environ.get("KHADAMATI_ACCESS_TOKEN_MINUTES", "480"))
 )
 PUBLIC_APP_URL = os.environ.get("KHADAMATI_PUBLIC_URL", "https://lllx6.github.io/Khadamati/").rstrip("/") + "/"
 LOGIN_MAX_ATTEMPTS = max(3, int(os.environ.get("KHADAMATI_LOGIN_MAX_ATTEMPTS", "5")))
 LOGIN_LOCK_MINUTES = max(1, int(os.environ.get("KHADAMATI_LOGIN_LOCK_MINUTES", "15")))
-MEDIA_URL_TTL_SECONDS = max(60, int(os.environ.get("KHADAMATI_MEDIA_URL_TTL_SECONDS", "900")))
+MEDIA_URL_TTL_SECONDS = max(60, int(os.environ.get("KHADAMATI_MEDIA_URL_TTL_SECONDS", "21600")))
 MEDIA_SIGNING_KEY = (
     os.environ.get("KHADAMATI_MEDIA_SIGNING_KEY")
     or os.environ.get("KHADAMATI_OTP_PEPPER")
@@ -795,7 +795,7 @@ def init_db():
             CREATE TABLE IF NOT EXISTS providers(
               id TEXT PRIMARY KEY, name TEXT NOT NULL, phone TEXT NOT NULL,
               email TEXT DEFAULT '', age INTEGER NOT NULL DEFAULT 0, nationality TEXT DEFAULT '',
-              gov TEXT, wilayah TEXT,
+              gov TEXT, wilayah TEXT, governorates TEXT DEFAULT '[]',
               areas TEXT, bio TEXT, hours TEXT, status TEXT, active INTEGER, verified INTEGER, featured INTEGER,
               package_id TEXT, rating REAL, reviews INTEGER, admin_note TEXT DEFAULT '', image_path TEXT DEFAULT '', card_image TEXT DEFAULT '',
               pin_hash TEXT DEFAULT '', services TEXT NOT NULL, work_images TEXT DEFAULT '[]', documents TEXT DEFAULT '[]',
@@ -1061,6 +1061,7 @@ def init_db():
         ensure_column(con, "providers", "email", "TEXT DEFAULT ''")
         ensure_column(con, "providers", "age", "INTEGER NOT NULL DEFAULT 0")
         ensure_column(con, "providers", "nationality", "TEXT DEFAULT ''")
+        ensure_column(con, "providers", "governorates", "TEXT DEFAULT '[]'")
         ensure_column(con, "providers", "location_sharing_expires_at", "TEXT DEFAULT ''")
         ensure_column(con, "providers", "deleted_at", "TEXT DEFAULT ''")
         ensure_column(con, "providers", "delete_reason", "TEXT DEFAULT ''")
@@ -1098,6 +1099,7 @@ def init_db():
         ensure_column(con, "packages", "max_governorates", "INTEGER NOT NULL DEFAULT 1")
         ensure_column(con, "packages", "monthly_response_limit", "INTEGER NOT NULL DEFAULT 30")
         ensure_column(con, "packages", "lead_delay_minutes", "INTEGER NOT NULL DEFAULT 15")
+        ensure_column(con, "packages", "lead_delay_seconds", "INTEGER NOT NULL DEFAULT 0")
         ensure_column(con, "packages", "max_team_members", "INTEGER NOT NULL DEFAULT 1")
         ensure_column(con, "packages", "max_branches", "INTEGER NOT NULL DEFAULT 1")
         ensure_column(con, "packages", "shared_inbox", "INTEGER NOT NULL DEFAULT 0")
@@ -1107,6 +1109,9 @@ def init_db():
         ensure_column(con, "packages", "foundation_once", "INTEGER NOT NULL DEFAULT 0")
         ensure_column(con, "packages", "verified_required", "INTEGER NOT NULL DEFAULT 0")
         ensure_column(con, "packages", "legacy", "INTEGER NOT NULL DEFAULT 0")
+        ensure_column(con, "packages", "account_scope", "TEXT NOT NULL DEFAULT 'all'")
+        ensure_column(con, "packages", "community_package_quota", "INTEGER NOT NULL DEFAULT 0")
+        ensure_column(con, "packages", "community_package_days", "INTEGER NOT NULL DEFAULT 30")
         ensure_column(con, "packages", "entitlements", "TEXT DEFAULT '{}'")
         ensure_column(con, "subscriptions", "currency", "TEXT NOT NULL DEFAULT 'OMR'")
         ensure_column(con, "subscriptions", "grace_days", "INTEGER NOT NULL DEFAULT 14")
@@ -1453,6 +1458,9 @@ def urls(paths):
 def row_provider(r, private=False, sign_private=False):
     d = dict(r)
     d["areas"] = jload(d["areas"], [])
+    d["governorates"] = jload(d.pop("governorates", "[]"), [])
+    if not d["governorates"] and d.get("gov"):
+        d["governorates"] = [d["gov"]]
     d["services"] = jload(d["services"], [])
     d["stats"] = jload(d["stats"], {"views": 0, "whatsapp": 0, "calls": 0})
     d["workImages"] = jload(d.pop("work_images", "[]"), [])
@@ -1618,6 +1626,7 @@ def row_package(r):
     d["maxGovernorates"] = d.pop("max_governorates", 0)
     d["monthlyResponses"] = d.pop("monthly_response_limit", 0)
     d["leadDelayMinutes"] = d.pop("lead_delay_minutes", 0)
+    d["leadDelaySeconds"] = d.pop("lead_delay_seconds", d["leadDelayMinutes"] * 60)
     d["teamMembers"] = d.pop("max_team_members", 1)
     d["branches"] = d.pop("max_branches", 1)
     d["sharedInbox"] = bool(d.pop("shared_inbox", 0))
@@ -1626,6 +1635,9 @@ def row_package(r):
     d["badgeEn"] = d.pop("badge_en", "")
     d["foundationOnce"] = bool(d.pop("foundation_once", 0))
     d["verifiedRequired"] = bool(d.pop("verified_required", 0))
+    d["accountScope"] = d.pop("account_scope", "all")
+    d["communityPackageQuota"] = d.pop("community_package_quota", 0)
+    d["communityPackageDays"] = d.pop("community_package_days", 30)
     d["entitlements"] = jload(d.get("entitlements"), {})
     account_limits = (
         d["entitlements"].get("accountLimits", {})
@@ -2604,6 +2616,7 @@ def request_matches_provider(request_item, provider):
     provider_area = {
         str(provider.get("gov") or ""),
         str(provider.get("wilayah") or ""),
+        *(str(item) for item in provider.get("governorates") or []),
         *(str(a) for a in provider.get("areas") or []),
     } - {""}
     return not request_area or bool(request_area & provider_area)
@@ -2842,7 +2855,9 @@ def scan_expirations(con):
             except ValueError:
                 continue
         days = (expiry - today).days
-        if days < -14:
+        if label == "الاشتراك" and days < 0:
+            stage = "expired"
+        elif days < -14:
             stage = "expired"
         elif days < 0:
             stage = "grace"
@@ -3978,13 +3993,39 @@ def upsert_provider(con, data):
         pin_hash = hash_pin(data["pin"])
     if not pin_hash:
         pin_hash = existing["pin_hash"] if existing else ""
+    default_package_id = PlanCatalog.foundation_for(p["providerType"])
     package_id = data.get(
-        "packageId", existing_provider.get("packageId", "foundation_12m")
+        "packageId", existing_provider.get("packageId", default_package_id)
     )
     package = PlanCatalog.get(con, package_id, False) or PlanCatalog.get(
-        con, "foundation_12m", False
+        con, default_package_id, False
     )
     account_limits = PlanCatalog.account_limits(package, p["providerType"])
+    raw_governorates = data.get(
+        "governorates",
+        existing_provider.get("governorates")
+        or [data.get("gov") or existing_provider.get("gov", "")],
+    )
+    if not isinstance(raw_governorates, list):
+        raise DomainError("governorates_must_be_list", 400)
+    p["governorates"] = list(
+        dict.fromkeys(
+            safe_text(item, 80) for item in raw_governorates if safe_text(item, 80)
+        )
+    )
+    primary_governorate = safe_text(
+        data.get("gov", existing_provider.get("gov", "")), 80
+    )
+    if primary_governorate and primary_governorate not in p["governorates"]:
+        p["governorates"].insert(0, primary_governorate)
+    existing_governorate_count = len(existing_provider.get("governorates") or [])
+    governorate_limit = max(
+        1,
+        int(account_limits.get("maxGovernorates") or 1),
+        existing_governorate_count if existing else 0,
+    )
+    if len(p["governorates"]) > governorate_limit:
+        raise DomainError("governorate_limit_exceeded", 409)
     existing_services = existing_provider.get("services", [])
     existing_categories = {
         item.get("catId")
@@ -4129,12 +4170,13 @@ def upsert_provider(con, data):
         ),
     )
     con.execute(
-        """UPDATE providers SET before_after=?,intro_video_url=?,availability=?,
+        """UPDATE providers SET before_after=?,intro_video_url=?,availability=?,governorates=?,
         response_minutes=?,completed_jobs=?,gender=?,email=?,age=?,nationality=?,location_sharing_expires_at=?
         WHERE id=?""",
         (
             jdump(before_after), intro_video_url,
             jdump(p.get("availability", existing_provider.get("availability", {}))),
+            jdump(p.get("governorates", existing_provider.get("governorates", []))),
             int(finite_number(p.get("responseMinutes", existing_provider.get("responseMinutes", 30)), default=30, minimum=0, maximum=100_000)),
             int(finite_number(p.get("completedJobs", existing_provider.get("completedJobs", 0)), minimum=0, maximum=100_000_000)),
             p.get("gender", existing_provider.get("gender", "not_specified"))
@@ -4160,6 +4202,7 @@ def upsert_provider(con, data):
     p["documents"] = documents
     p["beforeAfter"] = before_after
     p["introVideoUrl"] = image_url(intro_video_url)
+    p["governorates"] = p.get("governorates", [])
     recompute_provider_quality(con, p["id"])
     return p
 
@@ -5323,8 +5366,9 @@ class Handler(SimpleHTTPRequestHandler):
                 }]
             try:
                 with db() as con:
-                    foundation = PlanCatalog.get(con, "foundation_12m", False) or {}
                     is_company = item["providerType"] == "company"
+                    foundation_id = PlanCatalog.foundation_for("company" if is_company else "individual")
+                    foundation = PlanCatalog.get(con, foundation_id, False) or {}
                     limits = PlanCatalog.account_limits(
                         foundation, "company" if is_company else "individual"
                     )
@@ -5415,7 +5459,7 @@ class Handler(SimpleHTTPRequestHandler):
                         req_id,
                         data.get("workImagesData"),
                         "work",
-                        10 if item["providerType"] == "company" else 5,
+                        max(1, int(limits.get("maxImages") or 2)),
                     )
                 if data.get("documentsData"):
                     item["documents"] = save_many_documents(
@@ -7557,6 +7601,7 @@ class Handler(SimpleHTTPRequestHandler):
         if not request_id or action not in {
             "agreement_save",
             "agreement_confirm",
+            "agreement_reject",
             "start_work",
             "completion_submit",
             "completion_decide",
@@ -7596,7 +7641,13 @@ class Handler(SimpleHTTPRequestHandler):
                     related_id=request_id,
                     priority="high",
                     action_text="عرض الاتفاق",
-                    action_route=f"{target_kind}:request:{request_id}",
+                    action_route=f"{target_kind}:chat:{request_id}",
+                )
+                create_notification(
+                    con, "admin", "", "اتفاق تنفيذ جديد",
+                    f"الطلب {request_id} • النسخة {agreement.get('version', 1)}",
+                    type_="request", related_id=request_id, priority="high",
+                    action_text="مراجعة الاتفاق", action_route=f"admin:request:{request_id}",
                 )
             elif action == "agreement_confirm":
                 try:
@@ -7622,7 +7673,45 @@ class Handler(SimpleHTTPRequestHandler):
                     type_="request",
                     related_id=request_id,
                     action_text="فتح الطلب",
-                    action_route=f"{target_kind}:request:{request_id}",
+                    action_route=f"{target_kind}:chat:{request_id}",
+                )
+                create_notification(
+                    con, "admin", "", "تحديث تأكيد اتفاق",
+                    f"الطلب {request_id} • {title}", type_="request",
+                    related_id=request_id, action_text="عرض الاتفاق",
+                    action_route=f"admin:request:{request_id}",
+                )
+            elif action == "agreement_reject":
+                try:
+                    version = int(data.get("version") or 0)
+                except (TypeError, ValueError):
+                    return self.send_json({"error": "invalid_agreement_version"}, 400)
+                agreement = RequestAgreementService(con).reject(
+                    request_id,
+                    actor_kind,
+                    actor_id,
+                    version,
+                    safe_text(data.get("reason"), 240),
+                )
+                target_kind = "provider" if is_owner else "user"
+                target_id = request["acceptedProviderId"] if is_owner else request["userId"]
+                create_notification(
+                    con,
+                    target_kind,
+                    target_id,
+                    "طُلب تعديل الاتفاق",
+                    "راجع بطاقة الاتفاق داخل المحادثة وأرسل نسخة معدلة.",
+                    type_="request",
+                    related_id=request_id,
+                    priority="high",
+                    action_text="فتح المحادثة",
+                    action_route=f"{target_kind}:chat:{request_id}",
+                )
+                create_notification(
+                    con, "admin", "", "طُلب تعديل اتفاق تنفيذ",
+                    f"الطلب {request_id} • النسخة {agreement.get('version', 1)}",
+                    type_="request", related_id=request_id, priority="high",
+                    action_text="مراجعة الاتفاق", action_route=f"admin:request:{request_id}",
                 )
             elif action == "start_work":
                 agreement = RequestAgreementService(con).get(request_id)
@@ -8803,6 +8892,19 @@ class Handler(SimpleHTTPRequestHandler):
                 areas = list(
                     dict.fromkeys(safe_text(area, 80) for area in areas_value if safe_text(area, 80))
                 )
+                governorates_value = data.get(
+                    "governorates",
+                    provider.get("governorates") or [provider.get("gov", "")],
+                )
+                if not isinstance(governorates_value, list):
+                    return self.send_json({"error": "governorates_must_be_list"}, 400)
+                governorates = list(
+                    dict.fromkeys(
+                        safe_text(item, 80)
+                        for item in governorates_value
+                        if safe_text(item, 80)
+                    )
+                )
                 try:
                     location = normalized_location(
                         data.get("location", provider.get("location"))
@@ -8862,6 +8964,7 @@ class Handler(SimpleHTTPRequestHandler):
                     "commercialExpiry": safe_text(data.get("commercialExpiry", provider.get("commercialExpiry", "")), 40),
                     "licenseExpiry": safe_text(data.get("licenseExpiry", provider.get("licenseExpiry", "")), 40),
                     "gov": safe_text(data.get("gov", provider["gov"]), 80),
+                    "governorates": governorates,
                     "wilayah": safe_text(data.get("wilayah", provider["wilayah"]), 80),
                     "location": location,
                     "areas": areas,
@@ -8902,7 +9005,10 @@ class Handler(SimpleHTTPRequestHandler):
                     provider["documentsData"] = data["documentsData"]
                 try:
                     EntitlementService(con).validate_profile(
-                        provider["id"], services=provider.get("services", []), areas=provider.get("areas", [])
+                        provider["id"],
+                        services=provider.get("services", []),
+                        areas=provider.get("areas", []),
+                        governorates=provider.get("governorates", []),
                     )
                 except DomainError as err:
                     return self.send_domain_error(err)
@@ -8998,11 +9104,12 @@ class Handler(SimpleHTTPRequestHandler):
                 return self.send_json({"ok": True})
             if path == "/api/provider/subscription-request":
                 package_id = str(data.get("packageId", "") or "")
+                requested_plan = PlanCatalog.get(con, package_id)
                 try:
                     result = SubscriptionService(con).request_plan(
                         provider["id"], package_id,
                         coupon_code=str(data.get("couponCode", "") or ""),
-                        payment_required=package_id != "foundation_12m",
+                        payment_required=not bool((requested_plan or {}).get("foundation_once")),
                         actor=f"provider:{provider['id']}",
                     )
                 except DomainError as err:
@@ -9721,7 +9828,9 @@ class Handler(SimpleHTTPRequestHandler):
                         "active": True,
                         "verified": True,
                         "featured": False,
-                        "packageId": "foundation_12m",
+                        "packageId": PlanCatalog.foundation_for(
+                            "company" if payload.get("providerType") == "company" else "individual"
+                        ),
                         "rating": 0,
                         "reviews": 0,
                         "imagePath": payload.get("imagePath", ""),
@@ -9733,7 +9842,10 @@ class Handler(SimpleHTTPRequestHandler):
                         "pinHash": payload.get("pinHash") or "",
                     }
                     services = payload.get("services") if isinstance(payload.get("services"), list) else []
-                    foundation = PlanCatalog.get(con, "foundation_12m", False) or {}
+                    foundation_id = PlanCatalog.foundation_for(
+                        "company" if payload.get("providerType") == "company" else "individual"
+                    )
+                    foundation = PlanCatalog.get(con, foundation_id, False) or {}
                     limits = PlanCatalog.account_limits(
                         foundation,
                         "company" if payload.get("providerType") == "company" else "individual",
@@ -9830,7 +9942,7 @@ class Handler(SimpleHTTPRequestHandler):
                     )
                     try:
                         SubscriptionService(con).request_plan(
-                            provider["id"], "foundation_12m", payment_required=False,
+                            provider["id"], foundation_id, payment_required=False,
                             actor=f"admin:{session['id']}",
                         )
                     except DomainError as err:
@@ -10036,9 +10148,46 @@ class Handler(SimpleHTTPRequestHandler):
                     "deliveryChannel": "email" if email_delivery.get("ok") else "manual",
                 })
             if path == "/api/admin/packages":
-                package_id = str(data.get("id", "") or "")
-                if package_id not in PLAN_IDS:
-                    return self.send_json({"error": "fixed_plan_catalog"}, 409)
+                action = safe_text(data.get("action") or "save", 20)
+                package_id = safe_text(data.get("id"), 120)
+                if action in {"delete", "toggle"} and not package_id:
+                    return self.send_json({"error": "package_id_required"}, 400)
+                if action == "delete":
+                    referenced = int(con.execute(
+                        "SELECT COUNT(*) n FROM subscriptions WHERE package_id=?",
+                        (package_id,),
+                    ).fetchone()["n"]) + int(con.execute(
+                        "SELECT COUNT(*) n FROM providers WHERE package_id=?",
+                        (package_id,),
+                    ).fetchone()["n"])
+                    if referenced or package_id in PLAN_IDS:
+                        con.execute(
+                            "UPDATE packages SET active=0,legacy=1 WHERE id=?",
+                            (package_id,),
+                        )
+                        deleted = False
+                    else:
+                        con.execute("DELETE FROM packages WHERE id=?", (package_id,))
+                        deleted = True
+                    log_audit(con, session, "package.deleted", package_id, f"referenced={referenced}")
+                    return self.send_json({"ok": True, "deleted": deleted, "archived": not deleted})
+                if action == "toggle":
+                    current = con.execute("SELECT active FROM packages WHERE id=?", (package_id,)).fetchone()
+                    if not current:
+                        return self.send_json({"error": "package_not_found"}, 404)
+                    active = strict_bool(data.get("active"), not bool(current["active"]))
+                    con.execute(
+                        "UPDATE packages SET active=?,legacy=CASE WHEN ?=1 THEN 0 ELSE legacy END WHERE id=?",
+                        (int(active), int(active), package_id),
+                    )
+                    saved = con.execute("SELECT * FROM packages WHERE id=?", (package_id,)).fetchone()
+                    log_audit(con, session, "package.toggled", package_id, str(active))
+                    return self.send_json({"ok": True, "package": row_package(saved)})
+                account_scope = safe_text(data.get("accountScope") or "individual", 20)
+                if account_scope not in {"individual", "company", "all"}:
+                    return self.send_json({"error": "invalid_package_scope"}, 400)
+                if not package_id:
+                    package_id = slug(f"pkg_{account_scope}")
                 current_plan = PlanCatalog.get(con, package_id, False) or {}
                 current_individual = PlanCatalog.account_limits(current_plan, "individual")
                 current_company = PlanCatalog.account_limits(current_plan, "company")
@@ -10062,9 +10211,9 @@ class Handler(SimpleHTTPRequestHandler):
                         maximum=50,
                     ),
                     "maxWilayats": bounded_int(
-                        data.get("individualMaxWilayats", current_individual.get("maxWilayats", 5)),
-                        current_individual.get("maxWilayats", 5),
-                        minimum=1,
+                        data.get("individualMaxWilayats", current_individual.get("maxWilayats", 1)),
+                        current_individual.get("maxWilayats", 1),
+                        minimum=0,
                         maximum=100,
                     ),
                 }
@@ -10088,48 +10237,92 @@ class Handler(SimpleHTTPRequestHandler):
                         maximum=50,
                     ),
                     "maxWilayats": bounded_int(
-                        data.get("companyMaxWilayats", current_company.get("maxWilayats", 5)),
-                        current_company.get("maxWilayats", 5),
-                        minimum=1,
+                        data.get("companyMaxWilayats", current_company.get("maxWilayats", 0)),
+                        current_company.get("maxWilayats", 0),
+                        minimum=0,
                         maximum=100,
                     ),
                 }
+                selected_limits = company_limits if account_scope == "company" else individual_limits
+                if account_scope == "all":
+                    selected_limits = {
+                        key: max(individual_limits[key], company_limits[key])
+                        for key in individual_limits
+                    }
+                lead_delay_seconds = bounded_int(
+                    data.get(
+                        "leadDelaySeconds",
+                        current_plan.get("lead_delay_seconds")
+                        or bounded_int(data.get("leadDelayMinutes", 0), 0, minimum=0, maximum=1440) * 60,
+                    ),
+                    0,
+                    minimum=0,
+                    maximum=86400,
+                )
                 entitlements = {
-                    "maxServices": max(individual_limits["maxServices"], company_limits["maxServices"]),
-                    "maxCategories": max(individual_limits["maxCategories"], company_limits["maxCategories"]),
-                    "maxImages": max(individual_limits["maxImages"], company_limits["maxImages"]),
-                    "maxWilayats": max(individual_limits["maxWilayats"], company_limits["maxWilayats"]),
+                    "maxServices": selected_limits["maxServices"],
+                    "maxCategories": selected_limits["maxCategories"],
+                    "maxImages": selected_limits["maxImages"],
+                    "maxWilayats": selected_limits["maxWilayats"],
                     "maxGovernorates": bounded_int(data.get("maxGovernorates", 1), 1, minimum=1, maximum=20),
                     "monthlyResponses": bounded_int(data.get("monthlyResponses", 0), 0, minimum=0, maximum=100000),
-                    "leadDelayMinutes": bounded_int(data.get("leadDelayMinutes", 0), 0, minimum=0, maximum=1440),
+                    "leadDelaySeconds": lead_delay_seconds,
+                    "leadDelayMinutes": (lead_delay_seconds + 59) // 60,
                     "teamMembers": bounded_int(data.get("teamMembers", 1), 1, minimum=1, maximum=100),
                     "branches": bounded_int(data.get("branches", 1), 1, minimum=1, maximum=100),
                     "sharedInbox": strict_bool(data.get("sharedInbox"), False),
                     "advancedReports": strict_bool(data.get("advancedReports"), False),
+                    "accountScope": account_scope,
+                    "communityPackageQuota": bounded_int(data.get("communityPackageQuota", 0), 0, minimum=0, maximum=100),
+                    "communityPackageDays": bounded_int(data.get("communityPackageDays", 30), 30, minimum=1, maximum=365),
                     "accountLimits": {
-                        "individual": individual_limits,
-                        "company": company_limits,
+                        **({"individual": individual_limits} if account_scope in {"individual", "all"} else {}),
+                        **({"company": company_limits} if account_scope in {"company", "all"} else {}),
                     },
                 }
                 con.execute(
-                    """UPDATE packages SET ar=?,en=?,price=?,currency='OMR',duration_days=?,
-                    max_services=?,max_categories=?,max_images=?,max_wilayats=?,max_governorates=?,
-                    monthly_response_limit=?,lead_delay_minutes=?,max_team_members=?,max_branches=?,
-                    shared_inbox=?,advanced_reports=?,badge_ar=?,badge_en=?,entitlements=?,
-                    active=?,legacy=0 WHERE id=?""",
+                    """INSERT INTO packages(
+                    id,ar,en,price,currency,duration_days,featured_boost,
+                    max_services,max_categories,max_images,max_wilayats,max_governorates,
+                    monthly_response_limit,lead_delay_minutes,lead_delay_seconds,max_team_members,max_branches,
+                    shared_inbox,advanced_reports,badge_ar,badge_en,foundation_once,verified_required,
+                    entitlements,active,legacy,account_scope,community_package_quota,community_package_days)
+                    VALUES(?,?,?,?,?,?,0,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0,?,?,?)
+                    ON CONFLICT(id) DO UPDATE SET ar=excluded.ar,en=excluded.en,price=excluded.price,
+                    currency=excluded.currency,duration_days=excluded.duration_days,
+                    max_services=excluded.max_services,max_categories=excluded.max_categories,
+                    max_images=excluded.max_images,max_wilayats=excluded.max_wilayats,
+                    max_governorates=excluded.max_governorates,
+                    monthly_response_limit=excluded.monthly_response_limit,
+                    lead_delay_minutes=excluded.lead_delay_minutes,
+                    lead_delay_seconds=excluded.lead_delay_seconds,
+                    max_team_members=excluded.max_team_members,max_branches=excluded.max_branches,
+                    shared_inbox=excluded.shared_inbox,advanced_reports=excluded.advanced_reports,
+                    badge_ar=excluded.badge_ar,badge_en=excluded.badge_en,
+                    foundation_once=excluded.foundation_once,verified_required=excluded.verified_required,
+                    entitlements=excluded.entitlements,active=excluded.active,legacy=0,
+                    account_scope=excluded.account_scope,
+                    community_package_quota=excluded.community_package_quota,
+                    community_package_days=excluded.community_package_days""",
                     (
+                        package_id,
                         data.get("ar", "باقة"),
                         data.get("en", "Package"),
                         finite_number(data.get("price", 0), 0, minimum=0, maximum=1_000_000),
+                        "OMR",
                         bounded_int(data.get("durationDays", 30), 30, minimum=1, maximum=3650),
                         entitlements["maxServices"], entitlements["maxCategories"], entitlements["maxImages"],
                         entitlements["maxWilayats"], entitlements["maxGovernorates"],
                         entitlements["monthlyResponses"], entitlements["leadDelayMinutes"],
+                        entitlements["leadDelaySeconds"],
                         entitlements["teamMembers"], entitlements["branches"],
                         int(entitlements["sharedInbox"]), int(entitlements["advancedReports"]),
                         str(data.get("badgeAr", "") or "")[:80],
                         str(data.get("badgeEn", "") or "")[:80],
-                        jdump(entitlements), int(strict_bool(data.get("active"), True)), package_id,
+                        int(strict_bool(data.get("foundationOnce"), bool(current_plan.get("foundation_once")))),
+                        int(strict_bool(data.get("verifiedRequired"), bool(current_plan.get("verified_required")))),
+                        jdump(entitlements), int(strict_bool(data.get("active"), True)),
+                        account_scope, entitlements["communityPackageQuota"], entitlements["communityPackageDays"],
                     ),
                 )
                 log_audit(con, session, "package.upserted", package_id, data.get("ar", ""))

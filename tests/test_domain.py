@@ -96,7 +96,7 @@ class KhadamatiDomainTests(unittest.TestCase):
         )
         return provider_id
 
-    def activate(self, provider_id, plan_id="professional_12m", now=None):
+    def activate(self, provider_id, plan_id="individual_gold_6m", now=None):
         return SubscriptionService(self.con, now=now).request_plan(
             provider_id, plan_id, payment_required=False, actor="test"
         )
@@ -142,10 +142,58 @@ class KhadamatiDomainTests(unittest.TestCase):
         )
         return request_id
 
-    def test_exactly_five_active_plans(self):
+    def test_only_current_split_plans_are_active(self):
         rows = self.con.execute("SELECT id FROM packages WHERE active=1 ORDER BY id").fetchall()
         self.assertEqual(sorted(PLAN_IDS), sorted(row["id"] for row in rows))
-        self.assertEqual(5, len(rows))
+        self.assertEqual(len(PLAN_IDS), len(rows))
+
+    def test_split_plan_entitlements_match_release_rules(self):
+        individual_free = PlanCatalog.get(self.con, "individual_free_3m")
+        individual_gold = PlanCatalog.get(self.con, "individual_gold_6m")
+        company_silver = PlanCatalog.get(self.con, "company_silver_6m")
+        company_gold = PlanCatalog.get(self.con, "company_gold_6m")
+        self.assertEqual((90, 2, 1), (
+            individual_free["duration_days"],
+            individual_free["max_services"],
+            individual_free["max_wilayats"],
+        ))
+        self.assertEqual((15, 3, 2, 30, 2, 60), (
+            individual_gold["price"],
+            individual_gold["max_services"],
+            individual_gold["max_categories"],
+            individual_gold["lead_delay_seconds"],
+            individual_gold["community_package_quota"],
+            individual_gold["community_package_days"],
+        ))
+        self.assertEqual((30, 3, 3, 1, 2, 30), (
+            company_silver["price"],
+            company_silver["max_services"],
+            company_silver["max_categories"],
+            company_silver["max_governorates"],
+            company_silver["community_package_quota"],
+            company_silver["community_package_days"],
+        ))
+        self.assertEqual((50, 5, 5, 2, 8, 4, 60), (
+            company_gold["price"],
+            company_gold["max_services"],
+            company_gold["max_categories"],
+            company_gold["max_governorates"],
+            company_gold["max_images"],
+            company_gold["community_package_quota"],
+            company_gold["community_package_days"],
+        ))
+
+    def test_governorate_limit_is_enforced_by_subscription(self):
+        provider_id = self.provider("1001")
+        self.activate(provider_id, "individual_silver_6m")
+        with self.assertRaises(DomainError) as caught:
+            EntitlementService(self.con).validate_profile(
+                provider_id,
+                services=[{"catId": "homecare", "serviceId": "electrician"}],
+                areas=["السيب"],
+                governorates=["مسقط", "الداخلية"],
+            )
+        self.assertEqual("governorate_limit_exceeded", caught.exception.code)
 
     def test_seed_profiles_have_no_predictable_pin(self):
         seed_ids = [item["id"] for item in server.SEED_PROVIDERS]
@@ -160,16 +208,16 @@ class KhadamatiDomainTests(unittest.TestCase):
 
     def test_foundation_is_granted_once(self):
         provider_id = self.provider("101")
-        first = self.activate(provider_id, "foundation_12m")
+        first = self.activate(provider_id, "individual_free_3m")
         self.assertEqual("foundation", first["status"])
         with self.assertRaises(DomainError) as caught:
-            self.activate(provider_id, "foundation_12m")
+            self.activate(provider_id, "individual_free_3m")
         self.assertEqual("foundation_already_used", caught.exception.code)
 
     def test_expiry_grace_renewal_upgrade_and_downgrade(self):
         now = datetime(2026, 7, 18, 12, tzinfo=UTC)
         provider_id = self.provider("102")
-        active = self.activate(provider_id, "basic_6m", now)
+        active = self.activate(provider_id, "individual_silver_6m", now)
         subscription_id = active["subscriptionId"]
         service = SubscriptionService(self.con, now=now)
 
@@ -189,22 +237,22 @@ class KhadamatiDomainTests(unittest.TestCase):
             ((now + timedelta(days=90)).date().isoformat(), subscription_id),
         )
         service.synchronize_provider(provider_id)
-        upgrade = service.request_plan(provider_id, "professional_12m", actor="test")
+        upgrade = service.request_plan(provider_id, "individual_gold_6m", actor="test")
         self.assertEqual("pending_payment", upgrade["status"])
         self.assertGreater(upgrade["amount"], 0)
         payment = PaymentAdapter(self.con).create_intent(upgrade["subscriptionId"], provider_id)
         PaymentAdapter(self.con, now=now).confirm_manual(payment["paymentId"], actor="test-admin")
         current = SubscriptionService(self.con, now=now).latest(provider_id)
-        self.assertEqual("professional_12m", current["package_id"])
+        self.assertEqual("individual_gold_6m", current["package_id"])
         downgrade = SubscriptionService(self.con, now=now).request_plan(
-            provider_id, "basic_6m", actor="test"
+            provider_id, "individual_silver_6m", actor="test"
         )
         self.assertEqual("next_renewal", downgrade["effective"])
-        self.assertEqual("basic_6m", downgrade["renewalPackageId"])
+        self.assertEqual("individual_silver_6m", downgrade["renewalPackageId"])
 
     def test_payment_amount_and_webhook_are_server_verified(self):
         provider_id = self.provider("103")
-        pending = SubscriptionService(self.con).request_plan(provider_id, "basic_12m")
+        pending = SubscriptionService(self.con).request_plan(provider_id, "individual_silver_6m")
         adapter = PaymentAdapter(self.con)
         with self.assertRaises(DomainError) as caught:
             adapter.create_intent(pending["subscriptionId"], provider_id, client_amount=0.1)
@@ -240,10 +288,10 @@ class KhadamatiDomainTests(unittest.TestCase):
         exact_ids = []
         for index in range(201, 212):
             provider_id = self.provider(str(index))
-            self.activate(provider_id, "professional_12m", now)
+            self.activate(provider_id, "individual_gold_6m", now)
             exact_ids.append(provider_id)
         wrong_id = self.provider("299", cat="tech", service="pc")
-        self.activate(wrong_id, "professional_12m", now)
+        self.activate(wrong_id, "individual_gold_6m", now)
         user_id = "domain-user-1"
         request_id = "domain-request-1"
         self.con.execute(
@@ -270,7 +318,7 @@ class KhadamatiDomainTests(unittest.TestCase):
     def test_plan_delay_starts_only_when_subscriptions_are_enabled(self):
         now = datetime(2026, 7, 18, 12, tzinfo=UTC)
         provider_id = self.provider("301")
-        self.activate(provider_id, "foundation_12m", now)
+        self.activate(provider_id, "individual_free_3m", now)
         user_id = "domain-user-delay"
         self.con.execute(
             "INSERT OR REPLACE INTO app_users(id,phone,name,pin_hash) VALUES(?,?,?,?)",
@@ -361,19 +409,25 @@ class KhadamatiDomainTests(unittest.TestCase):
 
     def test_individual_provider_respects_account_specific_plan_limits(self):
         provider_id = self.provider("105")
-        self.activate(provider_id, "basic_12m")
+        self.activate(provider_id, "individual_silver_6m")
         entitlement = EntitlementService(self.con)
         valid = entitlement.validate_profile(
             provider_id,
             services=[
                 {"catId": "cleaning", "serviceId": "home_cleaning"},
                 {"catId": "cleaning", "serviceId": "carpet_cleaning"},
-                {"catId": "cleaning", "serviceId": "sofa_cleaning"},
             ],
-            areas=["السيب", "بوشر"],
+            areas=["السيب"],
         )
-        self.assertEqual(5, valid["maxServices"])
+        self.assertEqual(2, valid["maxServices"])
         self.assertEqual(1, valid["maxCategories"])
+        with self.assertRaises(DomainError) as wilayah_error:
+            entitlement.validate_profile(
+                provider_id,
+                services=[{"catId": "cleaning", "serviceId": "home_cleaning"}],
+                areas=["السيب", "بوشر"],
+            )
+        self.assertEqual("wilayah_limit_exceeded", wilayah_error.exception.code)
         with self.assertRaises(DomainError) as caught:
             entitlement.validate_profile(
                 provider_id,
@@ -391,12 +445,12 @@ class KhadamatiDomainTests(unittest.TestCase):
         self.con.execute(
             "UPDATE providers SET provider_type='company' WHERE id=?", (company_id,)
         )
-        self.activate(individual_id, "foundation_12m")
-        self.activate(company_id, "foundation_12m")
+        self.activate(individual_id, "individual_free_3m")
+        self.activate(company_id, "company_free_3m")
         individual = EntitlementService(self.con).profile_limits(individual_id)
         company = EntitlementService(self.con).profile_limits(company_id)
         self.assertEqual(
-            (3, 1, 5),
+            (2, 1, 2),
             (
                 individual["maxServices"],
                 individual["maxCategories"],
@@ -404,13 +458,14 @@ class KhadamatiDomainTests(unittest.TestCase):
             ),
         )
         self.assertEqual(
-            (6, 3, 10),
+            (3, 3, 2),
             (
                 company["maxServices"],
                 company["maxCategories"],
                 company["maxImages"],
             ),
         )
+        self.assertEqual(0, company["maxWilayats"])
 
     def test_provider_persistence_rejects_a_second_individual_category(self):
         provider_id = self.provider("1053")
@@ -449,15 +504,15 @@ class KhadamatiDomainTests(unittest.TestCase):
         self.assertEqual(2, len(saved["services"]))
 
     def test_plan_seed_preserves_admin_account_limit_edits(self):
-        plan = PlanCatalog.get(self.con, "basic_12m", False)
+        plan = PlanCatalog.get(self.con, "individual_silver_6m", False)
         entitlements = plan["entitlements"]
         entitlements["accountLimits"]["individual"]["maxServices"] = 7
         self.con.execute(
             "UPDATE packages SET entitlements=? WHERE id=?",
-            (json.dumps(entitlements, ensure_ascii=False), "basic_12m"),
+            (json.dumps(entitlements, ensure_ascii=False), "individual_silver_6m"),
         )
         PlanCatalog.seed(self.con)
-        refreshed = PlanCatalog.get(self.con, "basic_12m", False)
+        refreshed = PlanCatalog.get(self.con, "individual_silver_6m", False)
         self.assertEqual(
             7,
             refreshed["entitlements"]["accountLimits"]["individual"]["maxServices"],
@@ -466,27 +521,27 @@ class KhadamatiDomainTests(unittest.TestCase):
     def test_business_plan_allows_multiple_services_and_categories_within_limit(self):
         provider_id = self.provider("106")
         self.con.execute("UPDATE providers SET provider_type='company' WHERE id=?", (provider_id,))
-        self.activate(provider_id, "business_12m")
+        self.activate(provider_id, "company_gold_6m")
         services = [
             {"catId": f"category-{index % 5}", "serviceId": f"service-{index}"}
-            for index in range(20)
+            for index in range(5)
         ]
         limits = EntitlementService(self.con).validate_profile(
             provider_id, services=services, areas=["السيب", "بوشر"]
         )
-        self.assertEqual(20, limits["maxServices"])
+        self.assertEqual(5, limits["maxServices"])
         self.assertEqual(5, limits["maxCategories"])
         with self.assertRaises(DomainError) as caught:
             EntitlementService(self.con).validate_profile(
                 provider_id,
-                services=services + [{"catId": "category-6", "serviceId": "service-21"}],
+                services=services + [{"catId": "category-6", "serviceId": "service-6"}],
                 areas=["السيب"],
             )
         self.assertEqual("provider_category_limit", caught.exception.code)
 
     def test_request_eligibility_requires_approved_available_provider(self):
         provider_id = self.provider("107")
-        self.activate(provider_id, "professional_12m")
+        self.activate(provider_id, "individual_gold_6m")
         service = EntitlementService(self.con)
         self.assertTrue(service.can_receive(provider_id)[0])
         self.con.execute("UPDATE providers SET verified=0 WHERE id=?", (provider_id,))
@@ -528,7 +583,7 @@ class KhadamatiDomainTests(unittest.TestCase):
 
     def test_map_location_is_exact_only_when_provider_allows_visibility(self):
         provider_id = self.provider("108")
-        self.activate(provider_id, "professional_12m")
+        self.activate(provider_id, "individual_gold_6m")
         self.con.execute(
             "UPDATE providers SET latitude=?,longitude=?,map_visible=1 WHERE id=?",
             (23.612345, 58.241234, provider_id),
@@ -543,7 +598,7 @@ class KhadamatiDomainTests(unittest.TestCase):
 
     def test_service_availability_excludes_unapproved_and_busy_providers(self):
         provider_id = self.provider("109")
-        self.activate(provider_id, "professional_12m")
+        self.activate(provider_id, "individual_gold_6m")
         snapshot = server.service_availability_snapshot(self.con)
         self.assertGreater(snapshot["services"].get("homecare|electrician", 0), 0)
         self.con.execute("UPDATE providers SET status='busy' WHERE id=?", (provider_id,))
@@ -689,9 +744,12 @@ class KhadamatiDomainTests(unittest.TestCase):
                 "notes": "فحص وتنفيذ",
             },
         )
-        service.confirm(request_id, "user", user_id, agreement["version"])
         pending = service.get(request_id)
         self.assertEqual("pending_confirmation", pending["status"])
+        self.assertTrue(pending["userConfirmed"])
+        with self.assertRaises(DomainError) as sender_attempt:
+            service.confirm(request_id, "user", user_id, agreement["version"])
+        self.assertEqual("agreement_sender_cannot_confirm", sender_attempt.exception.code)
         confirmed = service.confirm(
             request_id, "provider", provider_id, agreement["version"]
         )

@@ -14,7 +14,7 @@ import math
 import sqlite3
 from typing import Any
 
-from khadamati_domain import DomainError
+from khadamati_domain import DomainError, PlanCatalog
 
 
 LISTING_KINDS = {"wanted", "package"}
@@ -44,18 +44,24 @@ DEFAULT_SETTINGS = {
     "communityFirstPackageFreeDays": 30,
     "communityRenewalFee": 2.0,
     "communityPlanQuotas": {
-        "foundation_12m": 1,
-        "basic_6m": 1,
-        "basic_12m": 2,
-        "professional_12m": 4,
-        "business_12m": 8,
+        "individual_free_3m": 1,
+        "individual_silver_6m": 1,
+        "individual_gold_6m": 2,
+        "individual_elite_6m": 4,
+        "company_free_3m": 2,
+        "company_silver_6m": 2,
+        "company_gold_6m": 4,
+        "company_elite_6m": 8,
     },
     "communityPlanFreeMonths": {
-        "foundation_12m": 1,
-        "basic_6m": 1,
-        "basic_12m": 1,
-        "professional_12m": 2,
-        "business_12m": 3,
+        "individual_free_3m": 3,
+        "individual_silver_6m": 6,
+        "individual_gold_6m": 6,
+        "individual_elite_6m": 6,
+        "company_free_3m": 3,
+        "company_silver_6m": 6,
+        "company_gold_6m": 6,
+        "company_elite_6m": 6,
     },
 }
 
@@ -667,6 +673,7 @@ class CommunityService:
             raise DomainError("service_not_found", 400)
         owner_kind = "user"
         provider = None
+        package_rules: dict[str, int] = {}
         if actor_kind == "provider":
             provider = self.con.execute(
                 """SELECT * FROM providers WHERE id=? AND active=1 AND verified=1
@@ -686,8 +693,9 @@ class CommunityService:
                 for item in services
             ):
                 raise DomainError("community_service_outside_provider_profile", 403)
+            package_rules = self._package_rules(provider)
             if not existing:
-                self._check_package_quota(provider)
+                self._check_package_quota(provider, package_rules)
         budget_min = _number(payload.get("budgetMin"))
         budget_max = _number(payload.get("budgetMax"))
         if budget_max and budget_min > budget_max:
@@ -720,10 +728,13 @@ class CommunityService:
         default_days = (
             settings["communityWantedExpiryDays"]
             if listing_kind == "wanted"
-            else settings["communityPackageExpiryDays"]
+            else package_rules.get("days", settings["communityPackageExpiryDays"])
         )
         duration_days = _integer(
-            payload.get("listingDays"), default_days, minimum=1, maximum=max_days
+            payload.get("listingDays") if listing_kind == "wanted" else default_days,
+            default_days,
+            minimum=1,
+            maximum=max_days,
         )
         publish = _bool(payload.get("publish"), True)
         if not publish:
@@ -740,7 +751,11 @@ class CommunityService:
             and publish
         ):
             status = "pending_payment"
-        expires_at = _iso(self.now + timedelta(days=duration_days)) if publish else ""
+        expires_at = (
+            existing["expires_at"]
+            if existing and existing["expires_at"]
+            else (_iso(self.now + timedelta(days=duration_days)) if publish else "")
+        )
         published_at = (
             existing["published_at"]
             if existing and existing["published_at"]
@@ -803,10 +818,7 @@ class CommunityService:
             else:
                 billing_status = "included"
             if historic_count == 0:
-                expires_at = _iso(
-                    self.now
-                    + timedelta(days=settings["communityFirstPackageFreeDays"])
-                )
+                expires_at = _iso(self.now + timedelta(days=duration_days))
         self.con.execute(
             """
             INSERT INTO community_listings(
@@ -891,6 +903,16 @@ class CommunityService:
         elif action == "renew":
             settings = community_settings(self.con)
             fee = settings["communityRenewalFee"]
+            renewal_days = settings["communityWantedExpiryDays"]
+            if row["kind"] == "package":
+                provider = self.con.execute(
+                    "SELECT * FROM providers WHERE id=?", (actor_id,)
+                ).fetchone()
+                if not provider:
+                    raise DomainError("provider_not_found", 404)
+                rules = self._package_rules(provider)
+                self._check_package_quota(provider, rules)
+                renewal_days = rules["days"]
             status = "pending_payment" if fee > 0 else (
                 "pending_review" if settings["communityModerationRequired"] else "active"
             )
@@ -902,7 +924,7 @@ class CommunityService:
                     "pending_payment" if fee > 0 else "included",
                     _iso(
                         self.now
-                        + timedelta(days=settings["communityPackageExpiryDays"])
+                        + timedelta(days=renewal_days)
                     ),
                     listing_id,
                 ),
@@ -1255,22 +1277,51 @@ class CommunityService:
             ),
         }
 
-    def _check_package_quota(self, provider: sqlite3.Row) -> None:
+    def _package_rules(self, provider: sqlite3.Row) -> dict[str, int]:
         settings = community_settings(self.con)
-        package_id = provider["package_id"] or "foundation_12m"
-        quota = _integer(
-            settings["communityPlanQuotas"].get(package_id, 1),
-            1,
-            minimum=0,
-            maximum=100,
+        package_id = provider["package_id"] or PlanCatalog.foundation_for(
+            "company" if provider["provider_type"] == "company" else "individual"
         )
+        try:
+            plan = PlanCatalog.get(self.con, package_id, False) or {}
+        except sqlite3.OperationalError as exc:
+            if "no such table: packages" not in str(exc).lower():
+                raise
+            # Community can be initialized before the subscription migration.
+            # Platform settings remain the compatibility source until plans exist.
+            plan = {}
+        entitlements = plan.get("entitlements") if isinstance(plan.get("entitlements"), dict) else {}
+        return {
+            "quota": _integer(
+                plan.get("community_package_quota")
+                or entitlements.get("communityPackageQuota")
+                or settings["communityPlanQuotas"].get(package_id, 0),
+                0,
+                minimum=0,
+                maximum=100,
+            ),
+            "days": _integer(
+                plan.get("community_package_days")
+                or entitlements.get("communityPackageDays")
+                or settings["communityPackageExpiryDays"],
+                30,
+                minimum=1,
+                maximum=365,
+            ),
+        }
+
+    def _check_package_quota(self, provider: sqlite3.Row, rules: dict[str, int] | None = None) -> None:
+        package_id = provider["package_id"] or PlanCatalog.foundation_for(
+            "company" if provider["provider_type"] == "company" else "individual"
+        )
+        quota = int((rules or self._package_rules(provider))["quota"])
         used = int(
             self.con.execute(
                 """SELECT COUNT(*) n FROM community_listings
                 WHERE owner_id=? AND kind='package'
-                  AND created_at>=datetime('now','start of month')
-                  AND status NOT IN ('deleted','rejected')""",
-                (provider["id"],),
+                  AND status NOT IN ('deleted','rejected','expired','closed','archived')
+                  AND (COALESCE(expires_at,'')='' OR expires_at>?)""",
+                (provider["id"], _iso(self.now)),
             ).fetchone()["n"]
         )
         if used >= quota:
