@@ -7,8 +7,10 @@ import unittest
 
 from khadamati_community import (
     CommunityService,
+    community_settings,
     install_community_schema,
     run_community_maintenance,
+    save_community_settings,
 )
 from khadamati_domain import DomainError
 
@@ -359,6 +361,71 @@ class CommunityServiceTests(unittest.TestCase):
                 offer_id="offer-disabled",
             )
         self.assertEqual("community_offers_disabled", offers_disabled.exception.code)
+
+    def test_featured_plan_schedule_is_normalized_and_persisted(self):
+        saved = save_community_settings(
+            self.con,
+            {
+                "featuredPackagesEnabled": True,
+                "featuredPackagePlanExposure": {
+                    "professional_12m": {
+                        "daysPerWeek": 12,
+                        "weight": 0,
+                        "seconds": 1,
+                    }
+                },
+            },
+        )
+        rule = saved["featuredPackagePlanExposure"]["professional_12m"]
+        self.assertEqual(
+            {"daysPerWeek": 7, "weight": 1, "seconds": 2}, rule
+        )
+        self.assertEqual(rule, community_settings(self.con)["featuredPackagePlanExposure"]["professional_12m"])
+
+    def test_admin_manages_listing_and_feature_schedule_with_audit_event(self):
+        listing = self.service.save(
+            self.provider,
+            self.package_payload(),
+            listing_id="package-managed",
+        )
+        managed = self.service.manage_listing(
+            {"kind": "admin", "id": "admin-1"},
+            listing["id"],
+            {
+                "title": "باقة كهرباء مميزة",
+                "description": "خدمة منظمة بموعد وسعر واضحين.",
+                "status": "active",
+                "featured": True,
+                "featureSchedule": {
+                    "startAt": self.now.isoformat(),
+                    "endAt": (self.now + timedelta(days=14)).isoformat(),
+                    "daysPerWeek": 4,
+                    "weight": 6,
+                    "seconds": 5,
+                },
+                "note": "اعتمدتها الإدارة",
+            },
+        )
+        self.assertTrue(managed["featured"])
+        self.assertEqual("باقة كهرباء مميزة", managed["title"])
+        self.assertEqual(4, managed["details"]["featureSchedule"]["daysPerWeek"])
+        event = self.con.execute(
+            "SELECT action FROM community_events WHERE listing_id=? ORDER BY created_at DESC, id DESC LIMIT 1",
+            (listing["id"],),
+        ).fetchone()
+        self.assertEqual("listing_managed", event["action"])
+        with self.assertRaises(DomainError) as invalid:
+            self.service.manage_listing(
+                {"kind": "admin", "id": "admin-1"},
+                listing["id"],
+                {
+                    "featureSchedule": {
+                        "startAt": (self.now + timedelta(days=2)).isoformat(),
+                        "endAt": self.now.isoformat(),
+                    }
+                },
+            )
+        self.assertEqual("invalid_feature_schedule", invalid.exception.code)
 
 
 if __name__ == "__main__":

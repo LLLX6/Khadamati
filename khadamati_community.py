@@ -32,6 +32,16 @@ LISTING_STATUSES = {
 }
 BILLING_PERIODS = {"one_time", "daily", "monthly", "yearly"}
 CONTACT_CHANNELS = {"app", "whatsapp"}
+DEFAULT_FEATURED_PLAN_EXPOSURE = {
+    "individual_free_3m": {"daysPerWeek": 1, "weight": 1, "seconds": 4},
+    "individual_silver_6m": {"daysPerWeek": 2, "weight": 2, "seconds": 3},
+    "individual_gold_6m": {"daysPerWeek": 4, "weight": 3, "seconds": 3},
+    "individual_elite_6m": {"daysPerWeek": 7, "weight": 4, "seconds": 2},
+    "company_free_3m": {"daysPerWeek": 1, "weight": 1, "seconds": 4},
+    "company_silver_6m": {"daysPerWeek": 2, "weight": 2, "seconds": 3},
+    "company_gold_6m": {"daysPerWeek": 4, "weight": 3, "seconds": 3},
+    "company_elite_6m": {"daysPerWeek": 7, "weight": 4, "seconds": 2},
+}
 DEFAULT_SETTINGS = {
     "communityEnabled": True,
     "communityPackagesEnabled": True,
@@ -41,6 +51,7 @@ DEFAULT_SETTINGS = {
     "communityModerationRequired": False,
     "featuredPackagesEnabled": True,
     "featuredPackageIntervalSeconds": 3,
+    "featuredPackagePlanExposure": DEFAULT_FEATURED_PLAN_EXPOSURE,
     "communityWantedExpiryDays": 30,
     "communityPackageExpiryDays": 30,
     "communityFirstPackageFreeDays": 30,
@@ -66,6 +77,33 @@ DEFAULT_SETTINGS = {
         "company_elite_6m": 6,
     },
 }
+
+
+def _featured_plan_exposure(value: Any) -> dict[str, dict[str, int]]:
+    raw = _json_load(value, {})
+    if not isinstance(raw, dict):
+        raw = {}
+    plan_ids = set(DEFAULT_FEATURED_PLAN_EXPOSURE) | {
+        _clean(plan_id, 80) for plan_id in raw if _clean(plan_id, 80)
+    }
+    result: dict[str, dict[str, int]] = {}
+    for plan_id in sorted(plan_ids):
+        defaults = DEFAULT_FEATURED_PLAN_EXPOSURE.get(
+            plan_id, {"daysPerWeek": 1, "weight": 1, "seconds": 3}
+        )
+        item = raw.get(plan_id) if isinstance(raw.get(plan_id), dict) else {}
+        result[plan_id] = {
+            "daysPerWeek": _integer(
+                item.get("daysPerWeek"), defaults["daysPerWeek"], minimum=0, maximum=7
+            ),
+            "weight": _integer(
+                item.get("weight"), defaults["weight"], minimum=1, maximum=20
+            ),
+            "seconds": _integer(
+                item.get("seconds"), defaults["seconds"], minimum=2, maximum=30
+            ),
+        }
+    return result
 
 
 def install_community_schema(con: sqlite3.Connection) -> None:
@@ -271,6 +309,9 @@ def community_settings(con: sqlite3.Connection) -> dict[str, Any]:
     result["featuredPackageIntervalSeconds"] = _integer(
         result.get("featuredPackageIntervalSeconds"), 3, minimum=2, maximum=30
     )
+    result["featuredPackagePlanExposure"] = _featured_plan_exposure(
+        result.get("featuredPackagePlanExposure")
+    )
     result["communityWantedExpiryDays"] = _integer(
         result.get("communityWantedExpiryDays"), 30, minimum=1, maximum=90
     )
@@ -379,6 +420,10 @@ def save_community_settings(
                 _clean(plan_id, 80): _integer(value, 0, minimum=0, maximum=maximum)
                 for plan_id, value in payload[key].items()
             }
+    if isinstance(payload.get("featuredPackagePlanExposure"), dict):
+        current["featuredPackagePlanExposure"] = _featured_plan_exposure(
+            payload["featuredPackagePlanExposure"]
+        )
     platform.update(current)
     con.execute(
         """INSERT INTO settings(key,value) VALUES('platform',?)
@@ -499,6 +544,9 @@ class CommunityService:
             key: settings[key]
             for key in (
                 "communityEnabled",
+                "featuredPackagesEnabled",
+                "featuredPackageIntervalSeconds",
+                "featuredPackagePlanExposure",
                 "communityModerationRequired",
                 "communityWantedExpiryDays",
                 "communityPackageExpiryDays",
@@ -734,6 +782,7 @@ class CommunityService:
         ] if isinstance(payload.get("contactChannels", ["app"]), list) else ["app"]
         if "app" not in channels:
             channels.insert(0, "app")
+        existing_details = _json_load(existing["details"], {}) if existing else {}
         details = payload.get("details") if isinstance(payload.get("details"), dict) else {}
         details = {
             "inclusions": [
@@ -744,6 +793,10 @@ class CommunityService:
             "commitment": _clean(details.get("commitment"), 300),
             "fulfillment": _clean(details.get("fulfillment"), 160),
         }
+        if isinstance(existing_details.get("featureSchedule"), dict):
+            details["featureSchedule"] = existing_details["featureSchedule"]
+        if existing_details.get("demoSeed") is True:
+            details["demoSeed"] = True
         settings = community_settings(self.con)
         max_days = 30 if listing_kind == "wanted" else 365
         default_days = (
@@ -1261,6 +1314,107 @@ class CommunityService:
             self._get(listing_id), session=session, include_admin=True
         )
 
+    def manage_listing(
+        self,
+        session: dict[str, Any],
+        listing_id: str,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Update an existing listing through the audited admin workflow."""
+        row = self._get(listing_id)
+        title = _clean(payload.get("title", row["title"]), 140)
+        description = _clean(payload.get("description", row["description"]), 1200)
+        if len(title) < 3:
+            raise DomainError("community_title_required", 400)
+        if len(description) < 3:
+            raise DomainError("community_description_required", 400)
+
+        status = _clean(payload.get("status", row["status"]), 30)
+        allowed_statuses = {
+            "draft",
+            "pending_review",
+            "pending_payment",
+            "active",
+            "paused",
+            "closed",
+            "expired",
+            "rejected",
+            "archived",
+        }
+        if status not in allowed_statuses:
+            raise DomainError("invalid_community_listing_status", 400)
+
+        expires_at = row["expires_at"] or ""
+        if "expiresAt" in payload:
+            parsed_expiry = _parse_datetime(payload.get("expiresAt"))
+            expires_at = _iso(parsed_expiry)
+
+        details = _json_load(row["details"], {})
+        featured = bool(row["featured"])
+        if row["kind"] == "package":
+            featured = _bool(payload.get("featured"), featured)
+            raw_schedule = (
+                payload.get("featureSchedule")
+                if isinstance(payload.get("featureSchedule"), dict)
+                else details.get("featureSchedule", {})
+            )
+            start_at = _parse_datetime(raw_schedule.get("startAt"))
+            end_at = _parse_datetime(raw_schedule.get("endAt"))
+            if start_at and end_at and end_at <= start_at:
+                raise DomainError("invalid_feature_schedule", 400)
+            details["featureSchedule"] = {
+                "startAt": _iso(start_at),
+                "endAt": _iso(end_at),
+                "daysPerWeek": _integer(
+                    raw_schedule.get("daysPerWeek"), 0, minimum=0, maximum=7
+                ),
+                "weight": _integer(
+                    raw_schedule.get("weight"), 0, minimum=0, maximum=20
+                ),
+                "seconds": _integer(
+                    raw_schedule.get("seconds"), 0, minimum=0, maximum=30
+                ),
+            }
+        else:
+            featured = False
+
+        self.con.execute(
+            """UPDATE community_listings
+            SET title=?,description=?,status=?,featured=?,expires_at=?,details=?,
+              moderation_note=?,
+              published_at=CASE WHEN ?='active' AND COALESCE(published_at,'')=''
+                THEN ? ELSE published_at END,
+              updated_at=CURRENT_TIMESTAMP
+            WHERE id=?""",
+            (
+                title,
+                description,
+                status,
+                1 if featured else 0,
+                expires_at,
+                _json_dump(details),
+                _clean(payload.get("note"), 500),
+                status,
+                _iso(self.now),
+                listing_id,
+            ),
+        )
+        self._event(
+            listing_id,
+            "admin",
+            session.get("id", ""),
+            "listing_managed",
+            {
+                "status": status,
+                "featured": featured,
+                "expiresAt": expires_at,
+                "featureSchedule": details.get("featureSchedule", {}),
+            },
+        )
+        return self.serialize(
+            self._get(listing_id), session=session, include_admin=True
+        )
+
     def resolve_report(
         self, session: dict[str, Any], report_id: str, resolution: str
     ) -> None:
@@ -1372,7 +1526,7 @@ class CommunityService:
             }
         row = self.con.execute(
             """SELECT id,name,image_path,card_image,gov,wilayah,verified,rating,
-            provider_type,phone FROM providers WHERE id=?""",
+            provider_type,phone,package_id FROM providers WHERE id=?""",
             (listing["owner_id"],),
         ).fetchone()
         if not row:
@@ -1386,6 +1540,9 @@ class CommunityService:
             "verified": bool(row["verified"]),
             "rating": float(row["rating"] or 0),
             "providerType": row["provider_type"] or "individual",
+            "packageId": PlanCatalog.compatible_id(
+                row["package_id"], row["provider_type"] or "individual"
+            ),
             "whatsappAvailable": bool(
                 row["phone"]
                 and "whatsapp" in _json_load(

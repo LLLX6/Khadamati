@@ -120,7 +120,7 @@ def environment_flag(name, default=False):
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
-APP_RELEASE = os.environ.get("KHADAMATI_RELEASE", "v1.1.4").strip() or "v1.1.4"
+APP_RELEASE = os.environ.get("KHADAMATI_RELEASE", "v1.1.5").strip() or "v1.1.5"
 TRUST_MIGRATION_KEY = "TRUST_SCHEMA_V1"
 QUALITY_MIGRATION_KEY = "QUALITY_SCHEMA_V1"
 PLATFORM_MIGRATION_KEY = "PLATFORM_SCHEMA_V1"
@@ -304,6 +304,11 @@ def normalize_phone(raw):
     if len(phone) == 8:
         phone = "968" + phone
     return phone
+
+
+SUPPORT_WHATSAPP = normalize_phone(os.environ.get("KHADAMATI_SUPPORT_WHATSAPP", ""))
+if SUPPORT_WHATSAPP and not re.fullmatch(r"968\d{8}", SUPPORT_WHATSAPP):
+    SUPPORT_WHATSAPP = ""
 
 
 def safe_text(value, limit=240):
@@ -707,6 +712,187 @@ def trusted_sql_identifier(value):
     if not SQL_IDENTIFIER_RE.fullmatch(value):
         raise ValueError("invalid_sql_identifier")
     return f'"{value}"'
+
+
+DEMO_ID_PREFIX = "demo_"
+
+
+def demo_content_counts(con):
+    return {
+        "listings": int(
+            con.execute(
+                "SELECT COUNT(*) n FROM community_listings WHERE id LIKE ?",
+                (f"{DEMO_ID_PREFIX}%",),
+            ).fetchone()["n"]
+        ),
+        "requests": int(
+            con.execute(
+                "SELECT COUNT(*) n FROM customer_requests WHERE id LIKE ?",
+                (f"{DEMO_ID_PREFIX}%",),
+            ).fetchone()["n"]
+        ),
+        "notifications": int(
+            con.execute(
+                "SELECT COUNT(*) n FROM app_notifications WHERE id LIKE ?",
+                (f"{DEMO_ID_PREFIX}%",),
+            ).fetchone()["n"]
+        ),
+    }
+
+
+def seed_isolated_demo_content(con):
+    """Create deterministic fixtures only when sample data is explicitly enabled."""
+    now = datetime.now(UTC)
+    expires_30 = (now + timedelta(days=30)).isoformat()
+    expires_60 = (now + timedelta(days=60)).isoformat()
+    con.execute(
+        """INSERT OR IGNORE INTO app_users(
+        id,phone,name,pin_hash,email,age,nationality,gov,wilayah,status)
+        VALUES(?,?,?,?,?,?,?,?,?,'active')""",
+        (
+            "demo_user_1",
+            "96890000001",
+            "مستخدم تجريبي",
+            "",
+            "",
+            30,
+            "عماني",
+            "مسقط",
+            "السيب",
+        ),
+    )
+    demo_listings = [
+        (
+            "demo_community_package_1", "package", "provider", "p1",
+            "صيانة كهربائية منزلية",
+            "فحص الأعطال الكهربائية وتنفيذ الإصلاحات المنزلية بموعد واضح.",
+            "homecare", "homecare|electrician", 0, 0, 18, "one_time",
+            "خلال يوم", "مسقط", "السيب",
+            jdump(
+                {
+                    "demoSeed": True,
+                    "inclusions": ["فحص أولي", "تقرير مختصر"],
+                    "commitment": "تجهيز تجريبي قابل للمسح من الإدارة.",
+                    "featureSchedule": {
+                        "startAt": "", "endAt": "", "daysPerWeek": 4,
+                        "weight": 3, "seconds": 3,
+                    },
+                }
+            ),
+            expires_60, 1,
+        ),
+        (
+            "demo_community_package_2", "package", "provider", "p2",
+            "تنظيف منزل متكامل",
+            "تنظيف منظم للمنازل مع تحديد النطاق والوقت قبل بدء الخدمة.",
+            "cleaning", "cleaning|home_clean", 0, 0, 35, "one_time",
+            "4 ساعات", "مسقط", "بوشر",
+            jdump(
+                {
+                    "demoSeed": True,
+                    "inclusions": ["مواد أساسية", "فريق منظم"],
+                    "commitment": "تجهيز تجريبي قابل للمسح من الإدارة.",
+                    "featureSchedule": {
+                        "startAt": "", "endAt": "", "daysPerWeek": 2,
+                        "weight": 2, "seconds": 3,
+                    },
+                }
+            ),
+            expires_30, 1,
+        ),
+        (
+            "demo_community_wanted_1", "wanted", "user", "demo_user_1",
+            "إصلاح عطل كهربائي",
+            "أحتاج فحص مفتاح كهربائي لا يعمل في غرفة المعيشة.",
+            "homecare", "homecare|electrician", 8, 20, 0, "one_time",
+            "خلال يومين", "مسقط", "السيب",
+            jdump({"demoSeed": True, "inclusions": [], "commitment": ""}),
+            expires_30, 0,
+        ),
+    ]
+    for item in demo_listings:
+        con.execute(
+            """INSERT OR IGNORE INTO community_listings(
+            id,kind,owner_kind,owner_id,title,description,category_id,
+            service_value,budget_min,budget_max,price_amount,billing_period,
+            duration_text,gov,wilayah,details,contact_channels,status,
+            billing_status,expires_at,published_at,featured,idempotency_key)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'active','included',?,?,?,?)""",
+            (
+                *item[:16],
+                jdump(["app"]),
+                item[16],
+                now.isoformat(),
+                item[17],
+                item[0],
+            ),
+        )
+    con.execute(
+        """INSERT OR IGNORE INTO customer_requests(
+        id,user_id,customer_name,phone,service_value,service_name,gov,wilayah,
+        urgency,schedule_type,budget_min,budget_max,location_text,note,images,
+        status,matching_provider_ids,offers,messages,created_at,updated_at)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'matching',?,?,?,?,?)""",
+        (
+            "demo_request_1", "demo_user_1", "مستخدم تجريبي", "96890000001",
+            "homecare|electrician", "كهربائي", "مسقط", "السيب", "normal",
+            "flexible", 8, 20, "السيب", "طلب تجريبي لفحص رحلة المطابقة.",
+            "[]", jdump(["p1"]), "[]", "[]", now.isoformat(), now.isoformat(),
+        ),
+    )
+    con.execute(
+        """INSERT OR IGNORE INTO complaints(
+        id,provider_id,customer_name,phone,reason,detail,status,priority)
+        VALUES(?,?,?,?,?,?,'open','normal')""",
+        (
+            "demo_complaint_1", "p2", "مستخدم تجريبي", "", "demo_review",
+            "بلاغ تجريبي لاختبار مسار الإدارة ويمكن مسحه بأمان.",
+        ),
+    )
+    for notification in (
+        (
+            "demo_notification_admin_1", "admin", "", "community",
+            "طلب تجريبي يحتاج متابعة",
+            "تحقق من المطابقة والعروض في ساحة الطلبات.",
+            "demo_request_1", "normal", "فتح الطلب",
+            "admin:community:demo_request_1",
+        ),
+        (
+            "demo_notification_provider_1", "provider", "p1", "request",
+            "فرصة تجريبية جديدة",
+            "وصل طلب مطابق لخدمة الكهرباء في السيب.",
+            "demo_request_1", "normal", "فتح الطلب",
+            "provider:request:demo_request_1",
+        ),
+    ):
+        con.execute(
+            """INSERT OR IGNORE INTO app_notifications(
+            id,target_kind,target_id,type,title,message,related_id,priority,
+            action_text,action_route) VALUES(?,?,?,?,?,?,?,?,?,?)""",
+            notification,
+        )
+    return demo_content_counts(con)
+
+
+def clear_isolated_demo_content(con):
+    for table in (
+        "community_events", "community_offers", "community_favorites",
+        "community_reports", "community_orders",
+    ):
+        con.execute(
+            f"DELETE FROM {trusted_sql_identifier(table)} WHERE listing_id LIKE ?",  # nosec B608
+            (f"{DEMO_ID_PREFIX}%",),
+        )
+    for table in (
+        "community_listings", "customer_requests", "complaints",
+        "app_notifications",
+    ):
+        con.execute(
+            f"DELETE FROM {trusted_sql_identifier(table)} WHERE id LIKE ?",  # nosec B608
+            (f"{DEMO_ID_PREFIX}%",),
+        )
+    con.execute("DELETE FROM app_users WHERE id='demo_user_1'")
+    return demo_content_counts(con)
 
 
 def ensure_column(con, table, column, definition):
@@ -1197,6 +1383,7 @@ def init_db():
                         "",
                     ),
                 )
+            seed_isolated_demo_content(con)
         for p in SEED_PROVIDERS:
             con.execute(
                 "UPDATE providers SET pin_hash='' WHERE id=? AND pin_hash IN (?,?)",
@@ -1287,9 +1474,10 @@ def init_db():
                 "nameAr": "خدماتي",
                 "nameEn": "Khadamati App",
                 "supportEmail": SUPPORT_EMAIL,
+                "supportWhatsapp": SUPPORT_WHATSAPP,
                 "policyVersion": POLICY_VERSION,
                 "currency": OMR,
-                "adminWhatsapp": "",
+                "adminWhatsapp": SUPPORT_WHATSAPP,
                 "monthlyGoal": 500,
                 "acceptProviders": True,
                 "subscriptionsEnabled": False,
@@ -1332,6 +1520,11 @@ def init_db():
         platform_settings["nameAr"] = "خدماتي"
         platform_settings["nameEn"] = "Khadamati App"
         platform_settings["supportEmail"] = SUPPORT_EMAIL
+        platform_settings.setdefault("supportWhatsapp", SUPPORT_WHATSAPP)
+        platform_settings.setdefault(
+            "adminWhatsapp",
+            platform_settings.get("supportWhatsapp", SUPPORT_WHATSAPP),
+        )
         platform_settings["policyVersion"] = POLICY_VERSION
         platform_settings["currency"] = OMR
         platform_settings.setdefault("subscriptionGraceDays", 14)
@@ -3169,6 +3362,8 @@ def get_bootstrap(session=None):
             "communityModerationRequired",
             "communityWantedExpiryDays", "communityPackageExpiryDays",
             "communityFirstPackageFreeDays", "communityRenewalFee",
+            "featuredPackagesEnabled", "featuredPackageIntervalSeconds",
+            "featuredPackagePlanExposure", "supportWhatsapp",
         }
         settings = platform_settings if is_admin else {
             key: value for key, value in platform_settings.items() if key in public_setting_keys
@@ -3657,6 +3852,10 @@ def get_bootstrap(session=None):
             "communityFavorites": community.get("favorites", []),
             "communityStats": community.get("stats", {}),
             "communityReports": community.get("reports", []) if is_admin else [],
+            "demoContent": {
+                "allowed": SAMPLE_DATA_ENABLED,
+                "counts": demo_content_counts(con) if SAMPLE_DATA_ENABLED else {},
+            } if is_admin else {"allowed": False, "counts": {}},
             "interactionBlocks": interaction_blocks,
             "platform": platform,
             "serverTime": datetime.now(UTC).isoformat(),
@@ -3670,6 +3869,7 @@ def get_bootstrap(session=None):
                 "nameAr": "خدماتي",
                 "nameEn": "Khadamati App",
                 "supportEmail": SUPPORT_EMAIL,
+                "supportWhatsapp": SUPPORT_WHATSAPP,
                 "policyVersion": POLICY_VERSION,
                 "currency": OMR,
             },
@@ -4547,6 +4747,7 @@ class Handler(SimpleHTTPRequestHandler):
                 "nameAr": "خدماتي",
                 "nameEn": "Khadamati App",
                 "supportEmail": SUPPORT_EMAIL,
+                "supportWhatsapp": SUPPORT_WHATSAPP,
                 "policyVersion": POLICY_VERSION,
                 "currency": OMR,
                 "publicUrl": PUBLIC_APP_URL,
@@ -6290,7 +6491,10 @@ class Handler(SimpleHTTPRequestHandler):
                     action_route=f"admin:community:{report['listingId']}",
                 )
                 return self.send_json({"ok": True, "report": report}, 201)
-            if action in {"settings", "moderate", "resolve_report"}:
+            if action in {
+                "settings", "moderate", "resolve_report", "manage_listing",
+                "demo_seed", "demo_clear",
+            }:
                 if not has_permission(session, "manage_community"):
                     return self.send_json(
                         {
@@ -6298,6 +6502,62 @@ class Handler(SimpleHTTPRequestHandler):
                             "permission": "manage_community",
                         },
                         403,
+                    )
+                if action in {"demo_seed", "demo_clear"}:
+                    if not SAMPLE_DATA_ENABLED:
+                        return self.send_json({"error": "demo_content_disabled"}, 403)
+                    counts = (
+                        seed_isolated_demo_content(con)
+                        if action == "demo_seed"
+                        else clear_isolated_demo_content(con)
+                    )
+                    log_audit(
+                        con,
+                        session,
+                        f"community.{action}",
+                        "demo_content",
+                        jdump(counts),
+                    )
+                    return self.send_json(
+                        {
+                            "ok": True,
+                            "demoContent": {"allowed": True, "counts": counts},
+                        }
+                    )
+                if action == "manage_listing":
+                    item = service.manage_listing(
+                        session,
+                        safe_text(data.get("listingId"), 120),
+                        data,
+                    )
+                    target_kind = (
+                        "user" if item["ownerKind"] == "user" else "provider"
+                    )
+                    create_notification(
+                        con,
+                        target_kind,
+                        item["ownerId"],
+                        "تم تحديث إعلانك من الإدارة",
+                        item["title"],
+                        type_="community",
+                        related_id=item["id"],
+                        action_text="فتح الإعلان",
+                        action_route=f"{target_kind}:community:{item['id']}",
+                    )
+                    log_audit(
+                        con,
+                        session,
+                        "community.listing.managed",
+                        "community_listing",
+                        item["id"],
+                    )
+                    return self.send_json(
+                        {
+                            "ok": True,
+                            "listing": community_snapshot_view(
+                                {"listings": [item]}
+                            )["listings"][0],
+                        }
                     )
                 if action == "settings":
                     settings = save_community_settings(con, data)
@@ -10816,6 +11076,15 @@ class Handler(SimpleHTTPRequestHandler):
                         "UPDATE admin_users SET code_hash=? WHERE id=?",
                         (hash_pin(new_admin_code), session["id"]),
                     )
+                support_whatsapp = normalize_phone(
+                    settings_data.get("supportWhatsapp")
+                    or settings_data.get("adminWhatsapp")
+                    or ""
+                )
+                if support_whatsapp and not re.fullmatch(r"968\d{8}", support_whatsapp):
+                    return self.send_json({"error": "invalid_support_whatsapp"}, 400)
+                settings_data["supportWhatsapp"] = support_whatsapp
+                settings_data["adminWhatsapp"] = support_whatsapp
                 settings_data["nameAr"] = "خدماتي"
                 settings_data["nameEn"] = "Khadamati App"
                 settings_data["supportEmail"] = SUPPORT_EMAIL

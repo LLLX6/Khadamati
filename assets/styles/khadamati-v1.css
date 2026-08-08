@@ -9469,3 +9469,51 @@ canvas{
   .home-featured-package-card>i{display:none}
   .provider-verification-card .verification-check-mini{grid-template-columns:1fr}
 }
+
+/* v1.1.5: consistent management surfaces and controlled featured listings */
+.admin-section-surface{min-width:0;display:grid;gap:14px;padding:2px 0 24px}
+.admin-section-surface>.section-head:first-child,
+.admin-section-surface>section>.section-head:first-child{margin-top:0}
+.admin-section-surface :is(.section-head,.admin-community-toolbar,.admin-community-subhead){min-width:0}
+.admin-section-surface :is(.section-head,.admin-community-toolbar)>div{min-width:0}
+.admin-section-surface :is(h1,h2,h3,p,small){overflow-wrap:anywhere}
+.admin-section-surface :is(.input,.select,.textarea,button){max-width:100%}
+.admin-section-surface .panel{border-color:color-mix(in srgb,var(--accent) 13%,var(--line));box-shadow:0 10px 30px rgba(3,46,60,.045)}
+.admin-featured-plan-matrix{display:grid;gap:12px;padding:16px;border:1px solid color-mix(in srgb,var(--accent) 20%,var(--line));border-radius:17px;background:color-mix(in srgb,var(--accent) 4%,var(--panel))}
+.admin-featured-plan-matrix .admin-community-toolbar{padding:0;border:0;background:transparent}
+.featured-plan-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:10px}
+.featured-plan-grid>article{min-width:0;display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:9px;padding:12px;border:1px solid var(--line);border-radius:14px;background:var(--panel);box-shadow:0 8px 22px rgba(3,46,60,.045)}
+.featured-plan-grid header{grid-column:1/-1;display:flex;align-items:center;justify-content:space-between;gap:8px;padding-bottom:9px;border-bottom:1px solid var(--line)}
+.featured-plan-grid header b{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.featured-plan-grid header small{flex:0 0 auto;padding:4px 7px;border-radius:99px;background:var(--panel2);color:var(--muted);font-size:.62rem;font-weight:850}
+.featured-plan-grid label{min-width:0;display:grid;gap:5px;color:var(--muted);font-size:.64rem;font-weight:850}
+.featured-plan-grid .input{height:42px;padding-inline:8px;text-align:center}
+.admin-demo-controls{display:grid;grid-template-columns:44px minmax(0,1fr) auto;align-items:center;gap:12px;padding:14px 16px;border:1px solid color-mix(in srgb,var(--gold) 32%,var(--line));border-radius:16px;background:color-mix(in srgb,var(--gold) 6%,var(--panel))}
+.admin-demo-controls>svg{width:42px;height:42px;padding:10px;border-radius:13px;background:var(--panel);color:var(--gold)}
+.admin-demo-controls>div:not(.row-actions){min-width:0;display:grid;gap:4px}
+.admin-demo-controls small{color:var(--muted);line-height:1.55}
+.admin-demo-controls.is-locked{border-style:dashed;filter:saturate(.72)}
+.admin-community-card.is-demo{border-style:dashed;border-color:color-mix(in srgb,var(--gold) 40%,var(--line))}
+.admin-community-editor .modal-body{display:grid;gap:14px}
+.admin-listing-summary{display:grid;grid-template-columns:44px minmax(0,1fr) auto;align-items:center;gap:11px;padding:12px;border:1px solid var(--line);border-radius:14px;background:var(--panel2)}
+.admin-listing-summary>span{display:grid;place-items:center;width:42px;height:42px;border-radius:12px;background:var(--panel);color:var(--accent)}
+.admin-listing-summary>div{min-width:0;display:grid;gap:3px}
+.admin-listing-summary small{color:var(--muted)}
+.admin-listing-summary em{padding:5px 8px;border-radius:99px;background:color-mix(in srgb,var(--gold) 13%,var(--panel));color:var(--gold);font-size:.62rem;font-style:normal;font-weight:900}
+.admin-listing-feature-schedule{display:grid;gap:12px;padding:14px;border:1px solid color-mix(in srgb,var(--accent) 20%,var(--line));border-radius:15px;background:color-mix(in srgb,var(--accent) 4%,var(--panel))}
+
+@media(max-width:760px){
+  .admin-section-surface{gap:11px;padding-bottom:18px}
+  .admin-section-surface>.section-head:first-child{padding-inline:4px}
+  .featured-plan-grid{grid-template-columns:1fr}
+  .admin-featured-plan-matrix{padding:12px;border-radius:15px}
+  .admin-demo-controls{grid-template-columns:40px minmax(0,1fr);padding:12px}
+  .admin-demo-controls>.row-actions,.admin-demo-controls>.badge{grid-column:1/-1;width:100%}
+  .admin-demo-controls>.row-actions>*{flex:1;justify-content:center}
+}
+@media(max-width:390px){
+  .featured-plan-grid>article{gap:7px;padding:10px}
+  .featured-plan-grid label span{font-size:.58rem}
+  .admin-listing-summary{grid-template-columns:40px minmax(0,1fr)}
+  .admin-listing-summary em{grid-column:1/-1;justify-self:start}
+}
