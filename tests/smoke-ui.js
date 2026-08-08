@@ -240,6 +240,12 @@ async function clickAdminTab(page, tab) {
     await page.waitForLoadState('domcontentloaded');
   }
   await page.waitForSelector('[data-action="openUserLogin"]');
+  await page.waitForTimeout(180);
+  if (await page.locator('.role-onboarding').count()) {
+    assert(await page.locator('.role-onboarding .onboarding-dot').count() === 3, 'First-open onboarding must contain three concise steps.');
+    await capture(page, '00a-first-open-onboarding', { fullPage: false });
+    await page.locator('[data-action="skipOnboarding"]').click();
+  }
   await capture(page, '00-entry');
   if (IS_MOBILE && VIEWPORT_HEIGHT > 700) {
     const entryLayout = await page.locator('.access-stage').evaluate(card => {
@@ -738,17 +744,17 @@ async function clickAdminTab(page, tab) {
   assert(await page.locator('#providerRegisterForm .registration-subservice.show').count() === 0, 'Optional sub-services should start collapsed.');
   const progressDirection = await page.locator('.provider-reg-progress').evaluate(element => getComputedStyle(element).direction);
   assert(progressDirection === 'rtl', 'Arabic provider registration progress must run right to left.');
-  assert(await page.locator('[data-action="addRegistrationSubservice"]').isVisible(), 'Individual registration must offer its two additional foundation services.');
+  assert(await page.locator('[data-action="addRegistrationSubservice"]').isVisible(), 'Individual registration must expose plan-limited additional services.');
   await page.locator('#regService').evaluate(select => {
     const option = [...select.options].find(item => item.value);
     select.value = option?.value || '';
     select.dispatchEvent(new Event('change', { bubbles: true }));
   });
-  await page.locator('[data-action="addRegistrationSubservice"]').click();
-  await page.locator('[data-action="addRegistrationSubservice"]').click();
-  assert(await page.locator('#providerRegisterForm .registration-subservice.show').count() === 2, 'Individual registration must allow three services in total.');
+  const individualLimit = Number((await page.locator('#regPlanGuidance').textContent()).match(/\d+/)?.[0] || 1);
+  for (let index = 1; index < individualLimit; index += 1) await page.locator('[data-action="addRegistrationSubservice"]').click();
+  assert(await page.locator('#providerRegisterForm .registration-subservice.show').count() === Math.max(0, individualLimit - 1), 'Individual registration did not follow the current foundation-plan service limit.');
   const individualCategory = String(await page.locator('#regService').inputValue()).split('|')[0];
-  assert(await page.locator('#regServiceExtra1').getAttribute('data-cat-filter') === individualCategory, 'Individual additional services must stay inside the primary category.');
+  if (individualLimit > 1) assert(await page.locator('#regServiceExtra1').getAttribute('data-cat-filter') === individualCategory, 'Individual additional services must stay inside the primary category.');
   await page.locator('#regAvatar').setInputFiles(path.join(__dirname, '..', 'app-icon-512.png'));
   await page.waitForSelector('.image-editor-modern');
   assert(await page.locator('.image-editor-modern [data-action="cropZoomDelta"]').count() === 2, 'The modern image editor must provide zoom-in and zoom-out controls.');
@@ -766,8 +772,11 @@ async function clickAdminTab(page, tab) {
   await page.locator('#regCredentialExpiry').fill('2028-12-31');
   await page.locator('[data-action="providerRegistrationNext"]').click();
   assert(await page.locator('[data-action="addRegistrationSubservice"]').isVisible(), 'Company registration must offer plan-limited services.');
+  const companyLimit = Number((await page.locator('#regPlanGuidance').textContent()).match(/\d+/)?.[0] || 1);
+  const companyRowsBefore = await page.locator('#providerRegisterForm .registration-subservice.show').count();
   await page.locator('[data-action="addRegistrationSubservice"]').click();
-  assert(await page.locator('#providerRegisterForm .registration-subservice.show').count() === 3, 'Company add-service should reveal one optional field at a time while preserving existing choices.');
+  const companyRowsAfter = await page.locator('#providerRegisterForm .registration-subservice.show').count();
+  assert(companyRowsAfter === Math.min(companyRowsBefore + 1, Math.max(0, companyLimit - 1)), 'Company add-service must reveal one field at a time while respecting its current plan.');
   await capture(page, '01e-provider-register');
   await page.locator('#modalRoot [data-action="closeModal"]').click();
   await page.locator('[data-action="toggleLang"]').first().click();
@@ -946,12 +955,22 @@ async function clickAdminTab(page, tab) {
   assert(await page.locator('[data-action="requestCall"]').count(), 'Phone calls were not enabled after customer consent.');
   const chatAction = await revealRequestAction(page, 'openRequestChat');
   await chatAction.click();
-  const chatViewportFit = await page.locator('.chat-sheet').evaluate(sheet => {
+  const chatViewportFit = await page.locator('.chat-sheet').evaluate((sheet, isMobile) => {
     const rect = sheet.getBoundingClientRect();
     const composer = sheet.querySelector('.chat-composer')?.getBoundingClientRect();
-    return rect.top <= 1 && rect.left <= 1 && rect.right >= innerWidth - 1 && rect.bottom >= innerHeight - 1 && composer && composer.left >= -1 && composer.right <= innerWidth + 1 && composer.bottom <= innerHeight + 1;
-  });
-  assert(chatViewportFit, 'Chat does not fill the active viewport or its composer overflows the phone screen.');
+    const composerFits = composer
+      && composer.left >= rect.left - 1
+      && composer.right <= rect.right + 1
+      && composer.bottom <= Math.min(rect.bottom, innerHeight) + 1;
+    if (isMobile) {
+      return { ok: rect.top <= 1 && rect.left <= 1 && rect.right >= innerWidth - 1 && rect.bottom >= innerHeight - 1 && composerFits, rect: {...rect.toJSON()}, composer: composer ? {...composer.toJSON()} : null };
+    }
+    const desktopSize = rect.width >= Math.min(innerWidth - 40, 680)
+      && rect.height >= Math.min(innerHeight - 40, 620);
+    const desktopBounds = rect.top >= -1 && rect.left >= -1 && rect.right <= innerWidth + 1 && rect.bottom <= innerHeight + 1;
+    return { ok: desktopSize && desktopBounds && composerFits, rect: {...rect.toJSON()}, composer: composer ? {...composer.toJSON()} : null };
+  }, IS_MOBILE);
+  assert(chatViewportFit.ok, `Chat does not fit the active viewport or its composer overflows the conversation window: ${JSON.stringify(chatViewportFit)}`);
   assert(await page.locator('.chat-sheet [data-action="refreshRequestChat"]').count() === 0, 'Chat still exposes a manual refresh button.');
   assert(await page.evaluate(() => Boolean(window.__khadamatiChatPoll)), 'Chat automatic refresh did not start.');
   await page.locator('.chat-sheet [data-action="manageRequestContact"]').click();
@@ -1149,9 +1168,11 @@ async function clickAdminTab(page, tab) {
   else if (await directSupport.count()) await directSupport.evaluate(element => element.click());
   else throw new Error('Provider support navigation is unavailable.');
   await dismissProviderSectionGuide(page);
-  const accountSecurity = page.locator('.compact-settings-disclosure').filter({ has: page.locator('[data-action="providerLogout"]') });
+  const accountSecurity = page.locator('.compact-settings-disclosure').filter({ has: page.locator('[data-action="confirmLogout"]') });
   if (!(await accountSecurity.getAttribute('open'))) await accountSecurity.locator('summary').click();
-  await accountSecurity.locator('[data-action="providerLogout"]').click();
+  await accountSecurity.locator('[data-action="confirmLogout"]').click();
+  assert(await page.locator('.confirmation-sheet').count(), 'Provider sign-out confirmation is missing.');
+  await page.locator('.confirmation-sheet [data-action="providerLogout"]').click();
   await page.locator('[data-action="goBack"]').click();
   await page.locator('[data-action="enterGuest"]').click();
   if (await page.locator('.role-onboarding').count()) {

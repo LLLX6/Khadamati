@@ -120,7 +120,7 @@ def environment_flag(name, default=False):
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
-APP_RELEASE = os.environ.get("KHADAMATI_RELEASE", "v1.1.3").strip() or "v1.1.3"
+APP_RELEASE = os.environ.get("KHADAMATI_RELEASE", "v1.1.4").strip() or "v1.1.4"
 TRUST_MIGRATION_KEY = "TRUST_SCHEMA_V1"
 QUALITY_MIGRATION_KEY = "QUALITY_SCHEMA_V1"
 PLATFORM_MIGRATION_KEY = "PLATFORM_SCHEMA_V1"
@@ -1391,6 +1391,8 @@ def is_private_upload(path):
     return bool(
         "-doc" in lowered
         or "-problem" in lowered
+        or "-completion-before" in lowered
+        or "-completion-after" in lowered
         or ("-msg_" in lowered and ("-image" in lowered or "-audio" in lowered))
         or (lowered.startswith("usr") and "-avatar" in lowered)
     )
@@ -3283,6 +3285,15 @@ def get_bootstrap(session=None):
             consent_service = ContactConsentService(con)
             for item in customer_requests:
                 accepted_for_provider = item.get("acceptedProviderId") == pid
+                if not accepted_for_provider:
+                    item["messages"] = []
+                    item["agreement"] = None
+                    item["completionEvidence"] = None
+                    item["events"] = []
+                    item["offers"] = [
+                        offer for offer in item.get("offers", [])
+                        if str(offer.get("providerId") or offer.get("provider_id") or "") == str(pid)
+                    ]
                 item["locationPrecision"] = (
                     "exact" if accepted_for_provider else "area"
                 )
@@ -5643,16 +5654,24 @@ class Handler(SimpleHTTPRequestHandler):
             user = con.execute("SELECT * FROM app_users WHERE id=?", (session["userId"],)).fetchone()
             if not user:
                 return self.send_json({"error": "user_not_found"}, 404)
+            request_board_report = str(data.get("reason", "") or "").startswith("request_board_")
             if request_id:
                 request_row = con.execute(
-                    """SELECT id,accepted_provider_id FROM customer_requests
-                    WHERE id=? AND user_id=?""",
-                    (request_id, session["userId"]),
+                    """SELECT id,user_id,accepted_provider_id,status FROM customer_requests
+                    WHERE id=?""",
+                    (request_id,),
                 ).fetchone()
                 if not request_row:
                     return self.send_json({"error": "request_not_found"}, 404)
+                if request_board_report:
+                    if request_row["user_id"] == session["userId"]:
+                        return self.send_json({"error": "cannot_report_own_request"}, 400)
+                    if request_row["status"] in ("deleted", "archived", "cancelled"):
+                        return self.send_json({"error": "request_not_reportable"}, 409)
+                elif request_row["user_id"] != session["userId"]:
+                    return self.send_json({"error": "request_not_found"}, 404)
                 selected_provider = request_row["accepted_provider_id"] or ""
-                if selected_provider:
+                if selected_provider and not request_board_report:
                     if provider_id and provider_id != selected_provider:
                         return self.send_json(
                             {"error": "complaint_provider_mismatch"}, 403
@@ -5701,7 +5720,7 @@ class Handler(SimpleHTTPRequestHandler):
                 actor_kind="user",
                 actor_id=session["userId"],
                 category=item["reason"],
-                source="request" if request_id else "provider_profile",
+                source="request_board" if request_board_report else "request" if request_id else "provider_profile",
             )
             if evidence_paths:
                 complaint_service.add_evidence(
@@ -7392,7 +7411,7 @@ class Handler(SimpleHTTPRequestHandler):
                 if item["status"] not in ("accepted", "appointmentConfirmed", "inProgress"):
                     return self.send_json({"error": "request_stage_not_allowed"}, 409)
                 agreement = RequestAgreementService(con).get(request_id)
-                if agreement and agreement.get("status") != "confirmed":
+                if not agreement or agreement.get("status") != "confirmed":
                     return self.send_json({"error": "agreement_confirmation_required"}, 409)
                 RequestLifecycleService(con).transition(
                     request_id,
@@ -7715,7 +7734,7 @@ class Handler(SimpleHTTPRequestHandler):
                 )
             elif action == "start_work":
                 agreement = RequestAgreementService(con).get(request_id)
-                if agreement and agreement.get("status") != "confirmed":
+                if not agreement or agreement.get("status") != "confirmed":
                     return self.send_json({"error": "agreement_confirmation_required"}, 409)
                 RequestLifecycleService(con).transition(
                     request_id,
@@ -7771,7 +7790,7 @@ class Handler(SimpleHTTPRequestHandler):
                     related_id=request_id,
                     priority="high",
                     action_text="مراجعة الإنجاز",
-                    action_route=f"user:request:{request_id}",
+                    action_route=f"user:completion:{request_id}",
                 )
             elif action == "completion_decide":
                 if not is_owner:
@@ -9258,6 +9277,7 @@ class Handler(SimpleHTTPRequestHandler):
             "/api/admin/providers": "manage_providers",
             "/api/admin/provider-status": "manage_providers",
             "/api/admin/provider-delete": "manage_providers",
+            "/api/admin/app-user": "manage_admins",
             "/api/admin/request-decision": "review_requests",
             "/api/admin/customer-request-action": "review_requests",
             "/api/admin/review-status": "manage_quality",
@@ -9770,6 +9790,80 @@ class Handler(SimpleHTTPRequestHandler):
                     f"{provider_row['name']} | {delete_reason}",
                 )
                 return self.send_json({"ok": True})
+            if path == "/api/admin/app-user":
+                user_id = safe_text(data.get("id", ""), 120)
+                action = safe_text(data.get("action", "update"), 20)
+                user_row = con.execute(
+                    "SELECT id,name,phone,status FROM app_users WHERE id=?", (user_id,)
+                ).fetchone()
+                if not user_row:
+                    return self.send_json({"error": "user_not_found"}, 404)
+                if action == "update":
+                    name = safe_text(data.get("name", user_row["name"]), 160)
+                    phone = normalize_phone(data.get("phone", user_row["phone"]))
+                    status = safe_text(data.get("status", user_row["status"]), 24)
+                    if not name or not phone:
+                        return self.send_json({"error": "user_required_fields"}, 400)
+                    if status not in {"active", "registered", "stopped", "suspended"}:
+                        return self.send_json({"error": "invalid_user_status"}, 400)
+                    duplicate = con.execute(
+                        "SELECT id FROM app_users WHERE phone=? AND id!=?", (phone, user_id)
+                    ).fetchone()
+                    if duplicate:
+                        return self.send_json({"error": "phone_already_registered"}, 409)
+                    con.execute(
+                        """UPDATE app_users SET name=?,phone=?,gov=?,wilayah=?,status=?
+                        WHERE id=?""",
+                        (
+                            name,
+                            phone,
+                            safe_text(data.get("gov", ""), 80),
+                            safe_text(data.get("wilayah", ""), 80),
+                            "active" if status == "registered" else status,
+                            user_id,
+                        ),
+                    )
+                    if status in {"stopped", "suspended"}:
+                        revoke_account_sessions(con, "user", user_id)
+                    log_audit(con, session, "app_user.updated", user_id, status)
+                    return self.send_json({"ok": True})
+                if action == "delete":
+                    admin_code = safe_text(data.get("adminCode", ""), 128)
+                    reason = safe_text(data.get("reason", ""), 500)
+                    admin_row = con.execute(
+                        "SELECT code_hash FROM admin_users WHERE id=? AND active=1",
+                        (session.get("id", ""),),
+                    ).fetchone()
+                    if not admin_row or not verify_secret(admin_code, admin_row["code_hash"]):
+                        return self.send_json({"error": "invalid_code"}, 403)
+                    if len(reason) < 3:
+                        return self.send_json({"error": "delete_reason_required"}, 400)
+                    anonymous_phone = f"deleted-user-{hashlib.sha256(user_id.encode('utf-8')).hexdigest()[:14]}"
+                    con.execute(
+                        """UPDATE app_users SET name='حساب مستخدم محذوف',phone=?,pin_hash='',
+                        email='',age=0,nationality='',avatar='',latitude=NULL,longitude=NULL,
+                        status='deleted',locked_until='' WHERE id=?""",
+                        (anonymous_phone, user_id),
+                    )
+                    con.execute(
+                        """UPDATE customer_requests SET customer_name='حساب مستخدم محذوف',phone=''
+                        WHERE user_id=?""",
+                        (user_id,),
+                    )
+                    con.execute(
+                        "UPDATE push_subscriptions SET active=0 WHERE target_kind='user' AND target_id=?",
+                        (user_id,),
+                    )
+                    revoke_account_sessions(con, "user", user_id)
+                    log_audit(
+                        con,
+                        session,
+                        "app_user.deleted",
+                        user_id,
+                        f"{user_row['name']} | {reason}",
+                    )
+                    return self.send_json({"ok": True})
+                return self.send_json({"error": "invalid_action"}, 400)
             if path == "/api/admin/request-decision":
                 decision = safe_text(data.get("decision"), 20)
                 if decision not in {"accept", "reject"}:

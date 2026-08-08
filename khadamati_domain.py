@@ -261,10 +261,9 @@ class PlanCatalog:
                     "UPDATE packages SET entitlements=? WHERE id=?",
                     (dump(current_entitlements), plan["id"]),
                 )
-        placeholders = ",".join("?" for _ in LEGACY_PLAN_IDS)
-        con.execute(
-            f"UPDATE packages SET active=0,legacy=1 WHERE id IN ({placeholders})",
-            LEGACY_PLAN_IDS,
+        con.executemany(
+            "UPDATE packages SET active=0,legacy=1 WHERE id=?",
+            ((plan_id,) for plan_id in LEGACY_PLAN_IDS),
         )
 
     @staticmethod
