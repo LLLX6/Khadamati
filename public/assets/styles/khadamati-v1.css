@@ -5609,7 +5609,7 @@ summary:focus-visible{
   .app-top .app-brand .brand-word>span{max-width:58px;font-size:.9rem}
 }
 
-/* Khadamati 1.0.2 final mobile and request-flow corrections. */
+/* Final mobile and request-flow corrections. */
 :root{
   --navH:68px;
   --kh-icon-size:20px;
@@ -6246,7 +6246,7 @@ body[data-scale] :is(.market-art,.direct-request-icon,.icon-chip){
   .voice-note-player{grid-template-columns:34px minmax(68px,1fr) 32px;gap:6px}
 }
 
-/* Targeted V1.0.2 rewards, catalog, and access polish. */
+/* Rewards, catalog, and access polish. */
 .phone-ltr{
   direction:ltr!important;
   text-align:left!important;
@@ -7434,7 +7434,7 @@ canvas{
   }
 }
 
-/* V1.0.2 account entry and adaptive mobile navigation */
+/* Account entry and adaptive mobile navigation. */
 .entry-card-focus .entry-role-card,
 .provider-entry-card,
 .account-login-sheet,
@@ -9337,7 +9337,7 @@ canvas{
 .request-budget-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.need-content{min-width:0;display:block}.need-content.has-media{display:grid;grid-template-columns:minmax(0,1fr) 88px;align-items:start;gap:11px}.need-content h3{margin:0 0 5px}.need-content p{margin:0}.need-problem-media{position:relative;width:88px;aspect-ratio:1;border:0;border-radius:14px;overflow:hidden;padding:0;background:var(--panel2);cursor:pointer}.need-problem-media img{width:100%;height:100%;object-fit:cover}.need-problem-media>span{position:absolute;inset:auto 5px 5px;display:flex;align-items:center;justify-content:center;gap:4px;min-height:23px;padding:3px 6px;border-radius:8px;background:rgba(3,31,45,.78);color:#fff;font-size:.62rem;font-weight:900;backdrop-filter:blur(5px)}.need-problem-media svg{width:14px}.request-report-sheet .modal-body{display:grid;gap:13px}.request-report-sheet .community-save-button{width:100%}
 @media(max-width:360px){.request-budget-grid{grid-template-columns:1fr}.need-content.has-media{grid-template-columns:minmax(0,1fr) 72px}.need-problem-media{width:72px}}
 
-/* V1.1.4 launch surfaces: compact, touch-first, and visually calm. */
+/* Launch surfaces: compact, touch-first, and visually calm. */
 .pull-refresh-indicator{
   --pull-distance:0px;
   position:fixed;
@@ -9470,7 +9470,7 @@ canvas{
   .provider-verification-card .verification-check-mini{grid-template-columns:1fr}
 }
 
-/* v1.1.5: consistent management surfaces and controlled featured listings */
+/* Consistent management surfaces and controlled featured listings. */
 .admin-section-surface{min-width:0;display:grid;gap:14px;padding:2px 0 24px}
 .admin-section-surface>.section-head:first-child,
 .admin-section-surface>section>.section-head:first-child{margin-top:0}
