@@ -12,6 +12,27 @@ const VIEWPORT_HEIGHT = Number(process.env.KHADAMATI_VIEWPORT_HEIGHT || 844);
 const IS_MOBILE = VIEWPORT_WIDTH <= 760;
 let LOCAL_SERVER = null;
 
+const APP_SOURCE = fs.readFileSync(path.resolve(__dirname, '..', 'index.html'), 'utf8');
+assertSource(APP_SOURCE.includes("const APP_VERSION = '1.1.0'") && APP_SOURCE.includes("const APP_BUILD = 'khadamati-v1.1.0-booking-v2-r1-2026-08-08'"), 'Booking v2 application version/build marker is missing.');
+assertSource(APP_SOURCE.includes('actionPromptRoot') && APP_SOURCE.includes('renderActionPrompt()'), 'The actionable notification root is not wired to rendering.');
+assertSource(APP_SOURCE.includes("'change_propose'") && APP_SOURCE.includes("'change_decide'"), 'Change-order propose/decision UI is missing.');
+assertSource(APP_SOURCE.includes('work-order-summary') && APP_SOURCE.includes('review_change_order'), 'Work-order summary or change-order routing is missing.');
+assertSource(APP_SOURCE.includes('bookingV2FeatureEnabled()') && APP_SOURCE.includes("action:'book'"), 'Instant booking is not gated by the server feature flag.');
+assertSource(['booking_started', 'offer_accepted', 'work_started', 'completion_submitted', 'completion_resolved', 'completion_issue_opened', 'rating_submitted', 'rebook_started', 'action_prompt_completed'].every(name => APP_SOURCE.includes(`trackEvent('${name}'`)), 'Canonical booking lifecycle analytics are incomplete.');
+assertSource(APP_SOURCE.includes("active:slot.active!==false&&Number(slot.active)!==0"), 'Cancelled provider instant slots are not normalized safely.');
+assertSource(APP_SOURCE.includes("AUTH.activeRole!=='provider'") && APP_SOURCE.includes("AUTH.activeRole!=='user'"), 'Deep links do not enforce switching to their target account role.');
+assertSource(APP_SOURCE.includes('!notification._offlineReadOnly&&!notificationStillActionable') && APP_SOURCE.includes('offlineMutationActions'), 'Offline notification details can still supersede or mutate server state.');
+assertSource(APP_SOURCE.includes('foregroundInteractionInProgress()') && APP_SOURCE.includes('preserveForeground') && APP_SOURCE.includes('rememberPendingNotification(notification)'), 'Background sync or deep links can still replace an active form.');
+assertSource(APP_SOURCE.includes('KHADAMATI_WORKFLOW_RETRY_INTENTS_V1') && APP_SOURCE.includes('clearWorkflowRetryIntent'), 'Completion retry idempotency is not persisted across network retries.');
+assertSource(APP_SOURCE.includes("notification.requiresAction&&notification._serverVerified===true"), 'Local or inferred notifications can still interrupt the user.');
+const INSTANT_CONFLICT_CODES = ['instant_slot_reserved', 'instant_slot_not_found', 'instant_slot_expired', 'instant_slot_policy_changed', 'provider_no_longer_available', 'instant_booking_stage_not_allowed', 'provider_area_mismatch', 'provider_daily_capacity_reached', 'instant_booking_conflict', 'instant_slot_service_mismatch'];
+assertSource(INSTANT_CONFLICT_CODES.every(code => APP_SOURCE.includes(`'${code}'`)) && APP_SOURCE.includes('if(definitiveConflict&&intent.requestId)') && APP_SOURCE.includes('if(definitiveConflict)setTimeout(()=>instantBookingSheet'), 'Instant-booking conflicts are not wired to orphan cleanup and slot reselection.');
+assertSource(['suggestion', 'community', 'offers', 'completion', 'change-order', 'quality', 'account'].every(route => APP_SOURCE.includes(`kind==='${route}'`)), 'Structured notification routes are incomplete.');
+
+function assertSource(value, message) {
+  if (!value) throw new Error(message);
+}
+
 async function startStaticServer() {
   const root = path.resolve(__dirname, '..');
   const mime = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.json': 'application/json; charset=utf-8', '.svg': 'image/svg+xml', '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.webp': 'image/webp', '.ico': 'image/x-icon' };
@@ -119,6 +140,26 @@ async function clickAdminTab(page, tab) {
   await page.locator(`[data-action="adminToolTab"][data-tab="${tab}"]`).click();
 }
 
+async function clickProviderNav(page, tab) {
+  const mobile = page.locator(`.provider-bottom-nav [data-action="providerTab"][data-tab="${tab}"]`).first();
+  if (await mobile.isVisible()) {
+    await mobile.click();
+    return;
+  }
+  const desktop = page.locator(`.provider-desktop-nav [data-action="providerTab"][data-tab="${tab}"], .provider-desktop-nav [data-action="providerToolTab"][data-tab="${tab}"]`).first();
+  if (await desktop.isVisible()) {
+    await desktop.click();
+    return;
+  }
+  const more = page.locator('.provider-bottom-nav [data-action="openProviderTools"], .provider-desktop-nav [data-action="openProviderTools"]').first();
+  assert(await more.count(), `Provider navigation is unavailable for ${tab}.`);
+  if (await more.isVisible()) await more.click();
+  else await more.evaluate(element => element.click());
+  const tool = page.locator(`.workspace-tools-sheet [data-action="providerToolTab"][data-tab="${tab}"]`).first();
+  await tool.waitFor({ state: 'visible' });
+  await tool.click();
+}
+
 (async () => {
   const testUrl = BASE_URL || await startStaticServer();
   const launchOptions = {
@@ -191,6 +232,9 @@ async function clickAdminTab(page, tab) {
     integrationAdapters: [{ key: 'insurance', enabled: false, mode: 'disabled', legalStatus: 'pending', config: {} }, { key: 'government', enabled: false, mode: 'disabled', legalStatus: 'pending', config: {} }],
     enterpriseClients: [],
   };
+  let mockBookingV2Enabled = null;
+  let mockServicePolicies = {};
+  let mockCustomerRequests = null;
 
   // Keep the visual smoke test deterministic while still exercising authenticated UI paths.
   await context.route('**/api/**', async route => {
@@ -226,7 +270,12 @@ async function clickAdminTab(page, tab) {
     if (url.pathname === '/api/admin/session') return json({ adminEntities: { rewardCampaigns: [mockRewardCampaign], campaignEligibility: [] }, platform: mockAdminPlatform });
     if (url.pathname === '/api/bootstrap') {
       const auth = route.request().headers().authorization || '';
-      return json({ platform: auth.includes('provider') ? mockProviderPlatform : mockUserPlatform });
+      return json({
+        platform: auth.includes('provider') ? mockProviderPlatform : mockUserPlatform,
+        ...(typeof mockBookingV2Enabled === 'boolean' ? { bookingV2Enabled: mockBookingV2Enabled } : {}),
+        servicePolicies: mockServicePolicies,
+        ...(Array.isArray(mockCustomerRequests) ? { customerRequests: mockCustomerRequests } : {}),
+      });
     }
     if (url.pathname === '/api/push/public-key') return json({ publicKey: '' });
     return route.fulfill({ status: 503, contentType: 'application/json', body: JSON.stringify({ error: 'request_failed' }) });
@@ -336,6 +385,89 @@ async function clickAdminTab(page, tab) {
   const userNavOrder = await page.locator('.bottom-nav [data-action="nav"]').evaluateAll(items => items.map(item => item.dataset.view));
   assert(JSON.stringify(userNavOrder) === JSON.stringify(['home', 'services', 'tasks', 'community', 'myAccount']), `User bottom navigation order is incorrect: ${userNavOrder.join(', ')}`);
   assert((await page.locator('.app-brand .brand-word > span').textContent()).trim() === 'خدماتي', 'The Arabic app name is missing from the signed-in header.');
+
+  await page.evaluate(() => {
+    const key = 'KHADAMATI_PRIVATE_STATE_V1';
+    const state = JSON.parse(sessionStorage.getItem(key) || '{}');
+    state.notifications = [{
+      id: 'ui-required-action', type: 'request', title: 'إجراء مطلوب', message: 'راجع الطلب',
+      target: 'user', targetId: 'ui-user', relatedId: 'ui-required-request', entityId: 'ui-required-request',
+      actionKind: 'open_booking', actionRoute: 'user:request:ui-required-request', requiresAction: true,
+      stateVersion: 1, priority: 'high', read: true, readAt: new Date().toISOString(), createdAt: new Date().toISOString(), _serverVerified: true,
+    }, ...(state.notifications || []).filter(item => item.id !== 'ui-required-action')];
+    sessionStorage.setItem(key, JSON.stringify(state));
+  });
+  const permissionSession = await browser.newBrowserCDPSession();
+  const { browserContextIds } = await permissionSession.send('Target.getBrowserContexts');
+  const permissionContextId = browserContextIds[browserContextIds.length - 1];
+  const testOrigin = new URL(testUrl).origin;
+  await context.clearPermissions();
+  await permissionSession.send('Browser.setPermission', { permission: { name: 'notifications' }, setting: 'denied', origin: testOrigin, browserContextId: permissionContextId });
+  await page.reload({ waitUntil: 'domcontentloaded' });
+  assert(await page.evaluate(() => Notification.permission) === 'denied', 'Notification permission denial was not applied for the internal-card check.');
+  await page.waitForSelector('#actionPromptRoot .action-prompt-card');
+  assert(await page.locator('.bottom-nav [data-view="tasks"] .nav-count').count(), 'A read-but-unresolved action is missing from the requests badge.');
+  await page.evaluate(() => localStorage.setItem('KHADAMATI_DIRECT_REQUEST_GUIDE_V1', '1'));
+  await clickFirstAction(page, 'quickRequestForm');
+  await page.locator('#qrNote').evaluate(input => { input.value = 'مدخل يجب ألا يضيع عند وصول الإشعار'; });
+  await page.waitForSelector('#actionPromptRoot.is-inline .action-prompt-card');
+  assert(await page.locator('#actionPromptRoot.is-inline .action-prompt-card').isVisible(), 'Action prompt is hidden behind the active form.');
+  await page.locator('#actionPromptRoot [data-action="openActionPrompt"]').evaluate(button => button.click());
+  await page.waitForTimeout(100);
+  assert(await page.locator('#qrNote').inputValue() === 'مدخل يجب ألا يضيع عند وصول الإشعار', 'Opening an action prompt destroyed the active request form.');
+  await page.evaluate(() => sessionStorage.removeItem('KHADAMATI_PENDING_NOTIFICATION_V1'));
+  await page.locator('.request-modal [data-action="closeModal"]').click();
+  await page.waitForTimeout(80);
+  await page.locator('#actionPromptRoot [data-action="snoozeActionPrompt"]').click();
+  assert(await page.locator('#actionPromptRoot .action-prompt-card').count() === 0, 'Later did not defer the current action prompt.');
+  assert(await page.locator('.bottom-nav [data-view="tasks"] .nav-count').count(), 'Later incorrectly cleared the unresolved action badge.');
+  await page.locator('.app-top [data-action="openNotifications"]').click();
+  const requiredCard = page.locator('.notification-disclosure:has(summary[data-id="ui-required-action"])');
+  assert(await requiredCard.count(), 'The deferred action disappeared from notification history.');
+  assert(await requiredCard.locator('[data-action="deleteNotification"]').count() === 0, 'An unresolved required action can still be deleted.');
+  await page.locator('.notification-center-sheet [data-action="closeModal"]').click();
+  await page.evaluate(() => {
+    const key = 'KHADAMATI_PRIVATE_STATE_V1';
+    const state = JSON.parse(sessionStorage.getItem(key) || '{}');
+    state.notifications = (state.notifications || []).filter(item => item.id !== 'ui-required-action');
+    sessionStorage.setItem(key, JSON.stringify(state));
+    sessionStorage.removeItem('KHADAMATI_ACTION_PROMPT_SNOOZED_V1');
+  });
+  await context.grantPermissions(['geolocation', 'microphone', 'notifications'], { origin: testOrigin });
+  await page.reload({ waitUntil: 'domcontentloaded' });
+
+  await page.evaluate(() => sessionStorage.setItem('KHADAMATI_INSTANT_POLICY_TEST_BACKUP', sessionStorage.getItem('KHADAMATI_PRIVATE_STATE_V1') || '{}'));
+  const instantPolicy = { categoryId: 'homecare', serviceId: 'electrician' };
+  mockBookingV2Enabled = true;
+  mockServicePolicies = { 'homecare|electrician': { fulfillmentMode: 'instant' } };
+  const flaggedBootstrap = page.waitForResponse(response => new URL(response.url()).pathname === '/api/bootstrap');
+  await page.reload({ waitUntil: 'domcontentloaded' });
+  await flaggedBootstrap;
+  await page.waitForTimeout(100);
+  await clickUserNav(page, 'services');
+  await page.locator(`[data-action="servicesCategory"][data-cat="${instantPolicy.categoryId}"]`).first().click();
+  await page.locator(`[data-action="serviceSheet"][data-cat="${instantPolicy.categoryId}"][data-service="${instantPolicy.serviceId}"]`).click();
+  assert(await page.locator('.modal [data-action="openInstantBooking"]').count(), 'Flagged instant service did not expose server-confirmed slot selection.');
+  await page.locator('.modal [data-action="closeModal"]').click();
+  mockBookingV2Enabled = false;
+  const disabledBootstrap = page.waitForResponse(response => new URL(response.url()).pathname === '/api/bootstrap');
+  await page.reload({ waitUntil: 'domcontentloaded' });
+  await disabledBootstrap;
+  await page.waitForTimeout(100);
+  await clickUserNav(page, 'services');
+  await page.locator(`[data-action="servicesCategory"][data-cat="${instantPolicy.categoryId}"]`).first().click();
+  await page.locator(`[data-action="serviceSheet"][data-cat="${instantPolicy.categoryId}"][data-service="${instantPolicy.serviceId}"]`).click();
+  assert(await page.locator('.modal [data-action="quickRequestForService"]').count(), 'Flag-off service did not fall back to the quoted request flow.');
+  assert(await page.locator('.modal [data-action="openInstantBooking"]').count() === 0, 'Instant booking bypassed the server feature flag.');
+  await page.locator('.modal [data-action="closeModal"]').click();
+  mockBookingV2Enabled = null;
+  mockServicePolicies = {};
+  await page.evaluate(() => {
+    const backup = sessionStorage.getItem('KHADAMATI_INSTANT_POLICY_TEST_BACKUP');
+    if (backup) sessionStorage.setItem('KHADAMATI_PRIVATE_STATE_V1', backup);
+    sessionStorage.removeItem('KHADAMATI_INSTANT_POLICY_TEST_BACKUP');
+  });
+  await page.reload({ waitUntil: 'domcontentloaded' });
 
   assert((await page.locator('.clean-grid .category-tile').count()) <= 6, 'Home must show no more than six categories.');
   assert(await page.locator('main.view > .home-ad.ad-slider').count(), 'Advertisement slider must be the first home block.');
@@ -829,12 +961,7 @@ async function clickAdminTab(page, tab) {
   assert(await page.locator('.quote-template-grid').count(), 'Provider quote templates are missing.');
   assert(await page.locator('.provider-topbar .provider-brand').isVisible(), 'Provider header identity is hidden.');
   assert(await page.locator('.provider-topbar .provider-brand > .brand-mark.image-mark').isVisible(), 'Provider header logo is hidden on a narrow phone.');
-  if (VIEWPORT_WIDTH <= 430) {
-    assert(!await page.locator('.provider-topbar .provider-brand > span:last-child').isVisible(), 'The redundant provider name should not be clipped into the compact phone header.');
-    assert(await page.locator('.provider-dashboard-head h2').filter({ hasText: /سالم البلوشي/ }).isVisible(), 'The full provider name is missing from the phone workspace.');
-  } else {
-    assert(await page.locator('.provider-topbar .provider-brand > span:last-child').isVisible(), 'Provider name is hidden on a wide screen.');
-  }
+  assert(await page.locator('.provider-topbar .provider-brand > span:last-child').isVisible(), 'Provider identity is hidden from the independent provider header.');
   const providerTopFits = await page.locator('.provider-topbar').evaluate(() => document.documentElement.scrollWidth <= window.innerWidth + 1);
   assert(providerTopFits, 'Provider top bar overflows the mobile viewport.');
   assert(await page.locator('.provider-top-actions > *').evaluateAll(items => items.every(item => { const box = item.getBoundingClientRect(); return box.left >= -1 && box.right <= window.innerWidth + 1; })), 'A provider header control leaves the mobile viewport.');
@@ -843,11 +970,17 @@ async function clickAdminTab(page, tab) {
   await page.waitForTimeout(150);
   assert(await page.locator('html').getAttribute('dir') === 'ltr', 'Provider English mode did not switch to LTR.');
   assert(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth + 1), 'Provider English layout overflows horizontally.');
-  const providerNavFits = await page.locator('.provider-shell .side-nav').evaluate(element => {
+  const providerNav = IS_MOBILE ? page.locator('.provider-bottom-nav') : page.locator('.provider-desktop-nav');
+  const providerNavFits = await providerNav.evaluate(element => {
     const rect = element.getBoundingClientRect();
-    return rect.left >= -1 && rect.right <= window.innerWidth + 1 && (window.innerWidth > 940 || getComputedStyle(element).overflowX !== 'visible');
+    return rect.left >= -1 && rect.right <= window.innerWidth + 1;
   });
-  assert(providerNavFits, 'Provider English tabs are not contained in their horizontal scroller.');
+  assert(providerNavFits, 'Provider navigation leaves the active viewport.');
+  if (IS_MOBILE) {
+    const providerNavLabels = await page.locator('.provider-bottom-nav-item').allTextContents();
+    assert(providerNavLabels.length === 5, 'Provider phone navigation must contain exactly five destinations.');
+    assert(providerNavLabels.every(label => label.trim()), 'A provider phone navigation destination has no accessible label.');
+  }
   await page.locator('.provider-status-toggle').click();
   await page.locator('.provider-status-toggle').click();
   await page.locator('.provider-status-toggle').click();
@@ -873,22 +1006,17 @@ async function clickAdminTab(page, tab) {
   assert(await page.locator('.quote-manager-list').getByText('عرض فحص مخصص').count(), 'Provider quote template edit was not retained.');
   await page.locator('[data-action="closeModal"]').click();
 
-  if (IS_MOBILE) {
-    await page.locator('[data-action="openProviderTools"]').click();
-    await page.locator('.workspace-tools-sheet [data-action="providerToolTab"][data-tab="business"]').click();
-  } else {
-    await page.locator('.provider-nav-secondary[data-action="providerToolTab"][data-tab="business"]').click();
-  }
+  await clickProviderNav(page, 'business');
   await page.waitForSelector('.platform-dashboard-grid');
   await dismissProviderSectionGuide(page, '02c-provider-business-guide');
   assert(await page.locator('.legal-profile-card').count(), 'Provider legal pathway summary is missing from the business center.');
   assert(await page.locator('.platform-workspace-section').count() >= 3, 'Provider CRM, contracts, or training workspace is incomplete.');
   assert(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth + 1), 'Provider business center overflows the mobile viewport.');
   await capture(page, '02c-provider-business');
-  await page.locator('.side-nav [data-action="providerTab"][data-tab="home"]').click();
+  await clickProviderNav(page, 'home');
   await dismissProviderSectionGuide(page, '02d-provider-today-guide');
 
-  await page.locator('.side-nav [data-action="providerTab"][data-tab="leads"]').click();
+  await clickProviderNav(page, 'leads');
   await dismissProviderSectionGuide(page, '02e-provider-community-guide');
   await page.locator('.community-v3-tabs [data-value="packages"]').click();
   assert(await page.locator('.community-page[data-community-mode="provider"]').count(), 'Provider Community destination is missing.');
@@ -1030,11 +1158,69 @@ async function clickAdminTab(page, tab) {
   await page.locator('[data-action="closeModal"]').click();
   assert(await page.evaluate(() => !window.__khadamatiChatPoll), 'Chat automatic refresh continued after closing the conversation.');
 
+  const originalBookingRequests = await page.evaluate(() => JSON.parse(sessionStorage.getItem('KHADAMATI_PRIVATE_STATE_V1') || '{}').customerRequests || []);
+  const bookingV2Fixture = JSON.parse(JSON.stringify(originalBookingRequests));
+  const bookingV2Request = bookingV2Fixture.find(item => item.acceptedProviderId);
+  assert(bookingV2Request, 'Could not prepare the isolated booking_v2 request check.');
+  {
+    const request = bookingV2Request;
+    request.workflowVersion = 'booking_v2';
+    request.fulfillmentMode = 'quoted';
+    request.status = 'accepted';
+    request.visibleState = 'booked';
+    request.allowedActions = ['open_chat', 'request_change'];
+    request.nextAction = { type: 'review_change_order', label: 'راجع التعديل', enabled: true, changeOrderId: 'ui-change-order', expectedVersion: 1 };
+    request.workOrderSummary = {
+      version: 1, priceAmount: 12, currency: 'OMR', appointmentAt: '2026-08-18T11:30:00Z',
+      durationMinutes: 90, warrantyDays: 14, scope: 'فحص اللوحة وتنفيذ الإصلاح المتفق عليه',
+      exclusions: 'قطع إضافية غير مدرجة', evidencePolicy: 'optional', startVerificationMode: 'none',
+    };
+    request.changeOrders = [{
+      id: 'ui-change-order', status: 'pending', proposedByKind: 'provider', expectedVersion: 1,
+      reason: 'تعديل الموعد بعد تنسيق الوصول', changes: { appointmentAt: '2026-08-19T12:30:00Z', priceAmount: 14 },
+    }];
+  }
+  mockCustomerRequests = bookingV2Fixture;
+  mockBookingV2Enabled = true;
+  const bookingV2Bootstrap = page.waitForResponse(response => new URL(response.url()).pathname === '/api/bootstrap');
+  await page.reload({ waitUntil: 'domcontentloaded' });
+  await bookingV2Bootstrap;
+  await page.waitForTimeout(100);
+  await clickUserNav(page, 'tasks');
+  const bookingV2Details = await revealRequestAction(page, 'openRequestTaskDetails');
+  await bookingV2Details.click();
+  await page.waitForSelector('.task-detail-sheet .work-order-summary');
+  assert(await page.locator('.task-detail-sheet .request-agreement-card').count() === 0, 'booking_v2 still renders a duplicate execution agreement.');
+  assert(await page.locator('.task-detail-sheet [data-action="startCustomerRequest"], .task-detail-sheet [data-action="workflowStartRequest"]').count() === 0, 'Customer can start booking_v2 work from the UI.');
+  assert(await page.locator('.task-detail-sheet .task-next-action').count() === 1, 'booking_v2 does not expose exactly one primary next action.');
+  assert(await page.locator('.work-order-summary').getByText(/فحص اللوحة وتنفيذ الإصلاح/).count(), 'Accepted work-order scope is missing.');
+  await page.locator('.work-order-change.pending').click();
+  assert(await page.locator('.change-order-sheet .change-compare-row').count() === 2, 'Pending change order is not compared field by field.');
+  assert(await page.locator('.change-order-sheet').getByText('تعديل الموعد بعد تنسيق الوصول').count(), 'Change-order reason is missing.');
+  assert(await page.locator('.change-order-sheet [data-action="decideChangeOrder"]').count() === 2, 'Customer cannot approve or reject the provider change order.');
+  await page.locator('.change-order-sheet [data-action="closeModal"]').click();
+  mockCustomerRequests = originalBookingRequests;
+  mockBookingV2Enabled = null;
+  const legacyRestoreBootstrap = page.waitForResponse(response => new URL(response.url()).pathname === '/api/bootstrap');
+  await page.reload({ waitUntil: 'domcontentloaded' });
+  await legacyRestoreBootstrap;
+  await page.waitForTimeout(100);
+  mockCustomerRequests = null;
+
   await page.evaluate(() => {
     const key = 'KHADAMATI_PRIVATE_STATE_V1';
     const state = JSON.parse(sessionStorage.getItem(key) || '{}');
     const request = state.customerRequests?.find(item => item.acceptedProviderId);
     if (!request) throw new Error('Accepted request is missing before agreement check.');
+    delete request.workflowVersion;
+    delete request.workflow_version;
+    delete request.workOrderSummary;
+    delete request.work_order_summary;
+    delete request.nextAction;
+    delete request.allowedActions;
+    delete request.visibleState;
+    delete request.changeOrders;
+    request.fulfillmentMode = 'quoted';
     request.status = 'appointmentConfirmed';
     request.agreement = {
       version: 1,
@@ -1051,18 +1237,7 @@ async function clickAdminTab(page, tab) {
   });
   await page.reload({ waitUntil: 'domcontentloaded' });
   await clickUserNav(page, 'tasks');
-  assert(await page.locator('[data-action="startCustomerRequest"]').count() === 1, 'Confirmed agreement must expose exactly one start-work action.');
-  const startWork = await revealRequestAction(page, 'startCustomerRequest');
-  await startWork.click();
-  await page.waitForFunction(() => {
-    const card = document.querySelector('[data-request-disclosure]');
-    return card && /قيد التنفيذ|In progress/i.test(card.textContent || '');
-  });
-  assert(await page.locator('[data-request-disclosure]').count(), 'Starting work removed the user from active requests.');
-  assert(
-    await page.locator('[data-request-disclosure] .request-status').filter({ hasText: /قيد التنفيذ|In progress/i }).count(),
-    'Request did not move to in-progress after work started.',
-  );
+  assert(await page.locator('[data-action="startCustomerRequest"], [data-action="workflowStartRequest"]').count() === 0, 'Customer must never receive the provider start-work action.');
 
   await revealRequestAction(page, 'openRequestTaskDetails').then(action => action.click());
   await page.locator('.task-detail-sheet').waitFor({ state: 'visible' });
@@ -1072,6 +1247,19 @@ async function clickAdminTab(page, tab) {
   const calendarDownload = await downloadPromise;
   assert((await calendarDownload.suggestedFilename()).endsWith('.ics'), 'Calendar export is not an ICS file.');
   await page.locator('.task-detail-sheet [data-action="closeModal"]').click();
+
+  // The provider completion action is valid only after the server has advanced the job to in-progress.
+  mockCustomerRequests = await page.evaluate(() => {
+    const key = 'KHADAMATI_PRIVATE_STATE_V1';
+    const state = JSON.parse(sessionStorage.getItem(key) || '{}');
+    const request = state.customerRequests?.find(item => item.acceptedProviderId);
+    if (!request) throw new Error('Accepted request is missing before provider in-progress check.');
+    request.status = 'inProgress';
+    request.visibleState = 'in_progress';
+    request.updatedAt = new Date(Date.now() + 1000).toISOString();
+    sessionStorage.setItem(key, JSON.stringify(state));
+    return state.customerRequests;
+  });
 
   await clickUserNav(page, 'myAccount');
   await page.locator('details.account-disclosure:has([data-action="providerMode"]) > summary').click();
@@ -1090,11 +1278,13 @@ async function clickAdminTab(page, tab) {
   assert(await page.locator('.chat-profile-identity b').filter({ hasText: /مستخدم الاختبار/i }).count(), 'Provider conversation page did not open the correct chat directly.');
   await page.locator('.chat-sheet [data-action="closeModalSoft"]').click();
   assert(await page.locator('.provider-workspace .conversation-page-list').count(), 'Closing a chat did not return to the provider conversation page.');
-  await page.locator('.side-nav [data-action="providerTab"][data-tab="tasks"]').click();
+  await clickProviderNav(page, 'tasks');
   await dismissProviderSectionGuide(page, '06a-provider-tasks-guide');
   assert(await page.locator('.provider-active-jobs .provider-task-card').count(), 'Accepted request is missing from provider active jobs.');
   assert(await page.locator('.provider-active-jobs [data-action="providerAcceptRequest"]').count() === 0, 'Provider can still submit an offer after being selected.');
-  assert(await page.locator('.provider-active-jobs [data-action="openCompletionEvidence"]').count() === 1, 'Provider active job must expose exactly one completion action.');
+  const completionActionCount = await page.locator('.provider-active-jobs [data-action="openCompletionEvidence"]').count();
+  assert(completionActionCount === 1, `Provider active job must expose exactly one completion action (found ${completionActionCount}).`);
+  mockCustomerRequests = null;
   const providerChatAction = page.locator('.provider-active-jobs [data-action="openRequestChat"]').first();
   const providerTaskDetails = providerChatAction.locator('xpath=ancestor::details[contains(@class,"task-secondary-details")][1]');
   if (!await providerChatAction.isVisible() && await providerTaskDetails.count()) await providerTaskDetails.locator(':scope > summary').click();
@@ -1109,8 +1299,14 @@ async function clickAdminTab(page, tab) {
   assert(await page.locator('[data-action="updateProviderArrival"]').count() === 0, 'Removed provider-arrival controls are still exposed.');
   await capture(page, '06-provider-active-jobs');
 
-  await page.locator('.side-nav [data-action="providerTab"][data-tab="profile"]').click();
+  await clickProviderNav(page, 'profile');
   await dismissProviderSectionGuide(page, '06b-provider-account-guide');
+  assert(await page.locator('.provider-space-title h1').filter({ hasText: /مساحتك|Your space/i }).count(), 'Provider account did not open the structured Your space page.');
+  await page.locator('[data-action="openProviderProfileEditor"]').click();
+  await page.waitForSelector('.provider-profile-edit-sheet');
+  assert(await page.locator('#ppEmail').count(), 'Provider profile editor is missing email.');
+  assert(await page.locator('#ppAge').count(), 'Individual provider profile editor is missing age.');
+  assert(await page.locator('#ppNationality').count(), 'Individual provider profile editor is missing nationality.');
   await page.locator('#ppBeforeImage').setInputFiles(path.join(__dirname, '..', 'app-icon-192.png'));
   await page.locator('#ppAfterImage').setInputFiles(path.join(__dirname, '..', 'app-icon-512.png'));
   await page.locator('#ppBeforeAfterCaption').fill('نتيجة اختبار قبل وبعد');
@@ -1119,6 +1315,14 @@ async function clickAdminTab(page, tab) {
   await page.locator('#ppIntroVideoUrl').fill('https://example.com/khadamati-intro.mp4');
   await page.locator('[data-action="saveProviderIntroVideo"]').click();
   await page.waitForSelector('.provider-media-preview');
+  await page.locator('#ppEmail').fill('provider@example.test');
+  await page.locator('#ppAge').fill('31');
+  await page.locator('#ppNationality').fill('عُماني');
+  await page.locator('#ppCommercialNo').fill('UI-LIC-100');
+  await page.locator('#ppDocs').setInputFiles(path.join(__dirname, '..', 'app-icon-192.png'));
+  await page.locator('[data-action="saveProviderProfile"]').click();
+  await page.waitForSelector('.provider-profile-edit-sheet', { state: 'detached' });
+  assert(await page.locator('.provider-space').count(), 'Saving an individual provider profile did not return to Your space.');
   await capture(page, '07-provider-media');
 
   await page.locator('.provider-top-actions [data-action="switchAccountMode"]').click();
@@ -1158,22 +1362,27 @@ async function clickAdminTab(page, tab) {
   await clickUserNav(page, 'myAccount');
   await page.locator('details.account-disclosure:has([data-action="providerMode"]) > summary').click();
   await page.locator('.account-menu [data-action="providerMode"], .account-menu [data-action="nav"][data-view="provider"]').first().click();
-  await page.waitForSelector('.provider-adaptive-nav');
-  const directSupport = page.locator('.side-nav [data-action="providerTab"][data-tab="support"]').first();
-  if (await directSupport.isVisible()) await directSupport.click();
-  else if (await page.locator('.side-nav [data-action="providerTab"][data-tab="profile"]').count()) {
-    await page.locator('.side-nav [data-action="providerTab"][data-tab="profile"]').first().click();
-    await page.locator('[data-action="providerTab"][data-tab="support"]').first().click();
-  }
-  else if (await directSupport.count()) await directSupport.evaluate(element => element.click());
-  else throw new Error('Provider support navigation is unavailable.');
+  await page.waitForSelector(IS_MOBILE ? '.provider-bottom-nav' : '.provider-desktop-nav');
+  await clickProviderNav(page, 'support');
   await dismissProviderSectionGuide(page);
   const accountSecurity = page.locator('.compact-settings-disclosure').filter({ has: page.locator('[data-action="confirmLogout"]') });
   if (!(await accountSecurity.getAttribute('open'))) await accountSecurity.locator('summary').click();
   await accountSecurity.locator('[data-action="confirmLogout"]').click();
   assert(await page.locator('.confirmation-sheet').count(), 'Provider sign-out confirmation is missing.');
   await page.locator('.confirmation-sheet [data-action="providerLogout"]').click();
-  await page.locator('[data-action="goBack"]').click();
+  await page.waitForFunction(() => {
+    const auth = JSON.parse(sessionStorage.getItem('KHADAMATI_AUTH_V3') || '{}');
+    return auth.userToken === 'ui-user-token' && !auth.providerToken;
+  });
+  const authAfterProviderLogout = await page.evaluate(() => JSON.parse(sessionStorage.getItem('KHADAMATI_AUTH_V3') || '{}'));
+  assert(authAfterProviderLogout.userToken === 'ui-user-token' && !authAfterProviderLogout.providerToken, 'Provider sign-out did not preserve the independent customer session.');
+  await clickUserNav(page, 'myAccount');
+  const userLogout = page.locator('[data-action="confirmLogout"][data-kind="user"]').first();
+  const userSecurity = userLogout.locator('xpath=ancestor::details[1]');
+  if (!await userLogout.isVisible() && await userSecurity.count()) await userSecurity.locator(':scope > summary').click();
+  await userLogout.click();
+  await page.locator('.confirmation-sheet [data-action="customerLogout"]').click();
+  await page.waitForSelector('[data-action="enterGuest"]');
   await page.locator('[data-action="enterGuest"]').click();
   if (await page.locator('.role-onboarding').count()) {
     assert(/assets\/onboarding\/core\/guest-browse\.webp/.test(await page.locator('.role-onboarding .onboarding-visual img').getAttribute('src')), 'Guest onboarding did not open its dedicated artwork.');

@@ -18,6 +18,7 @@ import mimetypes
 import os
 import re
 import secrets
+import socket
 import smtplib
 import sqlite3
 import ssl
@@ -45,13 +46,20 @@ from khadamati_domain import (
     run_subscription_migration_v1,
 )
 from khadamati_workflow import (
+    BookingPolicyService,
     CompletionEvidenceService,
+    InstantBookingService,
+    NotificationActionService,
     RequestAgreementService,
+    RequestChangeOrderService,
     RequestIdempotencyService,
     RequestLifecycleService,
+    RequestWorkOrderService,
     ServiceAssetService,
+    StartVerificationService,
     attach_workflow_data,
     install_workflow_schema,
+    notification_request_state,
 )
 from khadamati_locations import (
     LocationCatalogService,
@@ -100,8 +108,10 @@ from khadamati_platform import (
 )
 
 try:
+    import requests
     from pywebpush import WebPushException, webpush
 except ImportError:
+    requests = None
     WebPushException = Exception
     webpush = None
 
@@ -1010,7 +1020,7 @@ def init_db():
             );
             CREATE TABLE IF NOT EXISTS reviews(
               id TEXT PRIMARY KEY, provider_id TEXT NOT NULL, rating INTEGER NOT NULL, customer_name TEXT,
-              phone TEXT, comment TEXT, dimensions TEXT DEFAULT '{}',
+              phone TEXT, comment TEXT, dimensions TEXT DEFAULT '{}', tags TEXT DEFAULT '[]',
               approved INTEGER NOT NULL DEFAULT 1, created_at TEXT DEFAULT CURRENT_TIMESTAMP
             );
             CREATE TABLE IF NOT EXISTS complaints(
@@ -1101,6 +1111,35 @@ def init_db():
               id TEXT PRIMARY KEY, target_kind TEXT NOT NULL, target_id TEXT DEFAULT '', endpoint TEXT NOT NULL UNIQUE,
               subscription_json TEXT NOT NULL, active INTEGER NOT NULL DEFAULT 1,
               last_success_at TEXT DEFAULT '', created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS push_subscription_bindings(
+              id TEXT PRIMARY KEY,
+              target_kind TEXT NOT NULL,
+              target_id TEXT NOT NULL DEFAULT '',
+              endpoint TEXT NOT NULL,
+              subscription_json TEXT NOT NULL,
+              active INTEGER NOT NULL DEFAULT 1,
+              last_success_at TEXT DEFAULT '',
+              created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+              updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+              UNIQUE(target_kind,target_id,endpoint)
+            );
+            CREATE TABLE IF NOT EXISTS push_delivery_outbox(
+              id TEXT PRIMARY KEY,
+              notification_id TEXT NOT NULL UNIQUE,
+              target_kind TEXT NOT NULL,
+              target_id TEXT NOT NULL DEFAULT '',
+              payload_json TEXT NOT NULL,
+              status TEXT NOT NULL DEFAULT 'pending',
+              attempts INTEGER NOT NULL DEFAULT 0,
+              available_at TEXT DEFAULT CURRENT_TIMESTAMP,
+              locked_at TEXT DEFAULT '',
+              claim_token TEXT DEFAULT '',
+              delivered_at TEXT DEFAULT '',
+              last_error TEXT DEFAULT '',
+              created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+              updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+              FOREIGN KEY(notification_id) REFERENCES app_notifications(id) ON DELETE CASCADE
             );
             CREATE TABLE IF NOT EXISTS policy_acceptances(
               id TEXT PRIMARY KEY, user_id TEXT DEFAULT '', phone TEXT DEFAULT '', policy_version TEXT NOT NULL,
@@ -1200,9 +1239,13 @@ def init_db():
             CREATE INDEX IF NOT EXISTS idx_request_suggestions_request ON request_provider_suggestions(request_id,status,created_at);
             CREATE INDEX IF NOT EXISTS idx_request_suggestions_user ON request_provider_suggestions(suggested_by_user_id,created_at);
             CREATE INDEX IF NOT EXISTS idx_notifications_target ON app_notifications(target_kind, target_id, is_read);
+            CREATE INDEX IF NOT EXISTS idx_push_binding_target
+              ON push_subscription_bindings(target_kind,target_id,active);
             CREATE INDEX IF NOT EXISTS idx_sessions_hash ON auth_sessions(token_hash, expires_at);
             CREATE INDEX IF NOT EXISTS idx_dispatch_release ON request_dispatches(status,release_at,wave);
             CREATE INDEX IF NOT EXISTS idx_dispatch_provider ON request_dispatches(provider_id,status,notified_at);
+            CREATE INDEX IF NOT EXISTS idx_push_outbox_pending
+              ON push_delivery_outbox(status,available_at,created_at);
             CREATE INDEX IF NOT EXISTS idx_consent_lookup ON contact_consents(request_id,provider_id,channel,status);
             CREATE INDEX IF NOT EXISTS idx_subscription_provider ON subscriptions(provider_id,status,end_date);
             CREATE INDEX IF NOT EXISTS idx_payment_subscription ON payments(subscription_id,status);
@@ -1265,6 +1308,7 @@ def init_db():
         ensure_column(con, "auth_sessions", "refreshed_at", "TEXT DEFAULT ''")
         ensure_column(con, "password_recoveries", "verified_at", "TEXT DEFAULT ''")
         ensure_column(con, "password_recoveries", "reset_token_hash", "TEXT DEFAULT ''")
+        ensure_column(con, "push_delivery_outbox", "claim_token", "TEXT DEFAULT ''")
         con.execute(
             """CREATE UNIQUE INDEX IF NOT EXISTS idx_auth_refresh_hash
             ON auth_sessions(refresh_hash) WHERE refresh_hash!=''"""
@@ -1279,6 +1323,13 @@ def init_db():
         ensure_column(con, "customer_requests", "expansion_at", "TEXT DEFAULT ''")
         ensure_column(con, "customer_requests", "ranking_version", "TEXT DEFAULT ''")
         install_workflow_schema(con)
+        con.execute(
+            """INSERT OR IGNORE INTO push_subscription_bindings(
+            id,target_kind,target_id,endpoint,subscription_json,active,last_success_at,
+            created_at,updated_at)
+            SELECT id,target_kind,target_id,endpoint,subscription_json,active,
+            last_success_at,created_at,created_at FROM push_subscriptions"""
+        )
         ensure_column(con, "packages", "currency", "TEXT NOT NULL DEFAULT 'OMR'")
         ensure_column(con, "packages", "max_categories", "INTEGER NOT NULL DEFAULT 1")
         ensure_column(con, "packages", "max_wilayats", "INTEGER NOT NULL DEFAULT 5")
@@ -1333,6 +1384,7 @@ def init_db():
         ensure_column(con, "reviews", "request_id", "TEXT DEFAULT ''")
         ensure_column(con, "reviews", "user_id", "TEXT DEFAULT ''")
         ensure_column(con, "reviews", "dimensions", "TEXT DEFAULT '{}'")
+        ensure_column(con, "reviews", "tags", "TEXT DEFAULT '[]'")
         ensure_column(con, "reviews", "deleted_at", "TEXT DEFAULT ''")
         ensure_column(con, "reviews", "moderation_reason", "TEXT DEFAULT ''")
         ensure_column(con, "complaints", "request_id", "TEXT DEFAULT ''")
@@ -1346,6 +1398,11 @@ def init_db():
         install_security_schema(con)
         install_growth_schema(con)
         install_platform_schema(con)
+        con.execute(
+            """INSERT OR IGNORE INTO platform_feature_flags(
+            key,enabled,rollout_percentage,audiences,config,updated_by)
+            VALUES('booking_v2',0,0,'["user"]','{"migration":"additive"}','system')"""
+        )
         ensure_column(con, "customer_requests", "organization_id", "TEXT DEFAULT ''")
         ensure_column(con, "customer_requests", "organization_location_id", "TEXT DEFAULT ''")
         ensure_column(con, "customer_requests", "requested_by_member_id", "TEXT DEFAULT ''")
@@ -1756,6 +1813,7 @@ def provider_request_view(payload, created_at=""):
 
 
 REVIEW_DIMENSION_KEYS = ("quality", "punctuality", "communication", "value")
+REVIEW_TAG_KEYS = ("quality", "punctual", "communication", "value")
 
 
 def normalize_review_dimensions(value, fallback_rating=0):
@@ -1777,6 +1835,22 @@ def normalize_review_dimensions(value, fallback_rating=0):
     return result
 
 
+def normalize_review_tags(value):
+    source = jload(value, []) if isinstance(value, str) else value
+    if source is None:
+        source = []
+    if not isinstance(source, list):
+        raise DomainError("invalid_review_tags")
+    tags = list(
+        dict.fromkeys(safe_text(tag, 40) for tag in source if safe_text(tag, 40))
+    )
+    if len(tags) > len(REVIEW_TAG_KEYS) or any(
+        tag not in REVIEW_TAG_KEYS for tag in tags
+    ):
+        raise DomainError("invalid_review_tags")
+    return tags
+
+
 def row_review(r, private=False):
     d = dict(r)
     d["approved"] = bool(d["approved"])
@@ -1784,6 +1858,10 @@ def row_review(r, private=False):
     d["dimensions"] = normalize_review_dimensions(
         d.get("dimensions"), d.get("rating", 0)
     )
+    try:
+        d["tags"] = normalize_review_tags(d.get("tags"))
+    except DomainError:
+        d["tags"] = []
     if not private:
         for key in ("phone", "user_id", "request_id", "deleted_at", "moderation_reason"):
             d.pop(key, None)
@@ -2498,6 +2576,15 @@ def row_customer_request(r, sign_private=False):
     d["dispatchStartedAt"] = d.pop("dispatch_started_at", "")
     d["expansionAt"] = d.pop("expansion_at", "")
     d["rankingVersion"] = d.pop("ranking_version", "")
+    d["workflowVersion"] = d.pop("workflow_version", "legacy_v1") or "legacy_v1"
+    d["fulfillmentMode"] = d.pop("fulfillment_mode", "quoted") or "quoted"
+    d["pricingMode"] = d.pop("pricing_mode", "quote") or "quote"
+    d["defaultDurationMinutes"] = int(d.pop("default_duration_minutes", 60) or 60)
+    d["evidencePolicy"] = d.pop("evidence_policy", "required_photo") or "required_photo"
+    d["startVerificationMode"] = d.pop("start_verification_mode", "none") or "none"
+    d["autoCloseEnabled"] = bool(d.pop("auto_close_enabled", 0))
+    d["completionWindowHours"] = int(d.pop("completion_window_hours", 48) or 48)
+    d["completionDueAt"] = d.pop("completion_due_at", "")
     d["assetId"] = d.pop("asset_id", "")
     d["organizationId"] = d.pop("organization_id", "")
     d["organizationLocationId"] = d.pop("organization_location_id", "")
@@ -2530,9 +2617,17 @@ def community_snapshot_view(snapshot):
     return result
 
 
-def request_with_workflow(con, item, *, asset_visible=False):
+def request_with_workflow(
+    con, item, *, asset_visible=False, actor_kind="", actor_id=""
+):
     """Attach private workflow details after request-level authorization."""
-    result = attach_workflow_data(con, item, asset_visible=asset_visible)
+    result = attach_workflow_data(
+        con,
+        item,
+        asset_visible=asset_visible,
+        actor_kind=actor_kind,
+        actor_id=actor_id,
+    )
     evidence = result.get("completionEvidence")
     if evidence:
         evidence["beforeImages"] = [
@@ -2695,6 +2790,20 @@ def row_notification(r):
     d["actionText"] = d.pop("action_text")
     d["actionRoute"] = d.pop("action_route")
     d["read"] = bool(d.pop("is_read"))
+    d["dedupeKey"] = d.pop("dedupe_key", "")
+    d["entityKind"] = d.pop("entity_kind", "")
+    d["entityId"] = d.pop("entity_id", "")
+    d["actionKind"] = d.pop("action_kind", "")
+    d["requiresAction"] = bool(d.pop("requires_action", 0))
+    d["stateVersion"] = int(d.pop("state_version", 0) or 0)
+    d["seenAt"] = d.pop("seen_at", "")
+    d["readAt"] = d.pop("read_at", "")
+    d["acknowledgedAt"] = d.pop("acknowledged_at", "")
+    d["actedAt"] = d.pop("acted_at", "")
+    d["dismissedAt"] = d.pop("dismissed_at", "")
+    d["snoozedUntil"] = d.pop("snoozed_until", "")
+    d["supersededAt"] = d.pop("superseded_at", "")
+    d["expiresAt"] = d.pop("expires_at", "")
     d["createdAt"] = d.pop("created_at")
     return d
 
@@ -2715,81 +2824,449 @@ def push_ready():
     return bool(webpush and os.environ.get("VAPID_PRIVATE_KEY") and os.environ.get("VAPID_PUBLIC_KEY"))
 
 
+PUSH_ENDPOINT_HOSTS = frozenset({
+    "fcm.googleapis.com",
+    "updates.push.services.mozilla.com",
+    "web.push.apple.com",
+})
+PUSH_ENDPOINT_HOST_SUFFIXES = (".notify.windows.com",)
+PUSH_DELIVERY_TIMEOUT_SECONDS = 10
+
+
+def _push_endpoint_host_allowed(hostname):
+    hostname = str(hostname or "").rstrip(".").lower()
+    return hostname in PUSH_ENDPOINT_HOSTS or any(
+        hostname.endswith(suffix) and hostname != suffix[1:]
+        for suffix in PUSH_ENDPOINT_HOST_SUFFIXES
+    )
+
+
+if requests:
+    class NoRedirectPushSession(requests.Session):
+        """HTTP transport that never follows a push-service redirect."""
+
+        def post(self, url, *args, **kwargs):
+            kwargs["allow_redirects"] = False
+            return super().post(url, *args, **kwargs)
+else:  # pragma: no cover - pywebpush also depends on requests
+    NoRedirectPushSession = None
+
+
+def validate_push_endpoint(endpoint, *, resolver=None):
+    """Allow only browser push services and reject non-public DNS answers."""
+    endpoint = safe_text(endpoint, 2048)
+    parsed = urlparse(endpoint)
+    try:
+        endpoint_port = parsed.port
+    except ValueError as exc:
+        raise DomainError("invalid_push_endpoint", 400) from exc
+    if (
+        parsed.scheme != "https"
+        or not parsed.hostname
+        or parsed.username
+        or parsed.password
+        or parsed.fragment
+        or endpoint_port not in (None, 443)
+    ):
+        raise DomainError("invalid_push_endpoint", 400)
+    hostname = parsed.hostname.rstrip(".").lower()
+    if not _push_endpoint_host_allowed(hostname):
+        raise DomainError("push_endpoint_host_not_allowed", 400)
+    if hostname in {"localhost", "localhost.localdomain"} or hostname.endswith(
+        (".localhost", ".local", ".internal")
+    ):
+        raise DomainError("push_endpoint_not_public", 400)
+    resolver = resolver or socket.getaddrinfo
+    try:
+        addresses = resolver(hostname, endpoint_port or 443, type=socket.SOCK_STREAM)
+    except (OSError, socket.gaierror) as exc:
+        raise DomainError("push_endpoint_unresolvable", 400) from exc
+    if not addresses:
+        raise DomainError("push_endpoint_unresolvable", 400)
+    for address in addresses:
+        raw_ip = address[4][0]
+        try:
+            ip = ipaddress.ip_address(str(raw_ip).split("%", 1)[0])
+        except ValueError as exc:
+            raise DomainError("invalid_push_endpoint", 400) from exc
+        if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped:
+            ip = ip.ipv4_mapped
+        if not ip.is_global or any(
+            (
+                ip.is_private,
+                ip.is_loopback,
+                ip.is_link_local,
+                ip.is_reserved,
+                ip.is_multicast,
+                ip.is_unspecified,
+            )
+        ):
+            raise DomainError("push_endpoint_not_public", 400)
+    return endpoint
+
+
 def deliver_push(target_kind, target_id, payload):
     if not push_ready():
-        return
+        return False
     time.sleep(0.15)
     with db() as con:
         subscriptions = list(
             con.execute(
-                """SELECT id,subscription_json FROM push_subscriptions
+                """SELECT id,subscription_json FROM push_subscription_bindings
                 WHERE target_kind=? AND target_id=? AND active=1""",
                 (target_kind, target_id or ""),
             )
         )
+    transient_failure = False
     for subscription in subscriptions:
+        subscription_info = jload(subscription["subscription_json"], {})
+        try:
+            validate_push_endpoint(subscription_info.get("endpoint", ""))
+        except DomainError:
+            with db() as con:
+                con.execute(
+                    """UPDATE push_subscription_bindings SET active=0,
+                    updated_at=CURRENT_TIMESTAMP WHERE id=?""",
+                    (subscription["id"],),
+                )
+            continue
+        push_session = NoRedirectPushSession() if NoRedirectPushSession else None
         try:
             webpush(
-                subscription_info=jload(subscription["subscription_json"], {}),
+                subscription_info=subscription_info,
                 data=jdump(payload),
                 vapid_private_key=os.environ["VAPID_PRIVATE_KEY"],
                 vapid_claims={"sub": os.environ.get("VAPID_SUBJECT", f"mailto:{SUPPORT_EMAIL}")},
-                ttl=300,
+                ttl=max(300, min(int(payload.get("ttl") or 300), 28 * 24 * 60 * 60)),
+                timeout=PUSH_DELIVERY_TIMEOUT_SECONDS,
+                requests_session=push_session,
             )
             with db() as con:
                 con.execute(
-                    "UPDATE push_subscriptions SET last_success_at=CURRENT_TIMESTAMP WHERE id=?",
+                    """UPDATE push_subscription_bindings SET
+                    last_success_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP
+                    WHERE id=?""",
                     (subscription["id"],),
                 )
         except WebPushException as err:
             status = getattr(getattr(err, "response", None), "status_code", 0)
-            if status in (404, 410):
+            if status in (404, 410) or 300 <= status < 400:
                 with db() as con:
-                    con.execute("UPDATE push_subscriptions SET active=0 WHERE id=?", (subscription["id"],))
+                    con.execute(
+                        """UPDATE push_subscription_bindings SET active=0,
+                        updated_at=CURRENT_TIMESTAMP WHERE id=?""",
+                        (subscription["id"],),
+                    )
+            else:
+                transient_failure = True
         except Exception as err:
+            transient_failure = True
             log_event(
                 "push.delivery_skipped",
                 level="warning",
                 errorType=type(err).__name__,
             )
+        finally:
+            if push_session:
+                push_session.close()
+    return not transient_failure
 
 
-def create_notification(con, target_kind, target_id, title, message="", *, type_="general",
-                        related_id="", priority="normal", action_text="", action_route=""):
+def process_push_outbox(limit=20):
+    """Claim committed push rows and deliver them with bounded retries."""
+    if not push_ready():
+        return {"claimed": 0, "delivered": 0, "retried": 0}
+    now = datetime.now(UTC)
+    stale_lock = now - timedelta(minutes=5)
+    claimed = []
+    with db() as con:
+        con.execute("BEGIN IMMEDIATE")
+        rows = list(
+            con.execute(
+                """SELECT o.*,n.expires_at notification_expires_at
+                FROM push_delivery_outbox o
+                JOIN app_notifications n ON n.id=o.notification_id
+                WHERE (o.status='pending' AND o.available_at<=?)
+                   OR (o.status='processing' AND o.locked_at!='' AND o.locked_at<=?)
+                ORDER BY o.created_at,o.id LIMIT ?""",
+                (now.isoformat(), stale_lock.isoformat(), max(1, min(int(limit), 100))),
+            )
+        )
+        for row in rows:
+            expires_at = parse_iso(row["notification_expires_at"])
+            if expires_at and expires_at <= now:
+                con.execute(
+                    """UPDATE push_delivery_outbox SET status='expired',
+                    locked_at='',claim_token='',last_error='notification_expired',updated_at=?
+                    WHERE id=?""",
+                    (now.isoformat(), row["id"]),
+                )
+                continue
+            if int(row["attempts"] or 0) >= 8:
+                con.execute(
+                    """UPDATE push_delivery_outbox SET status='dead',locked_at='',claim_token='',
+                    last_error='delivery_attempts_exhausted',updated_at=? WHERE id=?""",
+                    (now.isoformat(), row["id"]),
+                )
+                continue
+            claim_token = secrets.token_hex(20)
+            claimed_result = con.execute(
+                """UPDATE push_delivery_outbox SET status='processing',
+                attempts=attempts+1,locked_at=?,claim_token=?,updated_at=? WHERE id=?
+                AND ((status='pending' AND available_at<=?) OR
+                (status='processing' AND locked_at!='' AND locked_at<=?))""",
+                (
+                    now.isoformat(),
+                    claim_token,
+                    now.isoformat(),
+                    row["id"],
+                    now.isoformat(),
+                    stale_lock.isoformat(),
+                ),
+            )
+            if claimed_result.rowcount == 1:
+                claimed.append({**dict(row), "claim_token": claim_token})
+    delivered = 0
+    retried = 0
+    for row in claimed:
+        success = deliver_push(
+            row["target_kind"],
+            row["target_id"],
+            jload(row["payload_json"], {}),
+        )
+        with db() as con:
+            if success:
+                result = con.execute(
+                    """UPDATE push_delivery_outbox SET status='delivered',
+                    delivered_at=?,locked_at='',claim_token='',last_error='',updated_at=?
+                    WHERE id=? AND status='processing' AND claim_token=?""",
+                    (
+                        datetime.now(UTC).isoformat(),
+                        datetime.now(UTC).isoformat(),
+                        row["id"],
+                        row["claim_token"],
+                    ),
+                )
+                delivered += int(result.rowcount or 0)
+            else:
+                attempts = int(row.get("attempts") or 0) + 1
+                if attempts >= 8:
+                    result = con.execute(
+                        """UPDATE push_delivery_outbox SET status='dead',locked_at='',
+                        claim_token='',last_error='delivery_attempts_exhausted',updated_at=?
+                        WHERE id=? AND status='processing' AND claim_token=?""",
+                        (
+                            datetime.now(UTC).isoformat(),
+                            row["id"],
+                            row["claim_token"],
+                        ),
+                    )
+                else:
+                    retry_seconds = min(3600, 15 * (2 ** min(attempts, 8)))
+                    retry_at = datetime.now(UTC) + timedelta(seconds=retry_seconds)
+                    result = con.execute(
+                        """UPDATE push_delivery_outbox SET status='pending',
+                        available_at=?,locked_at='',claim_token='',last_error='delivery_failed',
+                        updated_at=? WHERE id=? AND status='processing' AND claim_token=?""",
+                        (
+                            retry_at.isoformat(),
+                            datetime.now(UTC).isoformat(),
+                            row["id"],
+                            row["claim_token"],
+                        ),
+                    )
+                retried += int(result.rowcount or 0)
+    return {"claimed": len(claimed), "delivered": delivered, "retried": retried}
+
+
+def push_outbox_worker():
+    while True:
+        try:
+            process_push_outbox()
+        except Exception as err:
+            log_event(
+                "push.outbox_worker_failed",
+                level="warning",
+                errorType=type(err).__name__,
+            )
+        time.sleep(2)
+
+
+def next_notification_state_version(
+    con,
+    *,
+    entity_kind,
+    entity_id,
+    action_kind,
+    target_kind,
+    target_id,
+    minimum=1,
+    reuse_active=False,
+):
+    """Allocate a monotonic action revision for one notification audience.
+
+    Work Order versions do not change when an offer is edited or when a
+    rejected Change Order is proposed again.  Those action streams therefore
+    need their own persisted monotonic revision to keep dedupe keys fresh.
+    """
+    values = (
+        safe_text(entity_kind, 40),
+        safe_text(entity_id, 160),
+        safe_text(action_kind, 80),
+        safe_text(target_kind, 24),
+        safe_text(target_id, 120),
+    )
+    if reuse_active:
+        active = con.execute(
+            """SELECT MAX(state_version) n FROM app_notifications
+            WHERE entity_kind=? AND entity_id=? AND action_kind=?
+            AND target_kind=? AND target_id=? AND acted_at=''
+            AND superseded_at='' AND dismissed_at=''
+            AND (expires_at='' OR expires_at>CURRENT_TIMESTAMP)""",
+            values,
+        ).fetchone()
+        if active and int(active["n"] or 0) > 0:
+            return int(active["n"])
+    latest = con.execute(
+        """SELECT MAX(state_version) n FROM app_notifications
+        WHERE entity_kind=? AND entity_id=? AND action_kind=?
+        AND target_kind=? AND target_id=?""",
+        values,
+    ).fetchone()
+    return max(int(minimum or 1), int(latest["n"] or 0) + 1)
+
+
+def create_notification(
+    con,
+    target_kind,
+    target_id,
+    title,
+    message="",
+    *,
+    type_="general",
+    related_id="",
+    priority="normal",
+    action_text="",
+    action_route="",
+    dedupe_key="",
+    entity_kind="",
+    entity_id="",
+    action_kind="",
+    requires_action=False,
+    state_version=0,
+    expires_at="",
+):
+    target_kind = safe_text(target_kind, 24)
+    target_id = safe_text(target_id, 120)
+    if target_kind not in {"user", "provider", "admin"}:
+        raise DomainError("invalid_notification_target")
+    entity_kind = safe_text(entity_kind, 40)
+    entity_id = safe_text(entity_id, 160)
+    action_kind = safe_text(action_kind, 80)
+    action_route = safe_text(action_route, 240)
+    if action_route and not re.fullmatch(r"[A-Za-z0-9._:-]+", action_route):
+        raise DomainError("invalid_notification_route")
+    try:
+        state_version = bounded_int(state_version, 0, minimum=0, maximum=1_000_000)
+    except DomainError:
+        state_version = 0
+    dedupe_key = safe_text(dedupe_key, 240)
+    if requires_action and entity_kind and entity_id and action_kind and not dedupe_key:
+        dedupe_key = (
+            f"{entity_kind}:{entity_id}:{action_kind}:v{state_version}:"
+            f"{target_kind}:{target_id or 'account'}"
+        )[:240]
+    if dedupe_key:
+        existing = con.execute(
+            """SELECT id,acted_at,superseded_at FROM app_notifications
+            WHERE dedupe_key=?""",
+            (dedupe_key,),
+        ).fetchone()
+        if existing:
+            if not existing["acted_at"] and not existing["superseded_at"]:
+                return existing["id"]
+            raise DomainError("notification_state_version_reused", 409)
     notification_id = slug("ntf")
+    try:
+        con.execute(
+            """INSERT INTO app_notifications(
+            id,target_kind,target_id,type,title,message,related_id,priority,action_text,
+            action_route,dedupe_key,entity_kind,entity_id,action_kind,requires_action,
+            state_version,expires_at)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                notification_id, target_kind, target_id, safe_text(type_, 40) or "general",
+                safe_text(title, 160), safe_text(message, 1200), safe_text(related_id, 160),
+                safe_text(priority, 20) or "normal", safe_text(action_text, 80),
+                action_route, dedupe_key, entity_kind, entity_id, action_kind,
+                int(bool(requires_action)), state_version, safe_text(expires_at, 80),
+            ),
+        )
+    except sqlite3.IntegrityError:
+        if not dedupe_key:
+            raise
+        existing = con.execute(
+            """SELECT id,acted_at,superseded_at FROM app_notifications
+            WHERE dedupe_key=?""",
+            (dedupe_key,),
+        ).fetchone()
+        if existing:
+            if not existing["acted_at"] and not existing["superseded_at"]:
+                return existing["id"]
+            raise DomainError("notification_state_version_reused", 409)
+        raise
+    # Persist intent even when VAPID is not configured yet.  The row shares
+    # the caller's transaction with the notification and the worker simply
+    # waits until delivery credentials become available.
+    is_chat = type_ == "chat" and bool(related_id)
+    push_tag = (
+        f"khadamati-chat-{target_kind}-{target_id or 'account'}-{related_id}"
+        if is_chat else f"khadamati-{notification_id}"
+    )
+    push_route = f"{PUBLIC_APP_URL}#notification={notification_id}"
+    ttl = 300
+    expiry = parse_iso(expires_at)
+    if expiry:
+        ttl = max(300, int((expiry - datetime.now(UTC)).total_seconds()))
+    push_body = (
+        "لديك إجراء مطلوب في خدماتي. افتح التطبيق لمراجعته بأمان."
+        if requires_action
+        else (
+            "لديك رسالة جديدة في خدماتي. افتح التطبيق لقراءتها."
+            if type_ == "chat"
+            else "لديك تحديث جديد في خدماتي. افتح التطبيق لمراجعته."
+        )
+    )
+    push_payload = {
+        "id": notification_id,
+        # Lock-screen copy never contains names, prices, addresses, chat
+        # text, or other request details. Authenticated API fetches them.
+        "title": "خدماتي",
+        "body": push_body,
+        "tag": push_tag,
+        "route": push_route,
+        "ttl": ttl,
+        "requiresAction": bool(requires_action),
+        "actionKind": action_kind,
+        "entityKind": entity_kind,
+        "entityId": entity_id,
+        "stateVersion": state_version,
+    }
     con.execute(
-        """INSERT INTO app_notifications(
-        id,target_kind,target_id,type,title,message,related_id,priority,action_text,action_route)
-        VALUES(?,?,?,?,?,?,?,?,?,?)""",
+        """INSERT INTO push_delivery_outbox(
+        id,notification_id,target_kind,target_id,payload_json,status,
+        attempts,available_at,locked_at,delivered_at,last_error)
+        VALUES(?,?,?,?,?,'pending',0,?,'','','')
+        ON CONFLICT(notification_id) DO NOTHING""",
         (
-            notification_id, target_kind, target_id or "", type_, title[:160], message[:1200],
-            related_id or "", priority, action_text[:80], action_route[:240],
+            slug("pushout"),
+            notification_id,
+            target_kind,
+            target_id or "",
+            jdump(push_payload),
+            datetime.now(UTC).isoformat(),
         ),
     )
-    if push_ready():
-        is_chat = type_ == "chat" and bool(related_id)
-        push_tag = (
-            f"khadamati-chat-{target_kind}-{target_id or 'account'}-{related_id}"
-            if is_chat else f"khadamati-{notification_id}"
-        )
-        push_route = PUBLIC_APP_URL
-        if is_chat:
-            push_route += f"#chat={related_id}&target={target_kind}"
-        threading.Thread(
-            target=deliver_push,
-            args=(
-                target_kind,
-                target_id or "",
-                {
-                    "id": notification_id,
-                    "title": title[:160],
-                    "body": message[:1200],
-                    "tag": push_tag,
-                    "route": push_route,
-                },
-            ),
-            daemon=True,
-        ).start()
     return notification_id
 
 
@@ -3019,6 +3496,55 @@ def has_permission(session, permission):
     return role in {"owner", "super_admin"} or permission in permissions
 
 
+def effective_admin_permissions(session):
+    if not session or session.get("kind") != "admin":
+        return []
+    role = str(session.get("role") or "")
+    if role in {"owner", "super_admin"}:
+        return list(ALL_PERMISSIONS)
+    raw = session.get("permissions")
+    if isinstance(raw, str):
+        raw = jload(raw, [])
+    if isinstance(raw, list) and raw:
+        return [permission for permission in raw if permission in ALL_PERMISSIONS]
+    return list(permissions_for(role))
+
+
+ADMIN_NOTIFICATION_PERMISSIONS = {
+    "request": ("review_requests",),
+    "provider_suggestion": ("review_requests",),
+    "contract": ("review_requests",),
+    "chat": ("review_requests",),
+    "user": ("review_requests",),
+    "quality": ("manage_quality",),
+    "complaint": ("manage_quality",),
+    "provider_request": ("manage_providers",),
+    "provider": ("manage_providers",),
+    "verification": ("manage_providers",),
+    "subscription": ("manage_subscriptions",),
+    "expiry": ("manage_subscriptions", "manage_providers"),
+    "advertisement": ("manage_settings",),
+    "community": ("manage_community",),
+    "security": ("manage_admins",),
+    "admin": ("manage_admins",),
+    "general": ("manage_settings",),
+}
+
+
+def admin_can_access_notification(session, notification):
+    """Scope the shared admin inbox by the current administrator's grants."""
+    if not session or session.get("kind") != "admin" or not notification:
+        return False
+    item = dict(notification)
+    if item.get("target_kind") != "admin":
+        return False
+    required = ADMIN_NOTIFICATION_PERMISSIONS.get(
+        str(item.get("type") or "general"),
+        ("manage_settings",),
+    )
+    return any(has_permission(session, permission) for permission in required)
+
+
 def scan_expirations(con):
     settings_row = con.execute("SELECT value FROM settings WHERE key='platform'").fetchone()
     settings = jload(settings_row["value"], {}) if settings_row else {}
@@ -3135,26 +3661,78 @@ def run_domain_maintenance(con):
             )
     released = RequestMarketplace(con).release_due()
     create_marketplace_notifications(con, released)
+    auto_closed = CompletionEvidenceService(con).auto_close_due()
+    for item in auto_closed:
+        create_notification(
+            con,
+            "user",
+            item["userId"],
+            "اكتمل الطلب",
+            "انتهت مهلة المراجعة المحددة وأُغلق الطلب. ما زال بإمكانك التواصل مع الدعم.",
+            type_="request",
+            related_id=item["requestId"],
+            action_text="فتح الطلب",
+            action_route=f"user:request:{item['requestId']}",
+            entity_kind="request",
+            entity_id=item["requestId"],
+            action_kind="completion_auto_closed",
+        )
+        create_notification(
+            con,
+            "provider",
+            item["providerId"],
+            "اكتملت المهمة",
+            "انتهت مهلة مراجعة العميل وأُغلقت المهمة وفق السياسة المحددة.",
+            type_="request",
+            related_id=item["requestId"],
+            action_text="فتح المهمة",
+            action_route=f"provider:tasks:{item['requestId']}",
+            entity_kind="request",
+            entity_id=item["requestId"],
+            action_kind="completion_auto_closed",
+        )
     scan_expirations(con)
-    return {"stateChanges": len(state_changes), "releasedRequests": len(released)}
+    return {
+        "stateChanges": len(state_changes),
+        "releasedRequests": len(released),
+        "autoClosedRequests": len(auto_closed),
+    }
 
 
-def catalog_snapshot(con):
+def catalog_snapshot(con, *, expose_booking_v2=True):
     categories = []
+    policy_service = BookingPolicyService(con)
     for category in con.execute(
         """SELECT id,icon,ar,en,active FROM categories
         WHERE COALESCE(deleted_at,'')='' ORDER BY rowid"""
     ):
         item = dict(category)
         item["active"] = bool(item["active"])
-        item["services"] = [
-            dict(service) | {"active": bool(service["active"])}
-            for service in con.execute(
-                """SELECT id,icon,ar,en,active FROM services
-                WHERE category_id=? AND COALESCE(deleted_at,'')='' ORDER BY rowid""",
-                (category["id"],),
+        item["services"] = []
+        for service in con.execute(
+            """SELECT id,icon,ar,en,active FROM services
+            WHERE category_id=? AND COALESCE(deleted_at,'')='' ORDER BY rowid""",
+            (category["id"],),
+        ):
+            service_item = dict(service) | {"active": bool(service["active"])}
+            service_value = f"{category['id']}|{service['id']}"
+            policy = policy_service.get(service_value)
+            if not expose_booking_v2 and policy["fulfillmentMode"] == "instant":
+                policy = BookingPolicyService.defaults(service_value)
+            service_item.update(
+                {
+                    "fulfillmentMode": policy["fulfillmentMode"],
+                    "pricingMode": policy["pricingMode"],
+                    "fixedPriceAmount": policy["fixedPriceAmount"],
+                    "defaultDuration": policy["defaultDurationMinutes"],
+                    "defaultDurationMinutes": policy["defaultDurationMinutes"],
+                    "evidencePolicy": policy["evidencePolicy"],
+                    "startVerificationMode": policy["startVerificationMode"],
+                    "autoCloseEnabled": policy["autoCloseEnabled"],
+                    "completionWindowHours": policy["completionWindowHours"],
+                }
             )
-        ]
+            item["services"].append(service_item)
         categories.append(item)
     return categories
 
@@ -3249,12 +3827,32 @@ def get_bootstrap(session=None):
                 action_text="مراجعة الإعلان",
                 action_route=f"{target_kind}:community:{item['id']}",
             )
-        categories = catalog_snapshot(con)
         is_admin = bool(session and session.get("kind") == "admin")
         is_provider = bool(session and session.get("kind") == "provider")
         is_pending_provider = bool(session and session.get("kind") == "provider_pending")
         is_user = bool(session and session.get("kind") == "user")
-        if is_admin:
+        admin_permissions = set(effective_admin_permissions(session)) if is_admin else set()
+        can_view_reports = "view_reports" in admin_permissions
+        can_manage_providers = "manage_providers" in admin_permissions
+        can_review_requests = "review_requests" in admin_permissions
+        can_manage_quality = "manage_quality" in admin_permissions
+        can_manage_subscriptions = "manage_subscriptions" in admin_permissions
+        can_manage_finance = "manage_finance" in admin_permissions
+        can_manage_settings = "manage_settings" in admin_permissions
+        can_manage_admins = "manage_admins" in admin_permissions
+        can_manage_audit = "manage_audit" in admin_permissions
+        can_manage_community = "manage_community" in admin_permissions
+        booking_v2_enabled = bool(
+            is_user
+            and FeatureFlagService(con).is_enabled(
+                "booking_v2", "user", session["userId"]
+            )
+        )
+        categories = catalog_snapshot(
+            con,
+            expose_booking_v2=(booking_v2_enabled or is_admin or is_provider),
+        )
+        if is_admin and can_manage_providers:
             provider_rows = con.execute(
                 "SELECT * FROM providers ORDER BY featured DESC,quality_score DESC,rating DESC"
             )
@@ -3274,8 +3872,8 @@ def get_bootstrap(session=None):
         providers = [
             row_provider(
                 r,
-                private=is_admin or bool(is_provider and r["id"] == session.get("providerId")),
-                sign_private=is_admin or bool(is_provider and r["id"] == session.get("providerId")),
+                private=can_manage_providers or bool(is_provider and r["id"] == session.get("providerId")),
+                sign_private=can_manage_providers or bool(is_provider and r["id"] == session.get("providerId")),
             )
             for r in provider_rows
         ]
@@ -3315,15 +3913,17 @@ def get_bootstrap(session=None):
                     "responseMinutes": int(provider.get("responseMinutes") or 30),
                 }
         for provider in providers:
-            verification = verification_service.get(
-                provider["id"],
-                private=bool(
-                    is_admin
-                    or (
-                        is_provider
-                        and provider["id"] == session.get("providerId")
-                    )
-                ),
+            verification_visible = bool(
+                can_manage_providers
+                or (
+                    is_provider
+                    and provider["id"] == session.get("providerId")
+                )
+            )
+            verification = (
+                verification_service.get(provider["id"], private=True)
+                if verification_visible
+                else {}
             )
             if verification:
                 provider["verification"] = verification
@@ -3365,10 +3965,12 @@ def get_bootstrap(session=None):
             "featuredPackagesEnabled", "featuredPackageIntervalSeconds",
             "featuredPackagePlanExposure", "supportWhatsapp",
         }
-        settings = platform_settings if is_admin else {
+        settings = platform_settings if is_admin and can_manage_settings else {
             key: value for key, value in platform_settings.items() if key in public_setting_keys
         }
-        location_catalog = location_snapshot(con, include_inactive=is_admin)
+        location_catalog = location_snapshot(
+            con, include_inactive=bool(is_admin and can_manage_settings)
+        )
         settings = dict(settings)
         settings["serviceAreas"] = [
             {
@@ -3379,11 +3981,11 @@ def get_bootstrap(session=None):
                 "w": [
                     [wilayah["ar"], wilayah["en"], wilayah["id"]]
                     for wilayah in area["w"]
-                    if is_admin or wilayah["active"]
+                    if (is_admin and can_manage_settings) or wilayah["active"]
                 ],
             }
             for area in location_catalog
-            if is_admin or area["active"]
+            if (is_admin and can_manage_settings) or area["active"]
         ]
         packages = [
             row_package(r) for r in con.execute(
@@ -3392,12 +3994,37 @@ def get_bootstrap(session=None):
         ]
         complaint_service = ComplaintCaseService(con)
         if is_admin:
-            reviews = [row_review(r, private=True) for r in con.execute("SELECT * FROM reviews ORDER BY created_at DESC")]
-            complaints = complaint_service.list_admin()
-            subscriptions = [row_subscription(r) for r in con.execute("SELECT * FROM subscriptions ORDER BY created_at DESC")]
-            payments = [row_payment(r) for r in con.execute("SELECT * FROM payments ORDER BY created_at DESC")]
-            audits = [row_audit(r) for r in con.execute("SELECT * FROM audit_logs ORDER BY created_at DESC LIMIT 80")]
-            leads = [row_lead(r) for r in con.execute("SELECT * FROM leads ORDER BY created_at DESC LIMIT 120")]
+            reviews = (
+                [row_review(r, private=True) for r in con.execute(
+                    "SELECT * FROM reviews ORDER BY created_at DESC"
+                )]
+                if can_manage_quality else []
+            )
+            complaints = complaint_service.list_admin() if can_manage_quality else []
+            subscriptions = (
+                [row_subscription(r) for r in con.execute(
+                    "SELECT * FROM subscriptions ORDER BY created_at DESC"
+                )]
+                if can_manage_subscriptions else []
+            )
+            payments = (
+                [row_payment(r) for r in con.execute(
+                    "SELECT * FROM payments ORDER BY created_at DESC"
+                )]
+                if can_manage_finance else []
+            )
+            audits = (
+                [row_audit(r) for r in con.execute(
+                    "SELECT * FROM audit_logs ORDER BY created_at DESC LIMIT 80"
+                )]
+                if can_manage_audit else []
+            )
+            leads = (
+                [row_lead(r) for r in con.execute(
+                    "SELECT * FROM leads ORDER BY created_at DESC LIMIT 120"
+                )]
+                if can_review_requests else []
+            )
         elif is_provider:
             pid = session["providerId"]
             reviews = [
@@ -3428,7 +4055,13 @@ def get_bootstrap(session=None):
             ]
             complaints, subscriptions, payments, audits, leads = [], [], [], [], []
         all_customer_requests = [
-            row_customer_request(r, sign_private=bool(is_admin or is_provider or is_user))
+            row_customer_request(
+                r,
+                sign_private=bool(
+                    is_provider or is_user
+                    or (is_admin and (can_review_requests or can_manage_quality))
+                ),
+            )
             for r in con.execute(
                 """SELECT * FROM customer_requests
                 WHERE status!='deleted' ORDER BY created_at DESC LIMIT 300"""
@@ -3442,27 +4075,55 @@ def get_bootstrap(session=None):
         if is_admin or is_provider:
             marketplace_requests = []
         if is_admin:
-            customer_requests = [
-                request_with_workflow(con, item, asset_visible=True)
-                for item in all_customer_requests
-            ]
-            for item in customer_requests:
-                item["providerSuggestions"] = request_suggestions(con, item["id"], include_hidden=True)
+            can_review_evidence = can_manage_quality
+            customer_requests = []
+            if can_review_requests or can_review_evidence:
+                customer_requests = [
+                    request_with_workflow(
+                        con,
+                        item,
+                        asset_visible=can_review_evidence,
+                        actor_kind="admin",
+                        actor_id=session.get("id", ""),
+                    )
+                    for item in all_customer_requests
+                ]
+                for item in customer_requests:
+                    if can_review_requests:
+                        item["providerSuggestions"] = request_suggestions(
+                            con, item["id"], include_hidden=True
+                        )
+                    else:
+                        item["workOrder"] = None
+                        item["workOrderVersions"] = []
+                        item["changeOrders"] = []
+                        item["workOrderSummary"] = None
+                        item["agreement"] = None
+                    if not can_review_evidence:
+                        item["completionEvidence"] = None
             notifications = [
                 row_notification(r)
                 for r in con.execute(
                     """SELECT * FROM app_notifications
-                    WHERE target_kind='admin' ORDER BY created_at DESC LIMIT 300"""
+                    WHERE target_kind='admin'
+                    ORDER BY requires_action DESC,
+                    CASE priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1
+                    WHEN 'normal' THEN 2 ELSE 3 END,
+                    CASE WHEN expires_at='' THEN 1 ELSE 0 END,expires_at,created_at DESC
+                    LIMIT 300"""
                 )
+                if admin_can_access_notification(session, r)
             ]
             users = [
                 row_app_user(r, private=True, sign_private=True)
                 for r in con.execute("SELECT * FROM app_users ORDER BY last_login DESC LIMIT 300")
-            ]
-            advertisements = [
-                row_advertisement(r)
-                for r in con.execute("SELECT * FROM advertisements ORDER BY created_at DESC")
-            ]
+            ] if can_manage_admins else []
+            advertisements = (
+                [row_advertisement(r) for r in con.execute(
+                    "SELECT * FROM advertisements ORDER BY created_at DESC"
+                )]
+                if can_manage_settings else []
+            )
         elif is_provider:
             pid = session["providerId"]
             customer_requests = [
@@ -3474,7 +4135,11 @@ def get_bootstrap(session=None):
                     con,
                     item,
                     asset_visible=item.get("acceptedProviderId") == pid,
+                    actor_kind="provider",
+                    actor_id=pid,
                 )
+                if item.get("acceptedProviderId") == pid
+                else item
                 for item in customer_requests
             ]
             consent_service = ContactConsentService(con)
@@ -3484,7 +4149,18 @@ def get_bootstrap(session=None):
                     item["messages"] = []
                     item["agreement"] = None
                     item["completionEvidence"] = None
-                    item["events"] = []
+                    item["timeline"] = []
+                    item["workOrder"] = None
+                    item["workOrderVersions"] = []
+                    item["changeOrders"] = []
+                    item["workOrderSummary"] = None
+                    item["allowedActions"] = ["submit_offer"]
+                    item["nextAction"] = {
+                        "type": "submit_offer",
+                        "label": "إرسال عرض",
+                        "labelEn": "Submit offer",
+                        "enabled": bool(item.get("offersOpen")),
+                    }
                     item["offers"] = [
                         offer for offer in item.get("offers", [])
                         if str(offer.get("providerId") or offer.get("provider_id") or "") == str(pid)
@@ -3513,7 +4189,12 @@ def get_bootstrap(session=None):
                 row_notification(r)
                 for r in con.execute(
                     """SELECT * FROM app_notifications
-                    WHERE target_kind='provider' AND target_id=? ORDER BY created_at DESC LIMIT 160""",
+                    WHERE target_kind='provider' AND target_id=?
+                    ORDER BY requires_action DESC,
+                    CASE priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1
+                    WHEN 'normal' THEN 2 ELSE 3 END,
+                    CASE WHEN expires_at='' THEN 1 ELSE 0 END,expires_at,created_at DESC
+                    LIMIT 160""",
                     (pid,),
                 )
             ]
@@ -3528,7 +4209,13 @@ def get_bootstrap(session=None):
             uid = session["userId"]
             complaints = complaint_service.list_for_user(uid)
             customer_requests = [
-                request_with_workflow(con, item, asset_visible=True)
+                request_with_workflow(
+                    con,
+                    item,
+                    asset_visible=True,
+                    actor_kind="user",
+                    actor_id=uid,
+                )
                 for item in all_customer_requests
                 if item["userId"] == uid
             ]
@@ -3561,7 +4248,12 @@ def get_bootstrap(session=None):
                 row_notification(r)
                 for r in con.execute(
                     """SELECT * FROM app_notifications
-                    WHERE target_kind='user' AND target_id=? ORDER BY created_at DESC LIMIT 160""",
+                    WHERE target_kind='user' AND target_id=?
+                    ORDER BY requires_action DESC,
+                    CASE priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1
+                    WHEN 'normal' THEN 2 ELSE 3 END,
+                    CASE WHEN expires_at='' THEN 1 ELSE 0 END,expires_at,created_at DESC
+                    LIMIT 160""",
                     (uid,),
                 )
             ]
@@ -3587,61 +4279,109 @@ def get_bootstrap(session=None):
                     "SELECT * FROM advertisements WHERE active=1 AND COALESCE(deleted_at,'')='' ORDER BY created_at DESC"
                 )
             ]
-        payment_revenue = con.execute(
-            """SELECT COALESCE(SUM(amount),0) n FROM payments
-            WHERE kind IN ('revenue','subscription','promotion') AND status='paid'"""
-        ).fetchone()["n"]
-        finance_revenue = con.execute("SELECT COALESCE(SUM(amount),0) n FROM finance WHERE kind='revenue'").fetchone()["n"]
-        stats = {
-            "providers": len(providers),
-            "activeProviders": len([p for p in providers if p["active"]]),
-            "requests": con.execute("SELECT COUNT(*) n FROM provider_requests").fetchone()["n"],
-            "leads": con.execute("SELECT COUNT(*) n FROM leads").fetchone()["n"],
-            "revenue": payment_revenue + finance_revenue,
-            "reviews": con.execute(
-                "SELECT COUNT(*) n FROM reviews WHERE approved=1 AND COALESCE(deleted_at,'')=''"
-            ).fetchone()["n"],
-            "openComplaints": con.execute(
-                """SELECT COUNT(*) n FROM complaints
-                WHERE status NOT IN ('resolved','closed','rejected')"""
-            ).fetchone()["n"],
-            "activeSubscriptions": con.execute("SELECT COUNT(*) n FROM subscriptions WHERE status='active'").fetchone()["n"],
-            "qualityAverage": round(con.execute("SELECT COALESCE(AVG(quality_score),0) n FROM providers").fetchone()["n"], 1),
-            "whatsappLogs": con.execute("SELECT COUNT(*) n FROM whatsapp_logs").fetchone()["n"],
-            "users": con.execute("SELECT COUNT(*) n FROM app_users WHERE status='active'").fetchone()["n"],
-            "customerRequests": con.execute(
-                "SELECT COUNT(*) n FROM customer_requests WHERE status!='deleted'"
-            ).fetchone()["n"],
-            "unavailableRequests": con.execute(
-                "SELECT COUNT(*) n FROM customer_requests WHERE status='unavailable'"
-            ).fetchone()["n"],
-            "unreadNotifications": con.execute(
-                """SELECT COUNT(*) n FROM app_notifications
-                WHERE target_kind='admin' AND is_read=0"""
-            ).fetchone()["n"] if is_admin else len([n for n in notifications if not n["read"]]),
-        }
-        if not is_admin:
+        payment_revenue = 0
+        finance_revenue = 0
+        if is_admin and (can_view_reports or can_manage_finance):
+            payment_revenue = con.execute(
+                """SELECT COALESCE(SUM(amount),0) n FROM payments
+                WHERE kind IN ('revenue','subscription','promotion') AND status='paid'"""
+            ).fetchone()["n"]
+            finance_revenue = con.execute(
+                "SELECT COALESCE(SUM(amount),0) n FROM finance WHERE kind='revenue'"
+            ).fetchone()["n"]
+        if is_admin:
             stats = {
-                key: stats[key]
-                for key in ("providers", "activeProviders", "reviews", "qualityAverage", "unreadNotifications")
+                "unreadNotifications": len(
+                    [notification for notification in notifications if not notification["read"]]
+                )
             }
-        reports = {
-            "topProviders": sorted(
-                [{"id": p["id"], "name": p["name"], "rating": p["rating"], "qualityScore": p["qualityScore"], "stats": p["stats"]} for p in providers],
-                key=lambda p: (p["qualityScore"], p["rating"], p["stats"].get("whatsapp", 0)),
-                reverse=True,
-            )[:8],
-            "qualityQueue": [
-                {"id": p["id"], "name": p["name"], "qualityScore": p["qualityScore"], "rating": p["rating"], "reviews": p["reviews"]}
-                for p in providers if p["qualityScore"] < 65 or p["reviews"] == 0
-            ][:12],
-            "subscriptionRevenue": payment_revenue,
-            "complaintsByStatus": {
-                row["status"]: row["n"] for row in con.execute("SELECT status, COUNT(*) n FROM complaints GROUP BY status")
-            },
-        }
-        if not is_admin:
-            reports = {}
+            if can_view_reports or can_manage_providers:
+                stats.update({
+                    "providers": con.execute(
+                        "SELECT COUNT(*) n FROM providers"
+                    ).fetchone()["n"],
+                    "activeProviders": con.execute(
+                        "SELECT COUNT(*) n FROM providers WHERE active=1"
+                    ).fetchone()["n"],
+                    "qualityAverage": round(con.execute(
+                        "SELECT COALESCE(AVG(quality_score),0) n FROM providers"
+                    ).fetchone()["n"], 1),
+                })
+            if can_view_reports or can_review_requests:
+                stats.update({
+                    "requests": con.execute(
+                        "SELECT COUNT(*) n FROM provider_requests"
+                    ).fetchone()["n"],
+                    "leads": con.execute(
+                        "SELECT COUNT(*) n FROM leads"
+                    ).fetchone()["n"],
+                    "customerRequests": con.execute(
+                        "SELECT COUNT(*) n FROM customer_requests WHERE status!='deleted'"
+                    ).fetchone()["n"],
+                    "unavailableRequests": con.execute(
+                        "SELECT COUNT(*) n FROM customer_requests WHERE status='unavailable'"
+                    ).fetchone()["n"],
+                })
+            if can_view_reports or can_manage_finance:
+                stats["revenue"] = payment_revenue + finance_revenue
+            if can_view_reports or can_manage_quality:
+                stats.update({
+                    "reviews": con.execute(
+                        """SELECT COUNT(*) n FROM reviews WHERE approved=1
+                        AND COALESCE(deleted_at,'')=''"""
+                    ).fetchone()["n"],
+                    "openComplaints": con.execute(
+                        """SELECT COUNT(*) n FROM complaints
+                        WHERE status NOT IN ('resolved','closed','rejected')"""
+                    ).fetchone()["n"],
+                })
+            if can_view_reports or can_manage_subscriptions:
+                stats["activeSubscriptions"] = con.execute(
+                    "SELECT COUNT(*) n FROM subscriptions WHERE status='active'"
+                ).fetchone()["n"]
+            if can_view_reports or can_manage_audit:
+                stats["whatsappLogs"] = con.execute(
+                    "SELECT COUNT(*) n FROM whatsapp_logs"
+                ).fetchone()["n"]
+            if can_view_reports or can_manage_admins:
+                stats["users"] = con.execute(
+                    "SELECT COUNT(*) n FROM app_users WHERE status='active'"
+                ).fetchone()["n"]
+        else:
+            stats = {
+                "providers": len(providers),
+                "activeProviders": len([p for p in providers if p["active"]]),
+                "reviews": con.execute(
+                    """SELECT COUNT(*) n FROM reviews WHERE approved=1
+                    AND COALESCE(deleted_at,'')=''"""
+                ).fetchone()["n"],
+                "qualityAverage": round(con.execute(
+                    "SELECT COALESCE(AVG(quality_score),0) n FROM providers"
+                ).fetchone()["n"], 1),
+                "unreadNotifications": len(
+                    [notification for notification in notifications if not notification["read"]]
+                ),
+            }
+        reports = {}
+        if is_admin and can_view_reports:
+            reports = {
+                "topProviders": sorted(
+                    [{"id": p["id"], "name": p["name"], "rating": p["rating"], "qualityScore": p["qualityScore"], "stats": p["stats"]} for p in providers],
+                    key=lambda p: (p["qualityScore"], p["rating"], p["stats"].get("whatsapp", 0)),
+                    reverse=True,
+                )[:8],
+                "qualityQueue": [
+                    {"id": p["id"], "name": p["name"], "qualityScore": p["qualityScore"], "rating": p["rating"], "reviews": p["reviews"]}
+                    for p in providers if p["qualityScore"] < 65 or p["reviews"] == 0
+                ][:12],
+                "subscriptionRevenue": payment_revenue,
+                "complaintsByStatus": {
+                    row["status"]: row["n"]
+                    for row in con.execute(
+                        "SELECT status, COUNT(*) n FROM complaints GROUP BY status"
+                    )
+                },
+            }
         admin_entities = {}
         financial_metrics = {}
         if is_admin:
@@ -3686,6 +4426,8 @@ def get_bootstrap(session=None):
                 "churnRate": round(100 * churned / subscription_total, 1),
                 "subscriptionStates": state_counts,
             }
+            if not can_manage_finance:
+                financial_metrics = {}
             if has_permission(session, "manage_admins"):
                 recovery_items = []
                 for recovery in con.execute(
@@ -3827,8 +4569,29 @@ def get_bootstrap(session=None):
                     }
         community = community_snapshot_view(CommunityService(con).snapshot(session))
         platform = platform_snapshot(con, session)
+        if is_admin:
+            allowed_platform_keys = {"featureFlags"}
+            if can_manage_settings:
+                allowed_platform_keys.update({
+                    "featureFlagDetails", "integrationAdapters",
+                })
+            if can_manage_providers:
+                allowed_platform_keys.add("legalReviewQueue")
+            if can_manage_quality or can_manage_audit:
+                allowed_platform_keys.add("riskReviewQueue")
+            if can_view_reports or can_review_requests:
+                allowed_platform_keys.add("demandGapReport")
+            if can_manage_finance:
+                allowed_platform_keys.add("financialScenarios")
+            if can_manage_admins:
+                allowed_platform_keys.add("enterpriseClients")
+            platform = {
+                key: value for key, value in platform.items()
+                if key in allowed_platform_keys
+            }
         data = {
             "categories": categories,
+            "bookingV2Enabled": booking_v2_enabled,
             "providers": providers,
             "requests": requests,
             "reviews": reviews,
@@ -3851,11 +4614,14 @@ def get_bootstrap(session=None):
             "communitySettings": community.get("settings", {}),
             "communityFavorites": community.get("favorites", []),
             "communityStats": community.get("stats", {}),
-            "communityReports": community.get("reports", []) if is_admin else [],
+            "communityReports": (
+                community.get("reports", [])
+                if is_admin and can_manage_community else []
+            ),
             "demoContent": {
                 "allowed": SAMPLE_DATA_ENABLED,
                 "counts": demo_content_counts(con) if SAMPLE_DATA_ENABLED else {},
-            } if is_admin else {"allowed": False, "counts": {}},
+            } if is_admin and can_manage_settings else {"allowed": False, "counts": {}},
             "interactionBlocks": interaction_blocks,
             "platform": platform,
             "serverTime": datetime.now(UTC).isoformat(),
@@ -3863,7 +4629,10 @@ def get_bootstrap(session=None):
             "providerInsights": provider_operational_insights(
                 con, session["providerId"]
             ) if is_provider else {},
-            "demandGaps": admin_demand_gaps(con) if is_admin else [],
+            "demandGaps": (
+                admin_demand_gaps(con)
+                if is_admin and (can_view_reports or can_review_requests) else []
+            ),
             "settings": settings,
             "appConfig": {
                 "nameAr": "خدماتي",
@@ -3880,7 +4649,7 @@ def get_bootstrap(session=None):
             "maintenance": {
                 **maintenance,
                 "community": community_maintenance,
-            } if is_admin else {},
+            } if is_admin and can_manage_audit else {},
             "integrations": {
                 "whatsappConfigured": whatsapp_configured(),
                 "paymentConfigured": PaymentAdapter(con).configured,
@@ -3890,7 +4659,7 @@ def get_bootstrap(session=None):
                 "postgresReady": False,
                 "databaseEngine": "sqlite",
             },
-            "permissions": ALL_PERMISSIONS if is_admin else [],
+            "permissions": effective_admin_permissions(session) if is_admin else [],
         }
         if session and session.get("kind") == "admin":
             data["adminUser"] = {k: session[k] for k in ("id", "name", "role", "permissions")}
@@ -4742,6 +5511,40 @@ class Handler(SimpleHTTPRequestHandler):
             return self.send_json({"ok": True, "state": state})
         if path == "/api/bootstrap":
             return self.send_json(get_bootstrap(self.session()))
+        if path.startswith("/api/notifications/"):
+            session = self.session()
+            if not session:
+                return self.send_json({"error": "auth_required"}, 401)
+            notification_id = safe_text(path.rsplit("/", 1)[-1], 120)
+            target_kind = session.get("kind")
+            target_id = session.get("providerId") or session.get("userId") or ""
+            with db() as con:
+                row = con.execute(
+                    "SELECT * FROM app_notifications WHERE id=?", (notification_id,)
+                ).fetchone()
+                if not row:
+                    return self.send_json({"error": "notification_not_found"}, 404)
+                if target_kind == "admin":
+                    allowed_notification = admin_can_access_notification(session, row)
+                else:
+                    allowed_notification = (
+                        row["target_kind"] == target_kind
+                        and row["target_id"] == target_id
+                    )
+                if not allowed_notification:
+                    return self.send_json({"error": "notification_access_denied"}, 403)
+                state = notification_request_state(
+                    con,
+                    row,
+                    actor_kind=target_kind,
+                    actor_id=target_id,
+                )
+                refreshed = con.execute(
+                    "SELECT * FROM app_notifications WHERE id=?", (notification_id,)
+                ).fetchone()
+                return self.send_json(
+                    {"notification": row_notification(refreshed), **state}
+                )
         if path == "/api/config":
             return self.send_json({
                 "nameAr": "خدماتي",
@@ -5736,6 +6539,8 @@ class Handler(SimpleHTTPRequestHandler):
             return self.request_collaboration(data)
         if path == "/api/request/workflow":
             return self.request_workflow(data)
+        if path == "/api/instant-booking":
+            return self.instant_booking(data)
         if path == "/api/service-assets":
             return self.service_assets(data)
         if path == "/api/community":
@@ -5782,7 +6587,13 @@ class Handler(SimpleHTTPRequestHandler):
         dimensions = normalize_review_dimensions(data.get("dimensions"), rating)
         if set(dimensions) != set(REVIEW_DIMENSION_KEYS):
             return self.send_json({"error": "invalid_review_dimensions"}, 400)
+        try:
+            tags = normalize_review_tags(data.get("tags", []))
+        except DomainError as err:
+            return self.send_domain_error(err)
         with db() as con:
+            if not con.in_transaction:
+                con.execute("BEGIN IMMEDIATE")
             user = con.execute("SELECT * FROM app_users WHERE id=?", (session["userId"],)).fetchone()
             request_row = con.execute(
                 """SELECT id FROM customer_requests WHERE id=? AND user_id=?
@@ -5805,17 +6616,26 @@ class Handler(SimpleHTTPRequestHandler):
                 "phone": user["phone"],
                 "comment": str(data.get("comment", "") or "").strip()[:900],
                 "dimensions": dimensions,
+                "tags": tags,
             }
             con.execute(
                 """INSERT INTO reviews(
-                id,provider_id,rating,customer_name,phone,comment,dimensions,
+                id,provider_id,rating,customer_name,phone,comment,dimensions,tags,
                 approved,request_id,user_id)
-                VALUES(?,?,?,?,?,?,?,1,?,?)""",
+                VALUES(?,?,?,?,?,?,?,?,1,?,?)""",
                 (
                     item["id"], item["provider_id"], item["rating"], item["customer_name"],
                     item["phone"], item["comment"], jdump(item["dimensions"]),
+                    jdump(item["tags"]),
                     item["request_id"], item["user_id"],
                 ),
+            )
+            RequestLifecycleService(con).record(
+                request_id,
+                "rating_submitted",
+                actor_kind="user",
+                actor_id=session["userId"],
+                detail={"rating": rating, "tagCount": len(tags)},
             )
             record_loyalty_transaction(
                 con,
@@ -6756,6 +7576,11 @@ class Handler(SimpleHTTPRequestHandler):
             if path == "/api/user/requests":
                 request_id = str(data.get("id", "") or "")
                 action = data.get("action", "save")
+                if not request_id and not con.in_transaction:
+                    # Serialize idempotency lookup + request creation. A retry
+                    # that waited on this lock observes and replays the first
+                    # committed request instead of surfacing a UNIQUE failure.
+                    con.execute("BEGIN IMMEDIATE")
                 if request_id:
                     current = con.execute(
                         "SELECT * FROM customer_requests WHERE id=? AND user_id=?",
@@ -6820,6 +7645,8 @@ class Handler(SimpleHTTPRequestHandler):
                                     con,
                                     row_customer_request(updated, sign_private=True),
                                     asset_visible=True,
+                                    actor_kind="user",
+                                    actor_id=user_id,
                                 ),
                                 "loyaltySummary": loyalty_summary(
                                     con,
@@ -6853,19 +7680,59 @@ class Handler(SimpleHTTPRequestHandler):
                             "cancel": "cancelled", "delete": "deleted", "pause": "paused",
                             "archive": "archived",
                         }[action]
-                        con.execute(
-                            """UPDATE customer_requests SET status=?,offers_open=0,
-                            updated_at=CURRENT_TIMESTAMP WHERE id=?""",
-                            (next_status, request_id),
-                        )
-                        RequestLifecycleService(con).record(
-                            request_id,
-                            f"request_{action}",
-                            actor_kind="user",
-                            actor_id=user_id,
-                            from_status=current["status"],
-                            to_status=next_status,
-                        )
+                        if current["workflow_version"] == "booking_v2":
+                            allowed_from = {
+                                "cancel": {
+                                    "matching", "viewed", "unavailable", "paused",
+                                    "accepted", "appointmentConfirmed",
+                                },
+                                "delete": {"matching", "viewed", "unavailable", "paused"},
+                                "pause": {"matching", "viewed", "unavailable", "paused"},
+                                "archive": {"closed", "cancelled", "archived"},
+                            }[action]
+                            try:
+                                RequestLifecycleService(con).transition(
+                                    request_id,
+                                    next_status,
+                                    actor_kind="user",
+                                    actor_id=user_id,
+                                    event_type=f"request_{action}",
+                                    allowed_from=allowed_from,
+                                )
+                            except DomainError as err:
+                                return self.send_domain_error(err)
+                            con.execute(
+                                """UPDATE customer_requests SET offers_open=0,
+                                updated_at=CURRENT_TIMESTAMP WHERE id=?""",
+                                (request_id,),
+                            )
+                            if action == "delete":
+                                InstantBookingService(con).release_request(request_id)
+                            elif action == "archive":
+                                # A historical instant appointment must never
+                                # remain active merely because the UI archived
+                                # it. Closed bookings retain a completed slot;
+                                # cancelled bookings retain a released slot.
+                                if current["status"] in {"closed", "archived"}:
+                                    InstantBookingService(con).complete_request(request_id)
+                                elif current["status"] == "cancelled":
+                                    InstantBookingService(con).release_request(request_id)
+                        else:
+                            con.execute(
+                                """UPDATE customer_requests SET status=?,offers_open=0,
+                                updated_at=CURRENT_TIMESTAMP WHERE id=?""",
+                                (next_status, request_id),
+                            )
+                            if action in {"cancel", "delete"}:
+                                InstantBookingService(con).release_request(request_id)
+                            RequestLifecycleService(con).record(
+                                request_id,
+                                f"request_{action}",
+                                actor_kind="user",
+                                actor_id=user_id,
+                                from_status=current["status"],
+                                to_status=next_status,
+                            )
                         if action == "delete":
                             con.execute(
                                 "DELETE FROM request_dispatches WHERE request_id=?",
@@ -6928,6 +7795,8 @@ class Handler(SimpleHTTPRequestHandler):
                                             existing_request, sign_private=True
                                         ),
                                         asset_visible=True,
+                                        actor_kind="user",
+                                        actor_id=user_id,
                                     ),
                                 }
                             )
@@ -7091,14 +7960,64 @@ class Handler(SimpleHTTPRequestHandler):
                         "[]", "[]", 1,
                     ),
                 )
+                if not data.get("id") and FeatureFlagService(con).is_enabled(
+                    "booking_v2", "user", user_id
+                ):
+                    workflow_version = "booking_v2"
+                    booking_policy = BookingPolicyService(con).get(service_value)
+                else:
+                    workflow_version = (
+                        current["workflow_version"]
+                        if data.get("id") and current
+                        else "legacy_v1"
+                    )
+                    booking_policy = {
+                        "fulfillmentMode": (
+                            current["fulfillment_mode"] if data.get("id") and current else "quoted"
+                        ),
+                        "pricingMode": (
+                            current["pricing_mode"] if data.get("id") and current else "quote"
+                        ),
+                        "defaultDurationMinutes": (
+                            current["default_duration_minutes"]
+                            if data.get("id") and current else 60
+                        ),
+                        "evidencePolicy": (
+                            current["evidence_policy"]
+                            if data.get("id") and current else "required_photo"
+                        ),
+                        "startVerificationMode": (
+                            current["start_verification_mode"]
+                            if data.get("id") and current else "none"
+                        ),
+                        "autoCloseEnabled": bool(
+                            current["auto_close_enabled"]
+                            if data.get("id") and current else 0
+                        ),
+                        "completionWindowHours": (
+                            current["completion_window_hours"]
+                            if data.get("id") and current else 48
+                        ),
+                    }
                 con.execute(
                     """UPDATE customer_requests SET asset_id=?,organization_id=?,
-                    organization_location_id=?,requested_by_member_id=? WHERE id=?""",
+                    organization_location_id=?,requested_by_member_id=?,workflow_version=?,
+                    fulfillment_mode=?,pricing_mode=?,default_duration_minutes=?,
+                    evidence_policy=?,start_verification_mode=?,auto_close_enabled=?,
+                    completion_window_hours=? WHERE id=?""",
                     (
                         asset_id,
                         organization_id,
                         organization_location_id,
                         requested_by_member_id,
+                        workflow_version,
+                        booking_policy["fulfillmentMode"],
+                        booking_policy["pricingMode"],
+                        booking_policy["defaultDurationMinutes"],
+                        booking_policy["evidencePolicy"],
+                        booking_policy["startVerificationMode"],
+                        int(bool(booking_policy["autoCloseEnabled"])),
+                        booking_policy["completionWindowHours"],
                         request_id,
                     ),
                 )
@@ -7118,6 +8037,17 @@ class Handler(SimpleHTTPRequestHandler):
                             "wilayah": request_item["wilayah"],
                         },
                     )
+                    if workflow_version == "booking_v2":
+                        RequestLifecycleService(con).record(
+                            request_id,
+                            "booking_started",
+                            actor_kind="user",
+                            actor_id=user_id,
+                            to_status="matching",
+                            detail={
+                                "fulfillmentMode": booking_policy["fulfillmentMode"]
+                            },
+                        )
                 else:
                     RequestLifecycleService(con).record(
                         request_id,
@@ -7127,7 +8057,17 @@ class Handler(SimpleHTTPRequestHandler):
                         from_status=current["status"],
                         to_status="matching",
                     )
-                if preferred_provider_row:
+                instant_booking_request = (
+                    workflow_version == "booking_v2"
+                    and booking_policy["fulfillmentMode"] == "instant"
+                )
+                if instant_booking_request:
+                    # Instant requests wait for the customer to reserve a real
+                    # provider slot.  They must never enter the quote
+                    # marketplace or notify providers to submit offers.
+                    ranked = []
+                    released = []
+                elif preferred_provider_row:
                     direct_request = con.execute(
                         "SELECT * FROM customer_requests WHERE id=?", (request_id,)
                     ).fetchone()
@@ -7145,13 +8085,22 @@ class Handler(SimpleHTTPRequestHandler):
                     marketplace = RequestMarketplace(con)
                     ranked = marketplace.schedule(request_id)
                     released = marketplace.release_due(request_id)
-                create_marketplace_notifications(con, released)
-                status = "matching" if ranked else "unavailable"
+                if not instant_booking_request:
+                    create_marketplace_notifications(con, released)
                 create_notification(
-                    con, "admin", "", "طلب خدمة جديد" if ranked else "خدمة غير متاحة",
+                    con,
+                    "admin",
+                    "",
+                    (
+                        "طلب حجز فوري جديد"
+                        if instant_booking_request
+                        else ("طلب خدمة جديد" if ranked else "خدمة غير متاحة")
+                    ),
                     f"{service_name or service_value} - {request_item['wilayah'] or request_item['gov']}",
                     type_="request", related_id=request_id,
-                    priority="normal" if ranked else "high",
+                    priority=(
+                        "normal" if instant_booking_request or ranked else "high"
+                    ),
                     action_text="فتح الطلب", action_route=f"admin:request:{request_id}",
                 )
                 saved = con.execute("SELECT * FROM customer_requests WHERE id=?", (request_id,)).fetchone()
@@ -7162,6 +8111,8 @@ class Handler(SimpleHTTPRequestHandler):
                             con,
                             row_customer_request(saved, sign_private=True),
                             asset_visible=True,
+                            actor_kind="user",
+                            actor_id=user_id,
                         ),
                         "matchedProviders": len(ranked),
                         "notifiedProviders": len(released),
@@ -7363,6 +8314,8 @@ class Handler(SimpleHTTPRequestHandler):
             if provider_id not in item["matchingProviderIds"]:
                 return self.send_json({"error": "request_not_assigned_to_provider"}, 403)
             if action == "accept":
+                if item.get("workflowVersion") == "booking_v2":
+                    return self.send_json({"error": "customer_offer_selection_required"}, 409)
                 result = con.execute(
                     """UPDATE customer_requests SET accepted_provider_id=?,status='accepted',
                     offers_open=0,contact_consent=?,updated_at=CURRENT_TIMESTAMP
@@ -7494,6 +8447,12 @@ class Handler(SimpleHTTPRequestHandler):
                     (offer for offer in offers if offer.get("providerId") == provider_id),
                     None,
                 )
+                if (
+                    item.get("workflowVersion") == "booking_v2"
+                    and not existing
+                    and len([row for row in offers if row.get("status", "pending") == "pending"]) >= 3
+                ):
+                    return self.send_json({"error": "offer_limit_reached"}, 409)
                 offer = {
                     "id": existing.get("id") if existing else slug("offer"),
                     "providerId": provider_id,
@@ -7535,17 +8494,76 @@ class Handler(SimpleHTTPRequestHandler):
                     detail={"offerId": offer["id"]},
                 )
                 recompute_provider_quality(con, provider_id)
+                if item.get("workflowVersion") == "booking_v2":
+                    con.execute(
+                        """UPDATE app_notifications SET superseded_at=CURRENT_TIMESTAMP
+                        WHERE target_kind='user' AND target_id=?
+                        AND entity_kind='request' AND entity_id=?
+                        AND action_kind='compare_offers' AND acted_at=''
+                        AND superseded_at=''""",
+                        (item["userId"], request_id),
+                    )
+                    offer_state_version = next_notification_state_version(
+                        con,
+                        entity_kind="request",
+                        entity_id=request_id,
+                        action_kind="compare_offers",
+                        target_kind="user",
+                        target_id=item["userId"],
+                        minimum=len(offers),
+                    )
+                else:
+                    offer_state_version = len(offers)
                 create_notification(
                     con, "user", item["userId"], "وصل عرض جديد لطلبك",
                     f"{session.get('name', 'مزود')} أرسل سعراً ومدة لخدمة {item['serviceName'] or item['serviceValue']}.",
                     type_="request", related_id=request_id, priority="high",
-                    action_text="مقارنة العروض", action_route=f"user:request:{request_id}",
+                    action_text="مقارنة العروض", action_route=f"user:offers:{request_id}",
+                    entity_kind="request", entity_id=request_id,
+                    action_kind="compare_offers",
+                    requires_action=item.get("workflowVersion") == "booking_v2",
+                    state_version=offer_state_version,
                 )
 
             elif action == "choose_offer":
-                if not is_user or item["acceptedProviderId"]:
+                if not is_user:
                     return self.send_json({"error": "offer_selection_not_allowed"}, 403)
+                if item.get("workflowVersion") == "booking_v2":
+                    if not con.in_transaction:
+                        con.execute("BEGIN IMMEDIATE")
+                    # The pre-lock request snapshot may have changed while this
+                    # chooser waited. Refresh it before provider entitlement and
+                    # Work Order validation inside the same write transaction.
+                    locked_row = con.execute(
+                        "SELECT * FROM customer_requests WHERE id=?", (request_id,)
+                    ).fetchone()
+                    item = row_customer_request(locked_row)
+                    if item["userId"] != user_id:
+                        return self.send_json(
+                            {"error": "offer_selection_not_allowed"}, 403
+                        )
                 offer_id = str(data.get("offerId", "") or "")
+                if item["acceptedProviderId"]:
+                    existing_work_order = RequestWorkOrderService(con).get(request_id)
+                    if (
+                        item.get("workflowVersion") == "booking_v2"
+                        and existing_work_order
+                        and existing_work_order.get("acceptedOfferId") == offer_id
+                    ):
+                        return self.send_json(
+                            {
+                                "ok": True,
+                                "duplicate": True,
+                                "request": request_with_workflow(
+                                    con,
+                                    item,
+                                    asset_visible=True,
+                                    actor_kind="user",
+                                    actor_id=item["userId"],
+                                ),
+                            }
+                        )
+                    return self.send_json({"error": "offer_selection_not_allowed"}, 403)
                 offers = list(item.get("offers") or [])
                 selected = next((offer for offer in offers if offer.get("id") == offer_id), None)
                 if not selected:
@@ -7555,6 +8573,9 @@ class Handler(SimpleHTTPRequestHandler):
                     return self.send_json({"error": "offer_expired"}, 409)
                 selected_provider = selected.get("providerId", "")
                 blocks.assert_allowed(item["userId"], selected_provider)
+                eligible, _, _ = EntitlementService(con).can_receive(selected_provider)
+                if not eligible:
+                    return self.send_json({"error": "provider_no_longer_available"}, 409)
                 # In-app chat opens after the customer deliberately selects an offer.
                 # Phone and WhatsApp remain separately consent-gated.
                 chat_granted = True
@@ -7591,17 +8612,49 @@ class Handler(SimpleHTTPRequestHandler):
                     "createdAt": datetime.now(UTC).isoformat(),
                 }
                 messages.append(welcome_message)
-                con.execute(
-                    """UPDATE customer_requests SET offers=?,accepted_provider_id=?,
-                    status='accepted',offers_open=0,waitlisted=0,contact_consent=?,messages=?,
-                    updated_at=CURRENT_TIMESTAMP WHERE id=?""",
-                    (
-                        jdump(offers), selected_provider,
-                        jdump({"chat": chat_granted, "whatsapp": False, "call": False}),
-                        jdump(messages[-120:]),
+                booking_v2 = item.get("workflowVersion") == "booking_v2"
+                if booking_v2:
+                    _, duplicate_acceptance = RequestWorkOrderService(con).accept_offer(
                         request_id,
-                    ),
-                )
+                        item["userId"],
+                        offer_id,
+                        offers=offers,
+                        messages=messages,
+                        contact_consent={
+                            "chat": chat_granted,
+                            "whatsapp": False,
+                            "call": False,
+                        },
+                    )
+                    if duplicate_acceptance:
+                        updated = con.execute(
+                            "SELECT * FROM customer_requests WHERE id=?", (request_id,)
+                        ).fetchone()
+                        return self.send_json(
+                            {
+                                "ok": True,
+                                "duplicate": True,
+                                "request": request_with_workflow(
+                                    con,
+                                    row_customer_request(updated, sign_private=True),
+                                    asset_visible=True,
+                                    actor_kind="user",
+                                    actor_id=item["userId"],
+                                ),
+                            }
+                        )
+                else:
+                    con.execute(
+                        """UPDATE customer_requests SET offers=?,accepted_provider_id=?,
+                        status='accepted',offers_open=0,waitlisted=0,contact_consent=?,messages=?,
+                        updated_at=CURRENT_TIMESTAMP WHERE id=?""",
+                        (
+                            jdump(offers), selected_provider,
+                            jdump({"chat": chat_granted, "whatsapp": False, "call": False}),
+                            jdump(messages[-120:]),
+                            request_id,
+                        ),
+                    )
                 con.execute(
                     """INSERT INTO conversation_threads(request_id,status,updated_at)
                     VALUES(?,'open',CURRENT_TIMESTAMP)
@@ -7610,15 +8663,16 @@ class Handler(SimpleHTTPRequestHandler):
                     reopened_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP""",
                     (request_id,),
                 )
-                RequestLifecycleService(con).record(
-                    request_id,
-                    "offer_selected",
-                    actor_kind="user",
-                    actor_id=item["userId"],
-                    from_status=item["status"],
-                    to_status="accepted",
-                    detail={"offerId": offer_id, "providerId": selected_provider},
-                )
+                if not booking_v2:
+                    RequestLifecycleService(con).record(
+                        request_id,
+                        "offer_selected",
+                        actor_kind="user",
+                        actor_id=item["userId"],
+                        from_status=item["status"],
+                        to_status="accepted",
+                        detail={"offerId": offer_id, "providerId": selected_provider},
+                    )
                 consent_service = ContactConsentService(con)
                 consent_service.set_channel(
                     request_id, item["userId"], selected_provider, "chat", chat_granted
@@ -7636,18 +8690,19 @@ class Handler(SimpleHTTPRequestHandler):
                     (selected_provider, selected_provider, request_id),
                 )
                 con.execute(
-                    "DELETE FROM app_notifications WHERE related_id=? AND target_kind='provider' AND type='request'",
+                    """UPDATE app_notifications SET superseded_at=CURRENT_TIMESTAMP
+                    WHERE related_id=? AND type='request' AND superseded_at=''
+                    AND acted_at=''""",
                     (request_id,),
-                )
-                con.execute(
-                    "DELETE FROM app_notifications WHERE related_id=? AND target_kind='user' AND target_id=? AND type='request'",
-                    (request_id, item["userId"]),
                 )
                 create_notification(
                     con, "provider", selected_provider, "اختار العميل عرضك",
                     f"تم اختيار عرضك لخدمة {item['serviceName'] or item['serviceValue']}.",
                     type_="request", related_id=request_id, priority="high",
                     action_text="فتح المهمة", action_route=f"provider:tasks:{request_id}",
+                    entity_kind="request", entity_id=request_id,
+                    action_kind="open_booking", requires_action=booking_v2,
+                    state_version=1,
                 )
                 create_notification(
                     con, "user", item["userId"], f"رسالة جديدة من {provider_name}",
@@ -7663,6 +8718,8 @@ class Handler(SimpleHTTPRequestHandler):
                 )
 
             elif action == "start_work":
+                if item.get("workflowVersion") == "booking_v2":
+                    return self.send_json({"error": "provider_required"}, 403)
                 if not is_user or not item["acceptedProviderId"]:
                     return self.send_json({"error": "start_work_not_allowed"}, 403)
                 blocks.assert_allowed(
@@ -7861,7 +8918,13 @@ class Handler(SimpleHTTPRequestHandler):
             updated = con.execute(
                 "SELECT * FROM customer_requests WHERE id=?", (request_id,)
             ).fetchone()
-            response_request = row_customer_request(updated, sign_private=True)
+            response_request = request_with_workflow(
+                con,
+                row_customer_request(updated, sign_private=True),
+                asset_visible=bool(is_user),
+                actor_kind="provider" if provider_id else "user" if user_id else "",
+                actor_id=provider_id or user_id,
+            )
             if provider_id:
                 consent = response_request.get("contactConsent") or {}
                 if response_request.get("acceptedProviderId") != provider_id or not (
@@ -7884,6 +8947,9 @@ class Handler(SimpleHTTPRequestHandler):
             "start_work",
             "completion_submit",
             "completion_decide",
+            "change_propose",
+            "change_decide",
+            "start_code_issue",
             "asset_attach",
         }:
             return self.send_json({"error": "invalid_workflow_action"}, 400)
@@ -7903,8 +8969,17 @@ class Handler(SimpleHTTPRequestHandler):
             )
             if not (is_owner or is_selected_provider):
                 return self.send_json({"error": "request_access_denied"}, 403)
+            workflow_extra = {}
 
-            if action == "agreement_save":
+            if action == "start_code_issue":
+                if not is_owner:
+                    return self.send_json({"error": "request_owner_required"}, 403)
+                workflow_extra["startVerification"] = StartVerificationService(
+                    con
+                ).issue(request_id, actor_id)
+            elif action == "agreement_save":
+                if request.get("workflowVersion") == "booking_v2":
+                    return self.send_json({"error": "work_order_replaces_agreement"}, 409)
                 agreement = RequestAgreementService(con).save(
                     request_id, actor_kind, actor_id, data
                 )
@@ -7929,6 +9004,8 @@ class Handler(SimpleHTTPRequestHandler):
                     action_text="مراجعة الاتفاق", action_route=f"admin:request:{request_id}",
                 )
             elif action == "agreement_confirm":
+                if request.get("workflowVersion") == "booking_v2":
+                    return self.send_json({"error": "work_order_replaces_agreement"}, 409)
                 try:
                     version = int(data.get("version") or 0)
                 except (TypeError, ValueError):
@@ -7961,6 +9038,8 @@ class Handler(SimpleHTTPRequestHandler):
                     action_route=f"admin:request:{request_id}",
                 )
             elif action == "agreement_reject":
+                if request.get("workflowVersion") == "booking_v2":
+                    return self.send_json({"error": "work_order_replaces_agreement"}, 409)
                 try:
                     version = int(data.get("version") or 0)
                 except (TypeError, ValueError):
@@ -7993,9 +9072,49 @@ class Handler(SimpleHTTPRequestHandler):
                     action_text="مراجعة الاتفاق", action_route=f"admin:request:{request_id}",
                 )
             elif action == "start_work":
-                agreement = RequestAgreementService(con).get(request_id)
-                if not agreement or agreement.get("status") != "confirmed":
-                    return self.send_json({"error": "agreement_confirmation_required"}, 409)
+                if request.get("workflowVersion") == "booking_v2":
+                    if not con.in_transaction:
+                        con.execute("BEGIN IMMEDIATE")
+                    locked_request_row = con.execute(
+                        "SELECT * FROM customer_requests WHERE id=?", (request_id,)
+                    ).fetchone()
+                    request = row_customer_request(locked_request_row)
+                    is_owner = actor_kind == "user" and request["userId"] == actor_id
+                    is_selected_provider = (
+                        actor_kind == "provider"
+                        and request["acceptedProviderId"] == actor_id
+                    )
+                already_in_progress = request.get("status") == "inProgress"
+                if request.get("workflowVersion") == "booking_v2":
+                    if not is_selected_provider:
+                        return self.send_json({"error": "provider_required"}, 403)
+                    if not RequestWorkOrderService(con).get(request_id):
+                        return self.send_json({"error": "work_order_required"}, 409)
+                    if not already_in_progress:
+                        pending_change = con.execute(
+                            """SELECT id FROM request_change_orders
+                            WHERE request_id=? AND status='pending'""",
+                            (request_id,),
+                        ).fetchone()
+                        if pending_change:
+                            return self.send_json({"error": "change_order_pending"}, 409)
+                    if request.get("startVerificationMode") == "otp" and not already_in_progress:
+                            try:
+                                StartVerificationService(con).consume(
+                                    request_id,
+                                    actor_id,
+                                    safe_text(data.get("startCode"), 16),
+                                )
+                            except DomainError as err:
+                                if err.code == "invalid_start_verification_code":
+                                    # Persist the bounded failed-attempt counter;
+                                    # request bodies and the supplied code are never logged.
+                                    con.commit()
+                                return self.send_domain_error(err)
+                else:
+                    agreement = RequestAgreementService(con).get(request_id)
+                    if not agreement or agreement.get("status") != "confirmed":
+                        return self.send_json({"error": "agreement_confirmation_required"}, 409)
                 RequestLifecycleService(con).transition(
                     request_id,
                     "inProgress",
@@ -8004,32 +9123,177 @@ class Handler(SimpleHTTPRequestHandler):
                     event_type="work_started",
                     allowed_from={"accepted", "appointmentConfirmed"},
                 )
+                if not already_in_progress:
+                    target_kind = "provider" if is_owner else "user"
+                    target_id = request["acceptedProviderId"] if is_owner else request["userId"]
+                    create_notification(
+                        con,
+                        target_kind,
+                        target_id,
+                        "بدأ تنفيذ الطلب",
+                        request["serviceName"] or request["serviceValue"],
+                        type_="request",
+                        related_id=request_id,
+                        priority="high",
+                        action_text="فتح المهمة",
+                        action_route=f"{target_kind}:{'tasks' if target_kind == 'provider' else 'request'}:{request_id}",
+                        dedupe_key=f"request:{request_id}:work_started:v1:{target_kind}:{target_id}",
+                        entity_kind="request",
+                        entity_id=request_id,
+                        action_kind="work_started",
+                        state_version=1,
+                    )
+                NotificationActionService(con).resolve(
+                    entity_kind="request",
+                    entity_id=request_id,
+                    action_kind="open_booking",
+                    target_kind="provider",
+                    target_id=request["acceptedProviderId"],
+                )
+            elif action == "change_propose":
+                try:
+                    expected_version = int(data.get("expectedVersion") or 0)
+                except (TypeError, ValueError):
+                    return self.send_json({"error": "invalid_work_order_version"}, 400)
+                change_order = RequestChangeOrderService(con).propose(
+                    request_id,
+                    actor_kind,
+                    actor_id,
+                    expected_version=expected_version,
+                    changes=data.get("changes", {}),
+                    reason=safe_text(data.get("reason"), 600),
+                    idempotency_key=safe_text(data.get("idempotencyKey"), 128),
+                )
+                target_kind = "provider" if is_owner else "user"
+                target_id = request["acceptedProviderId"] if is_owner else request["userId"]
+                change_state_version = next_notification_state_version(
+                    con,
+                    entity_kind="request",
+                    entity_id=request_id,
+                    action_kind="review_change_order",
+                    target_kind=target_kind,
+                    target_id=target_id,
+                    minimum=expected_version,
+                    reuse_active=True,
+                )
+                create_notification(
+                    con,
+                    target_kind,
+                    target_id,
+                    "طُلب تعديل الحجز",
+                    "راجع القيم القديمة والجديدة قبل اتخاذ القرار.",
+                    type_="request",
+                    related_id=request_id,
+                    priority="high",
+                    action_text="مراجعة التعديل",
+                    action_route=f"{target_kind}:change-order:{request_id}",
+                    entity_kind="request",
+                    entity_id=request_id,
+                    action_kind="review_change_order",
+                    requires_action=True,
+                    state_version=change_state_version,
+                )
+            elif action == "change_decide":
+                try:
+                    expected_version = int(data.get("expectedVersion") or 0)
+                except (TypeError, ValueError):
+                    return self.send_json({"error": "invalid_work_order_version"}, 400)
+                change_order_id = safe_text(data.get("changeOrderId"), 120)
+                linked_change = con.execute(
+                    "SELECT request_id FROM request_change_orders WHERE id=?",
+                    (change_order_id,),
+                ).fetchone()
+                if not linked_change:
+                    return self.send_json({"error": "change_order_not_found"}, 404)
+                if linked_change["request_id"] != request_id:
+                    return self.send_json({"error": "change_order_request_mismatch"}, 409)
+                change_order, work_order = RequestChangeOrderService(con).decide(
+                    change_order_id,
+                    actor_kind,
+                    actor_id,
+                    decision=safe_text(data.get("decision"), 24),
+                    expected_version=expected_version,
+                    idempotency_key=safe_text(data.get("idempotencyKey"), 128),
+                )
+                NotificationActionService(con).resolve(
+                    entity_kind="request",
+                    entity_id=request_id,
+                    action_kind="review_change_order",
+                    target_kind=actor_kind,
+                    target_id=actor_id,
+                )
                 target_kind = "provider" if is_owner else "user"
                 target_id = request["acceptedProviderId"] if is_owner else request["userId"]
                 create_notification(
                     con,
                     target_kind,
                     target_id,
-                    "بدأ تنفيذ الطلب",
-                    request["serviceName"] or request["serviceValue"],
+                    (
+                        "تمت الموافقة على تعديل الحجز"
+                        if change_order.get("status") == "accepted"
+                        else "رُفض تعديل الحجز"
+                    ),
+                    f"أمر العمل الحالي: النسخة {work_order.get('version', expected_version)}.",
                     type_="request",
                     related_id=request_id,
-                    priority="high",
-                    action_text="فتح المهمة",
+                    action_text="فتح الحجز",
                     action_route=f"{target_kind}:{'tasks' if target_kind == 'provider' else 'request'}:{request_id}",
+                    entity_kind="request",
+                    entity_id=request_id,
+                    action_kind="change_order_result",
+                    state_version=int(work_order.get("version") or expected_version),
                 )
             elif action == "completion_submit":
                 if not is_selected_provider:
                     return self.send_json({"error": "provider_required"}, 403)
+                if not con.in_transaction:
+                    con.execute("BEGIN IMMEDIATE")
                 evidence_service = CompletionEvidenceService(con)
                 existing = evidence_service.get(request_id) or {}
                 before_images = existing.get("beforeImages", [])
                 after_images = existing.get("afterImages", [])
-                if data.get("beforeImagesData"):
+                idempotency_key = safe_text(data.get("idempotencyKey"), 128)
+                checklist = (
+                    data.get("checklist")
+                    if isinstance(data.get("checklist"), list)
+                    else []
+                )
+                completion_note = safe_text(data.get("note"), 600)
+                completion_payload_hash = hashlib.sha256(
+                    jdump(
+                        {
+                            "requestId": request_id,
+                            "before": [
+                                hashlib.sha256(str(value).encode("utf-8")).hexdigest()
+                                for value in (data.get("beforeImagesData") or [])[:5]
+                                if value
+                            ],
+                            "after": [
+                                hashlib.sha256(str(value).encode("utf-8")).hexdigest()
+                                for value in (data.get("afterImagesData") or [])[:5]
+                                if value
+                            ],
+                            "checklist": checklist,
+                            "note": completion_note,
+                        }
+                    ).encode("utf-8")
+                ).hexdigest()
+                prior_row = con.execute(
+                    """SELECT submit_idempotency_key,submit_payload_hash
+                    FROM request_completion_evidence WHERE request_id=?""",
+                    (request_id,),
+                ).fetchone()
+                same_replay = bool(
+                    prior_row
+                    and idempotency_key
+                    and prior_row["submit_idempotency_key"] == idempotency_key
+                    and prior_row["submit_payload_hash"] == completion_payload_hash
+                )
+                if data.get("beforeImagesData") and not same_replay:
                     before_images = save_many_images(
                         request_id, data["beforeImagesData"], "completion-before", 5
                     )
-                if data.get("afterImagesData"):
+                if data.get("afterImagesData") and not same_replay:
                     after_images = save_many_images(
                         request_id, data["afterImagesData"], "completion-after", 5
                     )
@@ -8038,20 +9302,39 @@ class Handler(SimpleHTTPRequestHandler):
                     actor_id,
                     before_images=before_images,
                     after_images=after_images,
-                    note=safe_text(data.get("note"), 600),
+                    checklist=checklist,
+                    note=completion_note,
+                    idempotency_key=idempotency_key,
+                    payload_hash_override=completion_payload_hash,
                 )
-                create_notification(
-                    con,
-                    "user",
-                    request["userId"],
-                    "اكتمل العمل بانتظار تأكيدك",
-                    "راجع صور الإنجاز ثم أكّد حل المشكلة أو أرسلها لمراجعة الجودة.",
-                    type_="request",
-                    related_id=request_id,
-                    priority="high",
-                    action_text="مراجعة الإنجاز",
-                    action_route=f"user:completion:{request_id}",
-                )
+                completion_duplicate = bool(evidence.pop("_duplicate", False))
+                workflow_extra["duplicate"] = completion_duplicate
+                due_row = con.execute(
+                    """SELECT completion_due_at,auto_close_enabled
+                    FROM customer_requests WHERE id=?""",
+                    (request_id,),
+                ).fetchone()
+                if not completion_duplicate:
+                    create_notification(
+                        con,
+                        "user",
+                        request["userId"],
+                        "اكتمل العمل بانتظار تأكيدك",
+                        "راجع ملخص الإنجاز ثم اختر كل شيء تمام أو أحتاج مساعدة.",
+                        type_="request",
+                        related_id=request_id,
+                        priority="high",
+                        action_text="مراجعة الإنجاز",
+                        action_route=f"user:completion:{request_id}",
+                        entity_kind="request", entity_id=request_id,
+                        action_kind="review_completion", requires_action=True,
+                        state_version=int((RequestWorkOrderService(con).get(request_id) or {}).get("version") or 0),
+                        expires_at=(
+                            due_row["completion_due_at"]
+                            if due_row and bool(due_row["auto_close_enabled"])
+                            else ""
+                        ),
+                    )
             elif action == "completion_decide":
                 if not is_owner:
                     return self.send_json({"error": "request_owner_required"}, 403)
@@ -8061,25 +9344,37 @@ class Handler(SimpleHTTPRequestHandler):
                     actor_id,
                     decision,
                     safe_text(data.get("note"), 600),
+                    idempotency_key=safe_text(data.get("idempotencyKey"), 128),
                 )
+                completion_duplicate = bool(evidence.pop("_duplicate", False))
+                workflow_extra["duplicate"] = completion_duplicate
+                if not completion_duplicate:
+                    NotificationActionService(con).resolve(
+                        entity_kind="request",
+                        entity_id=request_id,
+                        action_kind="review_completion",
+                        target_kind="user",
+                        target_id=request["userId"],
+                    )
                 title = (
                     "أكد العميل اكتمال الخدمة"
                     if decision == "resolved"
                     else "أُحيلت الخدمة لمراجعة الجودة"
                 )
-                create_notification(
-                    con,
-                    "provider",
-                    request["acceptedProviderId"],
-                    title,
-                    request["serviceName"] or request["serviceValue"],
-                    type_="request",
-                    related_id=request_id,
-                    priority="high" if decision == "issue" else "normal",
-                    action_text="فتح المهمة",
-                    action_route=f"provider:tasks:{request_id}",
-                )
-                if decision == "issue":
+                if not completion_duplicate:
+                    create_notification(
+                        con,
+                        "provider",
+                        request["acceptedProviderId"],
+                        title,
+                        request["serviceName"] or request["serviceValue"],
+                        type_="request",
+                        related_id=request_id,
+                        priority="high" if decision == "issue" else "normal",
+                        action_text="فتح المهمة",
+                        action_route=f"provider:tasks:{request_id}",
+                    )
+                if decision == "issue" and not completion_duplicate:
                     create_notification(
                         con,
                         "admin",
@@ -8106,8 +9401,204 @@ class Handler(SimpleHTTPRequestHandler):
                 con,
                 row_customer_request(updated_row, sign_private=True),
                 asset_visible=True,
+                actor_kind=actor_kind,
+                actor_id=actor_id,
             )
-            return self.send_json({"ok": True, "request": response_request})
+            return self.send_json(
+                {"ok": True, "request": response_request, **workflow_extra}
+            )
+
+    def instant_booking(self, data):
+        """Publish fixed-price slots and reserve one atomically for booking_v2."""
+        session = self.session()
+        if not session or session.get("kind") not in {"user", "provider"}:
+            return self.send_json({"error": "auth_required"}, 401)
+        action = safe_text(data.get("action"), 40) or "list"
+        actor_kind = session["kind"]
+        actor_id = session.get("userId") or session.get("providerId") or ""
+        if action not in {"list", "slot_upsert", "slot_cancel", "book"}:
+            return self.send_json({"error": "invalid_instant_booking_action"}, 400)
+        with db() as con:
+            service = InstantBookingService(con)
+            booking_replay = False
+            if actor_kind == "user" and not FeatureFlagService(con).is_enabled(
+                "booking_v2", "user", actor_id
+            ):
+                replay = None
+                if action == "book":
+                    replay = con.execute(
+                        """SELECT request_id FROM request_slot_reservations
+                        WHERE user_id=? AND idempotency_key=?""",
+                        (
+                            actor_id,
+                            safe_text(data.get("idempotencyKey"), 128),
+                        ),
+                    ).fetchone()
+                    if replay and replay["request_id"] != safe_text(
+                        data.get("requestId"), 120
+                    ):
+                        replay = None
+                if action != "book" or not replay:
+                    return self.send_json({"error": "booking_v2_disabled"}, 403)
+                booking_replay = True
+            if action == "list":
+                if actor_kind == "provider":
+                    requested_provider = safe_text(data.get("providerId"), 120)
+                    if requested_provider and requested_provider != actor_id:
+                        return self.send_json(
+                            {"error": "instant_slot_access_denied"}, 403
+                        )
+                    slots = service.provider_slots(
+                        actor_id,
+                        service_value=safe_text(data.get("serviceValue"), 160),
+                        limit=bounded_int(
+                            data.get("limit"), 200, minimum=1, maximum=500
+                        ),
+                    )
+                    return self.send_json({"ok": True, "slots": slots})
+                slots = service.available_slots(
+                    safe_text(data.get("serviceValue"), 160),
+                    provider_id=safe_text(data.get("providerId"), 120),
+                    starts_after=safe_text(data.get("startsAfter"), 80),
+                    ends_before=safe_text(data.get("endsBefore"), 80),
+                    limit=bounded_int(data.get("limit"), 100, minimum=1, maximum=200),
+                )
+                entitlement_cache = {}
+                visible_slots = []
+                for slot in slots:
+                    provider_id = slot["providerId"]
+                    if provider_id not in entitlement_cache:
+                        entitlement_cache[provider_id] = bool(
+                            EntitlementService(con).can_receive(provider_id)[0]
+                        )
+                    if entitlement_cache[provider_id]:
+                        visible_slots.append(slot)
+                return self.send_json({"ok": True, "slots": visible_slots})
+            if action == "slot_upsert":
+                if actor_kind != "provider":
+                    return self.send_json({"error": "provider_required"}, 403)
+                if not con.in_transaction:
+                    con.execute("BEGIN IMMEDIATE")
+                allowed, _, _ = EntitlementService(con).can_receive(actor_id)
+                if not allowed:
+                    return self.send_json({"error": "provider_no_longer_available"}, 409)
+                slot = service.upsert_slot(
+                    actor_id,
+                    safe_text(data.get("serviceValue"), 160),
+                    safe_text(data.get("startsAt"), 80),
+                    slot_id=safe_text(data.get("slotId"), 120),
+                )
+                return self.send_json({"ok": True, "slot": slot})
+            if action == "slot_cancel":
+                if actor_kind != "provider":
+                    return self.send_json({"error": "provider_required"}, 403)
+                if not con.in_transaction:
+                    con.execute("BEGIN IMMEDIATE")
+                service.cancel_slot(actor_id, safe_text(data.get("slotId"), 120))
+                return self.send_json({"ok": True})
+            if actor_kind != "user":
+                return self.send_json({"error": "request_owner_required"}, 403)
+            request_id = safe_text(data.get("requestId"), 120)
+            slot_id = safe_text(data.get("slotId"), 120)
+            if not con.in_transaction:
+                con.execute("BEGIN IMMEDIATE")
+            slot_row = con.execute(
+                "SELECT provider_id FROM provider_service_slots WHERE id=?", (slot_id,)
+            ).fetchone()
+            if not slot_row:
+                return self.send_json({"error": "instant_slot_not_found"}, 404)
+            if not booking_replay:
+                allowed, _, _ = EntitlementService(con).can_receive(
+                    slot_row["provider_id"]
+                )
+                if not allowed:
+                    return self.send_json(
+                        {"error": "provider_no_longer_available"}, 409
+                    )
+                InteractionBlockService(con).assert_allowed(
+                    actor_id, slot_row["provider_id"]
+                )
+            work_order, slot, duplicate = service.book(
+                request_id,
+                actor_id,
+                slot_id,
+                idempotency_key=safe_text(data.get("idempotencyKey"), 128),
+            )
+            if not duplicate:
+                con.execute(
+                    """INSERT INTO conversation_threads(request_id,status,updated_at)
+                    VALUES(?,'open',CURRENT_TIMESTAMP)
+                    ON CONFLICT(request_id) DO UPDATE SET status='open',
+                    ended_by_kind='',ended_by_id='',end_reason='',ended_at='',
+                    reopened_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP""",
+                    (request_id,),
+                )
+                consent = ContactConsentService(con)
+                consent.set_channel(
+                    request_id, actor_id, work_order["providerId"], "chat", True
+                )
+                consent.set_channel(
+                    request_id, actor_id, work_order["providerId"], "whatsapp", False
+                )
+                consent.set_channel(
+                    request_id, actor_id, work_order["providerId"], "call", False
+                )
+                con.execute(
+                    """UPDATE app_notifications SET superseded_at=CURRENT_TIMESTAMP
+                    WHERE entity_kind='request' AND entity_id=? AND acted_at=''
+                    AND superseded_at=''""",
+                    (request_id,),
+                )
+                create_notification(
+                    con,
+                    "provider",
+                    work_order["providerId"],
+                    "لديك حجز جديد",
+                    "افتح المهمة لمراجعة الموعد وتفاصيل أمر العمل.",
+                    type_="request",
+                    related_id=request_id,
+                    priority="high",
+                    action_text="فتح المهمة",
+                    action_route=f"provider:tasks:{request_id}",
+                    entity_kind="request",
+                    entity_id=request_id,
+                    action_kind="open_booking",
+                    requires_action=True,
+                    state_version=work_order["version"],
+                )
+                create_notification(
+                    con,
+                    "user",
+                    actor_id,
+                    "تم تأكيد حجزك",
+                    "تم حجز الموعد. افتح الطلب لمراجعة أمر العمل.",
+                    type_="request",
+                    related_id=request_id,
+                    action_text="فتح الحجز",
+                    action_route=f"user:request:{request_id}",
+                    entity_kind="request",
+                    entity_id=request_id,
+                    action_kind="booking_confirmed",
+                    state_version=work_order["version"],
+                )
+            updated = con.execute(
+                "SELECT * FROM customer_requests WHERE id=?", (request_id,)
+            ).fetchone()
+            return self.send_json(
+                {
+                    "ok": True,
+                    "duplicate": duplicate,
+                    "slot": slot,
+                    "request": request_with_workflow(
+                        con,
+                        row_customer_request(updated, sign_private=True),
+                        asset_visible=True,
+                        actor_kind="user",
+                        actor_id=actor_id,
+                    ),
+                },
+                200 if duplicate else 201,
+            )
 
     def service_assets(self, data):
         session = self.require_user()
@@ -8581,7 +10072,15 @@ class Handler(SimpleHTTPRequestHandler):
         action = safe_text(data.get("action"), 80)
         with db() as con:
             result = None
-            if action == "feature:update":
+            if action == "booking-policy:list":
+                result = BookingPolicyService(con).list()
+            elif action == "booking-policy:update":
+                result = BookingPolicyService(con).save(
+                    safe_text(data.get("serviceValue"), 160),
+                    data,
+                    session["id"],
+                )
+            elif action == "feature:update":
                 result = FeatureFlagService(con).update(
                     safe_text(data.get("key"), 80), data, session["id"]
                 )
@@ -8701,22 +10200,36 @@ class Handler(SimpleHTTPRequestHandler):
         if not session:
             return self.send_json({"error": "auth_required"}, 401)
         notification_id = str(data.get("id", ""))
-        action = data.get("action", "read")
+        action = safe_text(data.get("action"), 24) or "read"
         target_kind = session.get("kind")
         target_id = session.get("providerId") or session.get("userId") or ""
         with db() as con:
-            row = con.execute("SELECT * FROM app_notifications WHERE id=?", (notification_id,)).fetchone()
+            # Legacy clients used "delete"; preserve the API while retaining the
+            # audit row by treating it as an idempotent dismissal.
+            if action == "delete":
+                action = "dismiss"
+            row = con.execute(
+                "SELECT * FROM app_notifications WHERE id=?", (notification_id,)
+            ).fetchone()
             if not row:
                 return self.send_json({"error": "notification_not_found"}, 404)
-            if target_kind != "admin" and (
-                row["target_kind"] != target_kind or row["target_id"] != target_id
+            if target_kind == "admin" and not admin_can_access_notification(
+                session, row
             ):
                 return self.send_json({"error": "notification_access_denied"}, 403)
-            if action == "delete":
-                con.execute("DELETE FROM app_notifications WHERE id=?", (notification_id,))
-            else:
-                con.execute("UPDATE app_notifications SET is_read=1 WHERE id=?", (notification_id,))
-            return self.send_json({"ok": True})
+            NotificationActionService(con).update(
+                notification_id,
+                target_kind,
+                target_id,
+                action,
+                snooze_minutes=data.get("snoozeMinutes", 60),
+            )
+            updated = con.execute(
+                "SELECT * FROM app_notifications WHERE id=?", (notification_id,)
+            ).fetchone()
+            return self.send_json(
+                {"ok": True, "notification": row_notification(updated)}
+            )
 
     def recovery_request(self, data):
         phone = normalize_phone(data.get("phone", ""))
@@ -8936,7 +10449,9 @@ class Handler(SimpleHTTPRequestHandler):
                     (account_id,),
                 )
                 con.execute(
-                    "UPDATE push_subscriptions SET active=0 WHERE target_kind='user' AND target_id=?",
+                    """UPDATE push_subscription_bindings SET active=0,
+                    updated_at=CURRENT_TIMESTAMP
+                    WHERE target_kind='user' AND target_id=?""",
                     (account_id,),
                 )
             else:
@@ -8952,7 +10467,9 @@ class Handler(SimpleHTTPRequestHandler):
                     (anonymous_phone, account_id),
                 )
                 con.execute(
-                    "UPDATE push_subscriptions SET active=0 WHERE target_kind='provider' AND target_id=?",
+                    """UPDATE push_subscription_bindings SET active=0,
+                    updated_at=CURRENT_TIMESTAMP
+                    WHERE target_kind='provider' AND target_id=?""",
                     (account_id,),
                 )
             revoke_account_sessions(con, session["kind"], account_id)
@@ -8968,9 +10485,37 @@ class Handler(SimpleHTTPRequestHandler):
         session = self.session()
         if not session:
             return self.send_json({"error": "auth_required"}, 401)
+        action = safe_text(data.get("action"), 24) or "subscribe"
         subscription = data.get("subscription") or {}
-        endpoint = safe_text(subscription.get("endpoint"), 2048)
+        endpoint = safe_text(
+            subscription.get("endpoint") or data.get("endpoint"), 2048
+        )
         endpoint_url = urlparse(endpoint)
+        target_id = session.get("providerId") or session.get("userId") or session.get("id") or ""
+        if action == "unsubscribe":
+            if endpoint_url.scheme != "https" or not endpoint_url.netloc:
+                return self.send_json({"error": "push_endpoint_required"}, 400)
+            with db() as con:
+                result = con.execute(
+                    """UPDATE push_subscription_bindings SET active=0,
+                    updated_at=CURRENT_TIMESTAMP WHERE target_kind=? AND target_id=?
+                    AND endpoint=? AND active=1""",
+                    (session["kind"], target_id, endpoint),
+                )
+                remaining = con.execute(
+                    """SELECT COUNT(*) n FROM push_subscription_bindings
+                    WHERE endpoint=? AND active=1""",
+                    (endpoint,),
+                ).fetchone()["n"]
+            return self.send_json(
+                {
+                    "ok": True,
+                    "disabledBindings": int(result.rowcount or 0),
+                    "remainingBindingsForEndpoint": int(remaining or 0),
+                }
+            )
+        if action != "subscribe":
+            return self.send_json({"error": "invalid_push_action"}, 400)
         keys = subscription.get("keys") if isinstance(subscription.get("keys"), dict) else {}
         if (
             endpoint_url.scheme != "https"
@@ -8979,6 +10524,10 @@ class Handler(SimpleHTTPRequestHandler):
             or not safe_text(keys.get("auth"), 512)
         ):
             return self.send_json({"error": "push_endpoint_required"}, 400)
+        try:
+            endpoint = validate_push_endpoint(endpoint)
+        except DomainError as err:
+            return self.send_domain_error(err)
         subscription = {
             "endpoint": endpoint,
             "expirationTime": subscription.get("expirationTime"),
@@ -8987,14 +10536,14 @@ class Handler(SimpleHTTPRequestHandler):
                 "auth": safe_text(keys.get("auth"), 512),
             },
         }
-        target_id = session.get("providerId") or session.get("userId") or session.get("id") or ""
         with db() as con:
             con.execute(
-                """INSERT INTO push_subscriptions(
+                """INSERT INTO push_subscription_bindings(
                 id,target_kind,target_id,endpoint,subscription_json)
                 VALUES(?,?,?,?,?)
-                ON CONFLICT(endpoint) DO UPDATE SET target_kind=excluded.target_kind,
-                target_id=excluded.target_id,subscription_json=excluded.subscription_json,active=1""",
+                ON CONFLICT(target_kind,target_id,endpoint) DO UPDATE SET
+                subscription_json=excluded.subscription_json,active=1,
+                updated_at=CURRENT_TIMESTAMP""",
                 (slug("push"), session["kind"], target_id, endpoint, jdump(subscription)),
             )
         return self.send_json({"ok": True, "deliveryReady": bool(os.environ.get("VAPID_PRIVATE_KEY"))})
@@ -10038,7 +11587,9 @@ class Handler(SimpleHTTPRequestHandler):
                     (anonymous_phone, delete_reason, provider_id),
                 )
                 con.execute(
-                    "UPDATE push_subscriptions SET active=0 WHERE target_kind='provider' AND target_id=?",
+                    """UPDATE push_subscription_bindings SET active=0,
+                    updated_at=CURRENT_TIMESTAMP
+                    WHERE target_kind='provider' AND target_id=?""",
                     (provider_id,),
                 )
                 revoke_account_sessions(con, "provider", provider_id)
@@ -10111,7 +11662,9 @@ class Handler(SimpleHTTPRequestHandler):
                         (user_id,),
                     )
                     con.execute(
-                        "UPDATE push_subscriptions SET active=0 WHERE target_kind='user' AND target_id=?",
+                        """UPDATE push_subscription_bindings SET active=0,
+                        updated_at=CURRENT_TIMESTAMP
+                        WHERE target_kind='user' AND target_id=?""",
                         (user_id,),
                     )
                     revoke_account_sessions(con, "user", user_id)
@@ -11192,6 +12745,7 @@ class Handler(SimpleHTTPRequestHandler):
 
 if __name__ == "__main__":
     init_db()
+    threading.Thread(target=push_outbox_worker, daemon=True).start()
     host = os.environ.get("HOST", "127.0.0.1")
     port = int(os.environ.get("PORT", "8080"))
     try:

@@ -347,7 +347,7 @@ def run():
                 assert error.code == 413, f"oversized body returned HTTP {error.code}"
 
             sw = (ROOT / "service-worker.js").read_text(encoding="utf-8")
-            assert "khadamati-app-shell-v1.0.0-official-r1" in sw
+            assert "khadamati-app-shell-v1.1.0-booking-v2-r1" in sw
             assert "./assets/styles/khadamati-v1.css" in sw
             assert "khadamati-v1.css" in sw
             page_source = (ROOT / "index.html").read_text(encoding="utf-8")

@@ -1335,6 +1335,7 @@ def main():
             "beforeImagesData": [TEST_PNG],
             "afterImagesData": [TEST_PNG],
             "note": "تم فحص اللوحة وإصلاح التوصيل",
+            "idempotencyKey": f"completion-submit:{request_id}",
         },
         provider_token,
     )
@@ -1351,6 +1352,7 @@ def main():
             "action": "completion_decide",
             "decision": "resolved",
             "note": "تم حل المشكلة",
+            "idempotencyKey": f"completion-decision:{request_id}",
         },
         user_token,
     )

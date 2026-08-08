@@ -1,3 +1,9 @@
+-- REFERENCE MIGRATION ONLY (2026-08-08)
+-- The application runtime in server.py currently uses SQLite.  This file
+-- mirrors the intended PostgreSQL migration surface for review and a future
+-- controlled rollout; it is not an active runtime adapter and has not been
+-- executed or integration-tested against a live PostgreSQL service.
+
 CREATE TABLE IF NOT EXISTS settings (
   key TEXT PRIMARY KEY,
   value JSONB NOT NULL
@@ -130,6 +136,7 @@ CREATE TABLE IF NOT EXISTS reviews (
   phone TEXT,
   comment TEXT,
   dimensions JSONB NOT NULL DEFAULT '{}',
+  tags JSONB NOT NULL DEFAULT '[]',
   approved BOOLEAN NOT NULL DEFAULT TRUE,
   created_at TIMESTAMPTZ DEFAULT now()
 );
@@ -532,6 +539,10 @@ ALTER TABLE policy_acceptances ADD COLUMN IF NOT EXISTS metadata JSONB DEFAULT '
 ALTER TABLE reviews ADD COLUMN IF NOT EXISTS request_id TEXT DEFAULT '';
 ALTER TABLE reviews ADD COLUMN IF NOT EXISTS user_id TEXT DEFAULT '';
 ALTER TABLE reviews ADD COLUMN IF NOT EXISTS dimensions JSONB NOT NULL DEFAULT '{}';
+ALTER TABLE reviews ADD COLUMN IF NOT EXISTS tags JSONB NOT NULL DEFAULT '[]';
+CREATE UNIQUE INDEX IF NOT EXISTS idx_reviews_request_user_unique
+  ON reviews(request_id,user_id)
+  WHERE request_id <> '' AND user_id <> '';
 ALTER TABLE complaints ADD COLUMN IF NOT EXISTS request_id TEXT DEFAULT '';
 ALTER TABLE complaints ADD COLUMN IF NOT EXISTS user_id TEXT DEFAULT '';
 
@@ -935,3 +946,339 @@ CREATE INDEX IF NOT EXISTS idx_crm_provider ON provider_crm_records(provider_id,
 CREATE INDEX IF NOT EXISTS idx_training_provider ON training_progress(provider_id, status);
 CREATE INDEX IF NOT EXISTS idx_demand_alert ON demand_alerts(service_value, gov, wilayah, status);
 CREATE INDEX IF NOT EXISTS idx_risk_queue ON risk_reviews(status, score, created_at);
+
+-- booking_v2 is an additive workflow. Legacy columns and records remain intact.
+ALTER TABLE customer_requests ADD COLUMN IF NOT EXISTS asset_id TEXT DEFAULT '';
+ALTER TABLE customer_requests ADD COLUMN IF NOT EXISTS workflow_version TEXT NOT NULL DEFAULT 'legacy_v1';
+ALTER TABLE customer_requests ADD COLUMN IF NOT EXISTS fulfillment_mode TEXT NOT NULL DEFAULT 'quoted';
+ALTER TABLE customer_requests ADD COLUMN IF NOT EXISTS pricing_mode TEXT NOT NULL DEFAULT 'quote';
+ALTER TABLE customer_requests ADD COLUMN IF NOT EXISTS default_duration_minutes INTEGER NOT NULL DEFAULT 60;
+ALTER TABLE customer_requests ADD COLUMN IF NOT EXISTS evidence_policy TEXT NOT NULL DEFAULT 'required_photo';
+ALTER TABLE customer_requests ADD COLUMN IF NOT EXISTS start_verification_mode TEXT NOT NULL DEFAULT 'none';
+ALTER TABLE customer_requests ADD COLUMN IF NOT EXISTS auto_close_enabled BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE customer_requests ADD COLUMN IF NOT EXISTS completion_window_hours INTEGER NOT NULL DEFAULT 48;
+ALTER TABLE customer_requests ADD COLUMN IF NOT EXISTS completion_due_at TIMESTAMPTZ;
+
+ALTER TABLE app_notifications ADD COLUMN IF NOT EXISTS dedupe_key TEXT NOT NULL DEFAULT '';
+ALTER TABLE app_notifications ADD COLUMN IF NOT EXISTS entity_kind TEXT NOT NULL DEFAULT '';
+ALTER TABLE app_notifications ADD COLUMN IF NOT EXISTS entity_id TEXT NOT NULL DEFAULT '';
+ALTER TABLE app_notifications ADD COLUMN IF NOT EXISTS action_kind TEXT NOT NULL DEFAULT '';
+ALTER TABLE app_notifications ADD COLUMN IF NOT EXISTS requires_action BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE app_notifications ADD COLUMN IF NOT EXISTS state_version INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE app_notifications ADD COLUMN IF NOT EXISTS seen_at TIMESTAMPTZ;
+ALTER TABLE app_notifications ADD COLUMN IF NOT EXISTS read_at TIMESTAMPTZ;
+ALTER TABLE app_notifications ADD COLUMN IF NOT EXISTS acknowledged_at TIMESTAMPTZ;
+ALTER TABLE app_notifications ADD COLUMN IF NOT EXISTS acted_at TIMESTAMPTZ;
+ALTER TABLE app_notifications ADD COLUMN IF NOT EXISTS dismissed_at TIMESTAMPTZ;
+ALTER TABLE app_notifications ADD COLUMN IF NOT EXISTS snoozed_until TIMESTAMPTZ;
+ALTER TABLE app_notifications ADD COLUMN IF NOT EXISTS superseded_at TIMESTAMPTZ;
+ALTER TABLE app_notifications ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_notification_dedupe
+  ON app_notifications(dedupe_key) WHERE dedupe_key <> '';
+CREATE INDEX IF NOT EXISTS idx_notification_pending_action
+  ON app_notifications(target_kind,target_id,requires_action,acted_at,superseded_at,expires_at);
+
+CREATE TABLE IF NOT EXISTS request_events (
+  id TEXT PRIMARY KEY,
+  request_id TEXT NOT NULL REFERENCES customer_requests(id) ON DELETE CASCADE,
+  event_type TEXT NOT NULL,
+  from_status TEXT NOT NULL DEFAULT '',
+  to_status TEXT NOT NULL DEFAULT '',
+  actor_kind TEXT NOT NULL DEFAULT 'system',
+  actor_id TEXT NOT NULL DEFAULT '',
+  detail JSONB NOT NULL DEFAULT '{}',
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS request_agreements (
+  request_id TEXT PRIMARY KEY REFERENCES customer_requests(id) ON DELETE CASCADE,
+  provider_id TEXT NOT NULL,
+  version INTEGER NOT NULL DEFAULT 1,
+  appointment_at TIMESTAMPTZ,
+  duration_minutes INTEGER NOT NULL DEFAULT 60,
+  price_amount NUMERIC(14,3) NOT NULL DEFAULT 0,
+  currency TEXT NOT NULL DEFAULT 'OMR',
+  notes TEXT NOT NULL DEFAULT '',
+  location_text TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'draft',
+  user_confirmed_version INTEGER NOT NULL DEFAULT 0,
+  provider_confirmed_version INTEGER NOT NULL DEFAULT 0,
+  updated_by_kind TEXT NOT NULL DEFAULT '',
+  updated_by_id TEXT NOT NULL DEFAULT '',
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS service_assets (
+  id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL REFERENCES app_users(id) ON DELETE CASCADE,
+  name TEXT NOT NULL,
+  asset_type TEXT NOT NULL DEFAULT 'other',
+  category_id TEXT NOT NULL DEFAULT '',
+  brand TEXT NOT NULL DEFAULT '',
+  model TEXT NOT NULL DEFAULT '',
+  year INTEGER,
+  location_json JSONB NOT NULL DEFAULT '{}',
+  details_json JSONB NOT NULL DEFAULT '{}',
+  notes TEXT NOT NULL DEFAULT '',
+  image_path TEXT NOT NULL DEFAULT '',
+  active BOOLEAN NOT NULL DEFAULT TRUE,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS request_completion_evidence (
+  request_id TEXT PRIMARY KEY REFERENCES customer_requests(id) ON DELETE CASCADE,
+  provider_id TEXT NOT NULL,
+  before_images JSONB NOT NULL DEFAULT '[]',
+  after_images JSONB NOT NULL DEFAULT '[]',
+  checklist JSONB NOT NULL DEFAULT '[]',
+  note TEXT NOT NULL DEFAULT '',
+  submitted_at TIMESTAMPTZ,
+  customer_decision TEXT NOT NULL DEFAULT '',
+  customer_note TEXT NOT NULL DEFAULT '',
+  decided_at TIMESTAMPTZ,
+  submit_idempotency_key TEXT NOT NULL DEFAULT '',
+  submit_payload_hash TEXT NOT NULL DEFAULT '',
+  decision_idempotency_key TEXT NOT NULL DEFAULT '',
+  decision_payload_hash TEXT NOT NULL DEFAULT '',
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS request_idempotency (
+  user_id TEXT NOT NULL,
+  idempotency_key TEXT NOT NULL,
+  request_id TEXT NOT NULL REFERENCES customer_requests(id) ON DELETE CASCADE,
+  payload_hash TEXT NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY(user_id,idempotency_key)
+);
+
+CREATE TABLE IF NOT EXISTS service_fulfillment_policies (
+  service_value TEXT PRIMARY KEY,
+  fulfillment_mode TEXT NOT NULL DEFAULT 'quoted',
+  pricing_mode TEXT NOT NULL DEFAULT 'quote',
+  fixed_price_amount NUMERIC(14,3) NOT NULL DEFAULT 0,
+  default_duration_minutes INTEGER NOT NULL DEFAULT 60,
+  evidence_policy TEXT NOT NULL DEFAULT 'optional',
+  start_verification_mode TEXT NOT NULL DEFAULT 'none',
+  auto_close_enabled BOOLEAN NOT NULL DEFAULT FALSE,
+  completion_window_hours INTEGER NOT NULL DEFAULT 48,
+  updated_by TEXT NOT NULL DEFAULT '',
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS request_work_orders (
+  id TEXT NOT NULL UNIQUE,
+  request_id TEXT PRIMARY KEY REFERENCES customer_requests(id) ON DELETE CASCADE,
+  accepted_offer_id TEXT NOT NULL,
+  provider_id TEXT NOT NULL,
+  customer_id TEXT NOT NULL,
+  fulfillment_mode TEXT NOT NULL DEFAULT 'quoted',
+  service_value TEXT NOT NULL DEFAULT '',
+  category_id TEXT NOT NULL DEFAULT '',
+  service_id TEXT NOT NULL DEFAULT '',
+  service_name TEXT NOT NULL DEFAULT '',
+  price_total NUMERIC(14,3) NOT NULL DEFAULT 0,
+  labor_amount NUMERIC(14,3) NOT NULL DEFAULT 0,
+  materials_amount NUMERIC(14,3) NOT NULL DEFAULT 0,
+  currency TEXT NOT NULL DEFAULT 'OMR',
+  scope TEXT NOT NULL DEFAULT '',
+  exclusions TEXT NOT NULL DEFAULT '',
+  appointment_at TIMESTAMPTZ,
+  duration_minutes INTEGER NOT NULL DEFAULT 60,
+  duration_text TEXT NOT NULL DEFAULT '',
+  location_snapshot JSONB NOT NULL DEFAULT '{}',
+  warranty_days INTEGER NOT NULL DEFAULT 0,
+  evidence_policy TEXT NOT NULL DEFAULT 'optional',
+  start_verification_mode TEXT NOT NULL DEFAULT 'none',
+  version INTEGER NOT NULL DEFAULT 1,
+  status TEXT NOT NULL DEFAULT 'active',
+  accepted_at TIMESTAMPTZ NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS request_work_order_versions (
+  request_id TEXT NOT NULL REFERENCES customer_requests(id) ON DELETE CASCADE,
+  version INTEGER NOT NULL,
+  work_order_id TEXT NOT NULL,
+  snapshot JSONB NOT NULL,
+  source_kind TEXT NOT NULL DEFAULT 'offer',
+  source_id TEXT NOT NULL DEFAULT '',
+  actor_kind TEXT NOT NULL DEFAULT 'system',
+  actor_id TEXT NOT NULL DEFAULT '',
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY(request_id,version)
+);
+
+CREATE TABLE IF NOT EXISTS request_change_orders (
+  id TEXT PRIMARY KEY,
+  request_id TEXT NOT NULL REFERENCES customer_requests(id) ON DELETE CASCADE,
+  proposed_by_kind TEXT NOT NULL,
+  proposed_by_id TEXT NOT NULL,
+  expected_version INTEGER NOT NULL,
+  changes JSONB NOT NULL DEFAULT '{}',
+  reason TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'pending',
+  idempotency_key TEXT NOT NULL DEFAULT '',
+  payload_hash TEXT NOT NULL DEFAULT '',
+  decided_by_kind TEXT NOT NULL DEFAULT '',
+  decided_by_id TEXT NOT NULL DEFAULT '',
+  decision_idempotency_key TEXT NOT NULL DEFAULT '',
+  decision_payload_hash TEXT NOT NULL DEFAULT '',
+  decided_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS provider_service_slots (
+  id TEXT PRIMARY KEY,
+  provider_id TEXT NOT NULL,
+  service_value TEXT NOT NULL,
+  starts_at TIMESTAMPTZ NOT NULL,
+  ends_at TIMESTAMPTZ NOT NULL,
+  duration_minutes INTEGER NOT NULL,
+  price_amount NUMERIC(14,3) NOT NULL,
+  currency TEXT NOT NULL DEFAULT 'OMR',
+  active BOOLEAN NOT NULL DEFAULT TRUE,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE(provider_id,starts_at)
+);
+
+CREATE TABLE IF NOT EXISTS request_slot_reservations (
+  id TEXT PRIMARY KEY,
+  slot_id TEXT NOT NULL REFERENCES provider_service_slots(id) ON DELETE RESTRICT,
+  request_id TEXT NOT NULL UNIQUE REFERENCES customer_requests(id) ON DELETE CASCADE,
+  provider_id TEXT NOT NULL,
+  user_id TEXT NOT NULL,
+  starts_at TIMESTAMPTZ NOT NULL,
+  ends_at TIMESTAMPTZ NOT NULL,
+  status TEXT NOT NULL DEFAULT 'active',
+  idempotency_key TEXT NOT NULL,
+  payload_hash TEXT NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS request_start_verifications (
+  request_id TEXT PRIMARY KEY REFERENCES customer_requests(id) ON DELETE CASCADE,
+  user_id TEXT NOT NULL,
+  provider_id TEXT NOT NULL,
+  code_hash TEXT NOT NULL,
+  expires_at TIMESTAMPTZ NOT NULL,
+  attempts INTEGER NOT NULL DEFAULT 0,
+  max_attempts INTEGER NOT NULL DEFAULT 5,
+  verified_at TIMESTAMPTZ,
+  used_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- A physical browser endpoint may be bound independently to both account roles.
+CREATE TABLE IF NOT EXISTS push_subscription_bindings (
+  id TEXT PRIMARY KEY,
+  target_kind TEXT NOT NULL,
+  target_id TEXT NOT NULL DEFAULT '',
+  endpoint TEXT NOT NULL,
+  subscription_json JSONB NOT NULL,
+  active BOOLEAN NOT NULL DEFAULT TRUE,
+  last_success_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE(target_kind,target_id,endpoint)
+);
+
+CREATE TABLE IF NOT EXISTS push_delivery_outbox (
+  id TEXT PRIMARY KEY,
+  notification_id TEXT NOT NULL UNIQUE REFERENCES app_notifications(id) ON DELETE CASCADE,
+  target_kind TEXT NOT NULL,
+  target_id TEXT NOT NULL DEFAULT '',
+  payload_json JSONB NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending',
+  attempts INTEGER NOT NULL DEFAULT 0,
+  available_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  locked_at TIMESTAMPTZ,
+  claim_token TEXT NOT NULL DEFAULT '',
+  delivered_at TIMESTAMPTZ,
+  last_error TEXT NOT NULL DEFAULT '',
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_request_events_timeline
+  ON request_events(request_id,created_at,id);
+CREATE INDEX IF NOT EXISTS idx_service_assets_user
+  ON service_assets(user_id,active,updated_at);
+CREATE INDEX IF NOT EXISTS idx_completion_provider
+  ON request_completion_evidence(provider_id,submitted_at);
+CREATE INDEX IF NOT EXISTS idx_work_orders_provider
+  ON request_work_orders(provider_id,status,appointment_at);
+CREATE INDEX IF NOT EXISTS idx_change_orders_request
+  ON request_change_orders(request_id,status,created_at);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_change_order_pending
+  ON request_change_orders(request_id) WHERE status='pending';
+CREATE UNIQUE INDEX IF NOT EXISTS idx_change_order_proposal_idempotency
+  ON request_change_orders(proposed_by_kind,proposed_by_id,idempotency_key)
+  WHERE idempotency_key <> '';
+CREATE INDEX IF NOT EXISTS idx_provider_slots_lookup
+  ON provider_service_slots(service_value,provider_id,starts_at,active);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_active_slot_reservation
+  ON request_slot_reservations(slot_id) WHERE status='active';
+CREATE UNIQUE INDEX IF NOT EXISTS idx_consumed_slot_reservation
+  ON request_slot_reservations(slot_id) WHERE status IN ('active','completed');
+CREATE UNIQUE INDEX IF NOT EXISTS idx_slot_reservation_idempotency
+  ON request_slot_reservations(user_id,idempotency_key);
+CREATE INDEX IF NOT EXISTS idx_provider_reservation_overlap
+  ON request_slot_reservations(provider_id,status,starts_at,ends_at);
+CREATE INDEX IF NOT EXISTS idx_push_binding_target
+  ON push_subscription_bindings(target_kind,target_id,active);
+CREATE INDEX IF NOT EXISTS idx_push_outbox_pending
+  ON push_delivery_outbox(status,available_at,created_at);
+
+ALTER TABLE request_completion_evidence
+  ADD COLUMN IF NOT EXISTS submit_idempotency_key TEXT NOT NULL DEFAULT '';
+ALTER TABLE request_completion_evidence
+  ADD COLUMN IF NOT EXISTS submit_payload_hash TEXT NOT NULL DEFAULT '';
+ALTER TABLE request_completion_evidence
+  ADD COLUMN IF NOT EXISTS decision_idempotency_key TEXT NOT NULL DEFAULT '';
+ALTER TABLE request_completion_evidence
+  ADD COLUMN IF NOT EXISTS decision_payload_hash TEXT NOT NULL DEFAULT '';
+ALTER TABLE push_delivery_outbox
+  ADD COLUMN IF NOT EXISTS claim_token TEXT NOT NULL DEFAULT '';
+
+-- Preserve independent user/provider bindings for devices migrated from the
+-- legacy globally-unique endpoint table.
+INSERT INTO push_subscription_bindings(
+  id,target_kind,target_id,endpoint,subscription_json,active,last_success_at,
+  created_at,updated_at
+)
+SELECT
+  'pushbind_' || md5(target_kind || ':' || target_id || ':' || endpoint),
+  target_kind,target_id,endpoint,subscription_json,active,last_success_at,
+  created_at,created_at
+FROM push_subscriptions
+ON CONFLICT(target_kind,target_id,endpoint) DO NOTHING;
+
+-- PostgreSQL enforces provider-time overlap at the database boundary. The
+-- partial exclusion keeps cancelled reservations reusable while completed
+-- reservations permanently consume their historical appointment.
+CREATE EXTENSION IF NOT EXISTS btree_gist;
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint
+    WHERE conname='request_reservation_provider_time_no_overlap'
+  ) THEN
+    ALTER TABLE request_slot_reservations
+      ADD CONSTRAINT request_reservation_provider_time_no_overlap
+      EXCLUDE USING gist (
+        provider_id WITH =,
+        tstzrange(starts_at,ends_at,'[)') WITH &&
+      ) WHERE (status IN ('active','completed'));
+  END IF;
+END $$;

@@ -5,7 +5,9 @@ import os
 import sqlite3
 import sys
 import tempfile
+import threading
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -687,6 +689,606 @@ class KhadamatiDomainTests(unittest.TestCase):
                     (admin_related, user_related),
                 )
 
+    def test_instant_request_creation_waits_for_slot_without_marketplace_dispatch(self):
+        suffix = os.urandom(4).hex()
+        user_id = f"test-instant-user-{suffix}"
+        category_id = f"test-instant-category-{suffix}"
+        service_id = f"test-instant-service-{suffix}"
+        service_value = f"{category_id}|{service_id}"
+        with server.db() as con:
+            previous_flag = con.execute(
+                "SELECT * FROM platform_feature_flags WHERE key='booking_v2'"
+            ).fetchone()
+            previous_flag = dict(previous_flag) if previous_flag else None
+            con.execute(
+                """INSERT INTO app_users(id,phone,name,pin_hash,status,gov,wilayah)
+                VALUES(?,?,?,?, 'active','مسقط','السيب')""",
+                (
+                    user_id,
+                    f"96897{int(suffix[:6], 16) % 1_000_000:06d}",
+                    "مستخدم حجز فوري",
+                    server.hash_pin("7349"),
+                ),
+            )
+            con.execute(
+                "INSERT INTO categories(id,icon,ar,en,active) VALUES(?, '',?,?,1)",
+                (category_id, "اختبار فوري", "Instant test"),
+            )
+            con.execute(
+                """INSERT INTO services(id,category_id,icon,ar,en,active)
+                VALUES(?,?, '',?,?,1)""",
+                (service_id, category_id, "خدمة فورية", "Instant service"),
+            )
+            server.FeatureFlagService(con).update(
+                "booking_v2",
+                {
+                    "enabled": True,
+                    "rolloutPercentage": 100,
+                    "audiences": ["user"],
+                },
+                "test-admin",
+            )
+            server.BookingPolicyService(con).save(
+                service_value,
+                {
+                    "fulfillmentMode": "instant",
+                    "pricingMode": "fixed",
+                    "fixedPriceAmount": 12,
+                    "defaultDurationMinutes": 60,
+                    "evidencePolicy": "optional",
+                    "startVerificationMode": "none",
+                    "autoCloseEnabled": True,
+                    "completionWindowHours": 24,
+                },
+                "test-admin",
+            )
+
+        class DummyHandler:
+            headers = {}
+
+            def require_user(self):
+                return {"kind": "user", "userId": user_id}
+
+            @staticmethod
+            def send_json(data, status=200, extra_headers=None):
+                return status, data
+
+            @staticmethod
+            def send_domain_error(error):
+                return error.status, {"error": error.code}
+
+        request_id = ""
+        try:
+            payload = {
+                    "customerName": "مستخدم حجز فوري",
+                    "serviceValue": service_value,
+                    "serviceName": "خدمة فورية",
+                    "gov": "مسقط",
+                    "wilayah": "السيب",
+                    "urgency": "normal",
+                    "scheduleType": "flexible",
+                    "note": "اختبار عدم إرسال عروض",
+                    "idempotencyKey": f"instant:create:{suffix}",
+                }
+            barrier = threading.Barrier(2)
+
+            def create_once():
+                barrier.wait(timeout=5)
+                return server.Handler.user_post(
+                    DummyHandler(), "/api/user/requests", payload
+                )
+
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                responses = list(executor.map(lambda _: create_once(), range(2)))
+            self.assertEqual([200, 201], sorted(status for status, _ in responses))
+            response_ids = {
+                response["request"]["id"] for _, response in responses
+            }
+            self.assertEqual(1, len(response_ids))
+            status, response = next(
+                item for item in responses if item[0] == 201
+            )
+            request_id = response["request"]["id"]
+            with server.db() as con:
+                request_row = con.execute(
+                    """SELECT status,offers_open,workflow_version,fulfillment_mode
+                    FROM customer_requests WHERE id=?""",
+                    (request_id,),
+                ).fetchone()
+                dispatch_count = con.execute(
+                    "SELECT COUNT(*) n FROM request_dispatches WHERE request_id=?",
+                    (request_id,),
+                ).fetchone()["n"]
+                booking_started = con.execute(
+                    """SELECT detail FROM request_events
+                    WHERE request_id=? AND event_type='booking_started'""",
+                    (request_id,),
+                ).fetchone()
+            self.assertEqual("matching", request_row["status"])
+            self.assertEqual(1, request_row["offers_open"])
+            self.assertEqual("booking_v2", request_row["workflow_version"])
+            self.assertEqual("instant", request_row["fulfillment_mode"])
+            self.assertEqual(0, dispatch_count)
+            self.assertEqual(
+                {"fulfillmentMode": "instant"},
+                json.loads(booking_started["detail"]),
+            )
+            self.assertEqual(0, response["matchedProviders"])
+            self.assertEqual(0, response["notifiedProviders"])
+            enabled_bootstrap = server.get_bootstrap(
+                {"kind": "user", "userId": user_id}
+            )
+            enabled_service = next(
+                service
+                for category in enabled_bootstrap["categories"]
+                if category["id"] == category_id
+                for service in category["services"]
+                if service["id"] == service_id
+            )
+            self.assertTrue(enabled_bootstrap["bookingV2Enabled"])
+            self.assertEqual("instant", enabled_service["fulfillmentMode"])
+            self.assertEqual(12, enabled_service["fixedPriceAmount"])
+            self.assertEqual(60, enabled_service["defaultDurationMinutes"])
+            with server.db() as con:
+                server.FeatureFlagService(con).update(
+                    "booking_v2",
+                    {
+                        "enabled": False,
+                        "rolloutPercentage": 0,
+                        "audiences": ["user"],
+                    },
+                    "test-admin",
+                )
+            disabled_bootstrap = server.get_bootstrap(
+                {"kind": "user", "userId": user_id}
+            )
+            disabled_service = next(
+                service
+                for category in disabled_bootstrap["categories"]
+                if category["id"] == category_id
+                for service in category["services"]
+                if service["id"] == service_id
+            )
+            self.assertFalse(disabled_bootstrap["bookingV2Enabled"])
+            self.assertEqual("quoted", disabled_service["fulfillmentMode"])
+        finally:
+            with server.db() as con:
+                if request_id:
+                    con.execute(
+                        "DELETE FROM app_notifications WHERE related_id=?", (request_id,)
+                    )
+                    con.execute(
+                        "DELETE FROM customer_requests WHERE id=?", (request_id,)
+                    )
+                con.execute(
+                    "DELETE FROM service_fulfillment_policies WHERE service_value=?",
+                    (service_value,),
+                )
+                con.execute(
+                    "DELETE FROM services WHERE id=? AND category_id=?",
+                    (service_id, category_id),
+                )
+                con.execute("DELETE FROM categories WHERE id=?", (category_id,))
+                con.execute("DELETE FROM app_users WHERE id=?", (user_id,))
+                if previous_flag:
+                    con.execute(
+                        """UPDATE platform_feature_flags SET enabled=?,rollout_percentage=?,
+                        audiences=?,config=?,updated_by=?,updated_at=? WHERE key='booking_v2'""",
+                        (
+                            previous_flag["enabled"],
+                            previous_flag["rollout_percentage"],
+                            previous_flag["audiences"],
+                            previous_flag["config"],
+                            previous_flag["updated_by"],
+                            previous_flag["updated_at"],
+                        ),
+                    )
+                else:
+                    con.execute(
+                        "DELETE FROM platform_feature_flags WHERE key='booking_v2'"
+                    )
+
+    def test_losing_matched_provider_cannot_bootstrap_private_workflow_data(self):
+        suffix = str(700000 + int.from_bytes(os.urandom(3), "big") % 200000)
+        user_id = self.user(suffix)
+        winner_id = self.provider(f"{suffix}-winner")
+        loser_id = self.provider(f"{suffix}-loser")
+        request_id = self.customer_request(
+            suffix,
+            user_id,
+            status="viewed",
+        )
+        offer = {
+            "id": f"offer-{suffix}",
+            "providerId": winner_id,
+            "price": 20,
+            "durationMinutes": 60,
+            "scope": "Private accepted scope",
+            "validUntil": "2027-01-01T00:00:00+00:00",
+        }
+        self.con.execute(
+            """UPDATE customer_requests SET matching_provider_ids=?,offers=?,
+            workflow_version='booking_v2',evidence_policy='optional'
+            WHERE id=?""",
+            (json.dumps([winner_id, loser_id]), json.dumps([offer]), request_id),
+        )
+        server.RequestWorkOrderService(self.con).accept_offer(
+            request_id,
+            user_id,
+            offer["id"],
+            offers=[offer],
+        )
+        self.con.execute(
+            """INSERT INTO request_completion_evidence(
+            request_id,provider_id,note,submitted_at)
+            VALUES(?,?,?,CURRENT_TIMESTAMP)""",
+            (request_id, winner_id, "Private completion evidence"),
+        )
+        server.RequestLifecycleService(self.con).record(
+            request_id,
+            "private_timeline_event",
+            actor_kind="provider",
+            actor_id=winner_id,
+            detail={"private": "accepted-only"},
+        )
+        self.con.commit()
+        try:
+            bootstrap = server.get_bootstrap(
+                {
+                    "kind": "provider",
+                    "providerId": loser_id,
+                    "name": "Losing provider",
+                    "permissions": ["requests"],
+                }
+            )
+            item = next(
+                request
+                for request in bootstrap["customerRequests"]
+                if request["id"] == request_id
+            )
+            self.assertEqual([], item["timeline"])
+            self.assertIsNone(item["workOrder"])
+            self.assertEqual([], item["workOrderVersions"])
+            self.assertEqual([], item["changeOrders"])
+            self.assertIsNone(item["completionEvidence"])
+            self.assertEqual([], item["messages"])
+            self.assertEqual([], item["offers"])
+            self.assertNotIn("start_work", item["allowedActions"])
+        finally:
+            self.con.execute(
+                "DELETE FROM customer_requests WHERE id=?", (request_id,)
+            )
+            self.con.execute("DELETE FROM providers WHERE id IN (?,?)", (winner_id, loser_id))
+            self.con.execute("DELETE FROM app_users WHERE id=?", (user_id,))
+            self.con.commit()
+
+    def test_notification_get_supersedes_stale_request_action(self):
+        suffix = str(650000 + int.from_bytes(os.urandom(3), "big") % 40000)
+        user_id = self.user(suffix)
+        provider_id = self.provider(f"stale-{suffix}")
+        request_id = self.customer_request(suffix, user_id, status="viewed")
+        offer = {
+            "id": f"stale-offer-{suffix}",
+            "providerId": provider_id,
+            "price": 10,
+            "durationMinutes": 60,
+            "validUntil": "2027-01-01T00:00:00+00:00",
+        }
+        self.con.execute(
+            """UPDATE customer_requests SET matching_provider_ids=?,offers=?,
+            workflow_version='booking_v2' WHERE id=?""",
+            (json.dumps([provider_id]), json.dumps([offer]), request_id),
+        )
+        server.RequestWorkOrderService(self.con).accept_offer(
+            request_id, user_id, offer["id"], offers=[offer]
+        )
+        notification_id = server.create_notification(
+            self.con,
+            "provider",
+            provider_id,
+            "Open booking",
+            entity_kind="request",
+            entity_id=request_id,
+            action_kind="open_booking",
+            requires_action=True,
+            state_version=99,
+        )
+        self.con.commit()
+
+        class DummyHandler:
+            path = f"/api/notifications/{notification_id}"
+
+            @staticmethod
+            def session():
+                return {"kind": "provider", "providerId": provider_id}
+
+            @staticmethod
+            def send_json(data, status=200, extra_headers=None):
+                return status, data
+
+        try:
+            status, response = server.Handler.do_GET(DummyHandler())
+            self.assertEqual(200, status)
+            self.assertTrue(response["stale"])
+            self.assertEqual("state_version_changed", response["staleReason"])
+            self.assertTrue(response["notification"]["supersededAt"])
+            self.assertEqual(request_id, response["currentRequest"]["id"])
+            self.assertEqual(1, response["currentRequest"]["stateVersion"])
+        finally:
+            with server.db() as con:
+                con.execute(
+                    "DELETE FROM app_notifications WHERE id=?", (notification_id,)
+                )
+                con.execute(
+                    "DELETE FROM customer_requests WHERE id=?", (request_id,)
+                )
+                con.execute("DELETE FROM providers WHERE id=?", (provider_id,))
+                con.execute("DELETE FROM app_users WHERE id=?", (user_id,))
+
+    def test_notification_and_push_outbox_rollback_atomically(self):
+        target_id = f"outbox-target-{os.urandom(4).hex()}"
+        original_push_ready = server.push_ready
+        server.push_ready = lambda: True
+        con = sqlite3.connect(server.DB_PATH)
+        con.row_factory = sqlite3.Row
+        notification_id = ""
+        try:
+            con.execute("BEGIN IMMEDIATE")
+            notification_id = server.create_notification(
+                con,
+                "user",
+                target_id,
+                "Action required",
+                "Private details stay in app",
+                type_="request",
+                related_id="outbox-request",
+                entity_kind="request",
+                entity_id="outbox-request",
+                action_kind="review_completion",
+                requires_action=True,
+                state_version=3,
+            )
+            outbox = con.execute(
+                """SELECT payload_json,status FROM push_delivery_outbox
+                WHERE notification_id=?""",
+                (notification_id,),
+            ).fetchone()
+            self.assertIsNotNone(outbox)
+            payload = json.loads(outbox["payload_json"])
+            self.assertTrue(payload["requiresAction"])
+            self.assertEqual("review_completion", payload["actionKind"])
+            self.assertEqual("request", payload["entityKind"])
+            self.assertEqual(3, payload["stateVersion"])
+            self.assertEqual("خدماتي", payload["title"])
+            self.assertNotIn("Private details", payload["body"])
+            con.rollback()
+            with server.db() as verify:
+                self.assertIsNone(
+                    verify.execute(
+                        "SELECT id FROM app_notifications WHERE id=?",
+                        (notification_id,),
+                    ).fetchone()
+                )
+                self.assertIsNone(
+                    verify.execute(
+                        "SELECT id FROM push_delivery_outbox WHERE notification_id=?",
+                        (notification_id,),
+                    ).fetchone()
+                )
+        finally:
+            con.rollback()
+            con.close()
+            server.push_ready = original_push_ready
+
+    def test_push_outbox_dedupes_dispatches_committed_row_and_expires_old_row(self):
+        suffix = os.urandom(4).hex()
+        target_id = f"outbox-commit-{suffix}"
+        dedupe_key = f"request:outbox-{suffix}:review_completion:v1:user:{target_id}"
+        original_push_ready = server.push_ready
+        original_deliver_push = server.deliver_push
+        delivered = []
+        server.push_ready = lambda: True
+        notification_ids = []
+        try:
+            with server.db() as con:
+                first = server.create_notification(
+                    con,
+                    "user",
+                    target_id,
+                    "Review completion",
+                    "Open the app",
+                    type_="request",
+                    related_id=f"outbox-{suffix}",
+                    dedupe_key=dedupe_key,
+                    entity_kind="request",
+                    entity_id=f"outbox-{suffix}",
+                    action_kind="review_completion",
+                    requires_action=True,
+                    state_version=1,
+                )
+                duplicate = server.create_notification(
+                    con,
+                    "user",
+                    target_id,
+                    "Review completion",
+                    "Open the app",
+                    type_="request",
+                    related_id=f"outbox-{suffix}",
+                    dedupe_key=dedupe_key,
+                    entity_kind="request",
+                    entity_id=f"outbox-{suffix}",
+                    action_kind="review_completion",
+                    requires_action=True,
+                    state_version=1,
+                )
+                expired = server.create_notification(
+                    con,
+                    "user",
+                    target_id,
+                    "Expired reminder",
+                    "Open the app",
+                    type_="request",
+                    related_id=f"expired-{suffix}",
+                    dedupe_key=f"expired:{suffix}",
+                    entity_kind="request",
+                    entity_id=f"expired-{suffix}",
+                    action_kind="review_completion",
+                    requires_action=True,
+                    state_version=1,
+                    expires_at=(datetime.now(UTC) - timedelta(minutes=1)).isoformat(),
+                )
+                notification_ids.extend([first, expired])
+                self.assertEqual(first, duplicate)
+                self.assertEqual(
+                    1,
+                    con.execute(
+                        "SELECT COUNT(*) n FROM push_delivery_outbox WHERE notification_id=?",
+                        (first,),
+                    ).fetchone()["n"],
+                )
+            server.deliver_push = lambda kind, target, payload: (
+                delivered.append((kind, target, payload)) or True
+            )
+            result = server.process_push_outbox(limit=20)
+            self.assertEqual(1, result["claimed"])
+            self.assertEqual(1, result["delivered"])
+            self.assertEqual(1, len(delivered))
+            self.assertEqual(first, delivered[0][2]["id"])
+            with server.db() as con:
+                delivered_row = con.execute(
+                    "SELECT status,attempts FROM push_delivery_outbox WHERE notification_id=?",
+                    (first,),
+                ).fetchone()
+                expired_row = con.execute(
+                    "SELECT status,last_error FROM push_delivery_outbox WHERE notification_id=?",
+                    (expired,),
+                ).fetchone()
+            self.assertEqual("delivered", delivered_row["status"])
+            self.assertEqual(1, delivered_row["attempts"])
+            self.assertEqual("expired", expired_row["status"])
+            self.assertEqual("notification_expired", expired_row["last_error"])
+        finally:
+            server.deliver_push = original_deliver_push
+            server.push_ready = original_push_ready
+            with server.db() as con:
+                for notification_id in notification_ids:
+                    con.execute(
+                        "DELETE FROM app_notifications WHERE id=?", (notification_id,)
+                    )
+
+    def test_push_outbox_stops_after_eight_attempts(self):
+        suffix = os.urandom(4).hex()
+        original_push_ready = server.push_ready
+        original_deliver_push = server.deliver_push
+        server.push_ready = lambda: True
+        notification_id = ""
+        try:
+            with server.db() as con:
+                notification_id = server.create_notification(
+                    con,
+                    "user",
+                    f"retry-{suffix}",
+                    "Retry bounded",
+                    "Open the app",
+                    dedupe_key=f"retry:{suffix}",
+                )
+                con.execute(
+                    """UPDATE push_delivery_outbox SET attempts=7,available_at=?
+                    WHERE notification_id=?""",
+                    ((datetime.now(UTC) - timedelta(seconds=1)).isoformat(), notification_id),
+                )
+            server.deliver_push = lambda kind, target, payload: False
+            result = server.process_push_outbox(limit=20)
+            self.assertEqual(1, result["retried"])
+            with server.db() as con:
+                row = con.execute(
+                    "SELECT status,attempts FROM push_delivery_outbox WHERE notification_id=?",
+                    (notification_id,),
+                ).fetchone()
+            self.assertEqual("dead", row["status"])
+            self.assertEqual(8, row["attempts"])
+        finally:
+            server.deliver_push = original_deliver_push
+            server.push_ready = original_push_ready
+            if notification_id:
+                with server.db() as con:
+                    con.execute(
+                        "DELETE FROM app_notifications WHERE id=?", (notification_id,)
+                    )
+
+    def test_review_tags_are_whitelisted_and_request_cannot_be_reviewed_twice(self):
+        suffix = str(500000 + int.from_bytes(os.urandom(3), "big") % 150000)
+        user_id = self.user(suffix)
+        provider_id = self.provider(f"review-{suffix}")
+        request_id = self.customer_request(
+            suffix,
+            user_id,
+            provider_id=provider_id,
+            status="closed",
+        )
+        self.con.commit()
+
+        class DummyHandler:
+            @staticmethod
+            def require_user():
+                return {"kind": "user", "userId": user_id}
+
+            @staticmethod
+            def send_json(data, status=200, extra_headers=None):
+                return status, data
+
+            @staticmethod
+            def send_domain_error(error):
+                return error.status, {"error": error.code}
+
+        base = {
+            "providerId": provider_id,
+            "requestId": request_id,
+            "rating": 5,
+            "comment": "Excellent",
+        }
+        try:
+            invalid_status, invalid = server.Handler.save_review(
+                DummyHandler(), {**base, "tags": ["quality", "unknown"]}
+            )
+            self.assertEqual(400, invalid_status)
+            self.assertEqual("invalid_review_tags", invalid["error"])
+            status, created = server.Handler.save_review(
+                DummyHandler(),
+                {**base, "tags": ["quality", "punctual", "quality"]},
+            )
+            self.assertEqual(201, status, created)
+            self.assertEqual(["quality", "punctual"], created["review"]["tags"])
+            duplicate_status, duplicate = server.Handler.save_review(
+                DummyHandler(), {**base, "tags": ["communication"]}
+            )
+            self.assertEqual(409, duplicate_status)
+            self.assertEqual("request_already_reviewed", duplicate["error"])
+            with server.db() as con:
+                stored = con.execute(
+                    "SELECT * FROM reviews WHERE request_id=? AND user_id=?",
+                    (request_id, user_id),
+                ).fetchone()
+                public = server.row_review(stored)
+                analytics = con.execute(
+                    """SELECT detail FROM request_events
+                    WHERE request_id=? AND event_type='rating_submitted'""",
+                    (request_id,),
+                ).fetchone()
+            self.assertEqual(["quality", "punctual"], public["tags"])
+            self.assertEqual(
+                {"rating": 5, "tagCount": 2}, json.loads(analytics["detail"])
+            )
+            self.assertNotIn("Excellent", analytics["detail"])
+        finally:
+            with server.db() as con:
+                con.execute("DELETE FROM reviews WHERE request_id=?", (request_id,))
+                con.execute(
+                    "DELETE FROM customer_requests WHERE id=?", (request_id,)
+                )
+                con.execute("DELETE FROM providers WHERE id=?", (provider_id,))
+                con.execute("DELETE FROM app_users WHERE id=?", (user_id,))
+
     def test_whatsapp_audit_masks_the_target_phone(self):
         detail = f"audit-{os.urandom(4).hex()}"
         server.log_whatsapp("96895550177", "failed", detail)
@@ -703,6 +1305,91 @@ class KhadamatiDomainTests(unittest.TestCase):
             with server.db() as con:
                 con.execute("DELETE FROM whatsapp_logs WHERE detail=?", (detail,))
 
+    def test_push_binding_keeps_same_endpoint_for_user_and_provider_roles(self):
+        endpoint = f"https://push.example.test/{os.urandom(8).hex()}"
+        self.con.execute(
+            """INSERT INTO push_subscription_bindings(
+            id,target_kind,target_id,endpoint,subscription_json)
+            VALUES('push-user-test','user','user-push-test',?,?)""",
+            (endpoint, json.dumps({"endpoint": endpoint, "keys": {"auth": "a"}})),
+        )
+        self.con.execute(
+            """INSERT INTO push_subscription_bindings(
+            id,target_kind,target_id,endpoint,subscription_json)
+            VALUES('push-provider-test','provider','provider-push-test',?,?)""",
+            (endpoint, json.dumps({"endpoint": endpoint, "keys": {"auth": "b"}})),
+        )
+        rows = self.con.execute(
+            """SELECT target_kind,target_id FROM push_subscription_bindings
+            WHERE endpoint=? ORDER BY target_kind""",
+            (endpoint,),
+        ).fetchall()
+        self.assertEqual(
+            [("provider", "provider-push-test"), ("user", "user-push-test")],
+            [(row["target_kind"], row["target_id"]) for row in rows],
+        )
+        self.con.execute(
+            """INSERT INTO push_subscription_bindings(
+            id,target_kind,target_id,endpoint,subscription_json)
+            VALUES('push-user-retry','user','user-push-test',?,?)
+            ON CONFLICT(target_kind,target_id,endpoint) DO UPDATE SET
+            subscription_json=excluded.subscription_json,active=1""",
+            (endpoint, json.dumps({"endpoint": endpoint, "keys": {"auth": "new"}})),
+        )
+        count = self.con.execute(
+            "SELECT COUNT(*) n FROM push_subscription_bindings WHERE endpoint=?",
+            (endpoint,),
+        ).fetchone()["n"]
+        self.assertEqual(2, count)
+
+    def test_push_unsubscribe_disables_only_the_authenticated_role_binding(self):
+        endpoint = f"https://push.example.test/{os.urandom(8).hex()}"
+        with server.db() as con:
+            con.execute(
+                """INSERT INTO push_subscription_bindings(
+                id,target_kind,target_id,endpoint,subscription_json)
+                VALUES('unsubscribe-user','user','unsubscribe-user-id',?,?)""",
+                (endpoint, json.dumps({"endpoint": endpoint})),
+            )
+            con.execute(
+                """INSERT INTO push_subscription_bindings(
+                id,target_kind,target_id,endpoint,subscription_json)
+                VALUES('unsubscribe-provider','provider','unsubscribe-provider-id',?,?)""",
+                (endpoint, json.dumps({"endpoint": endpoint})),
+            )
+
+        class DummyHandler:
+            @staticmethod
+            def session():
+                return {"kind": "user", "userId": "unsubscribe-user-id"}
+
+            @staticmethod
+            def send_json(data, status=200, extra_headers=None):
+                return status, data
+
+        try:
+            status, response = server.Handler.push_subscribe(
+                DummyHandler(), {"action": "unsubscribe", "endpoint": endpoint}
+            )
+            self.assertEqual(200, status)
+            self.assertEqual(1, response["disabledBindings"])
+            self.assertEqual(1, response["remainingBindingsForEndpoint"])
+            with server.db() as con:
+                states = {
+                    row["target_kind"]: bool(row["active"])
+                    for row in con.execute(
+                        """SELECT target_kind,active FROM push_subscription_bindings
+                        WHERE endpoint=?""",
+                        (endpoint,),
+                    )
+                }
+            self.assertEqual({"user": False, "provider": True}, states)
+        finally:
+            with server.db() as con:
+                con.execute(
+                    "DELETE FROM push_subscription_bindings WHERE endpoint=?",
+                    (endpoint,),
+                )
     def test_request_lifecycle_rejects_invalid_stage_jump(self):
         user_id = self.user("701")
         request_id = self.customer_request("701", user_id)
