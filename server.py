@@ -111,7 +111,14 @@ try:
     import requests
     from pywebpush import WebPushException, webpush
 except ImportError:
-    requests = None
+    class _FallbackRequestsSession:
+        def post(self, *_args, **_kwargs):
+            raise RuntimeError("requests dependency is not installed")
+
+    class _FallbackRequestsModule:
+        Session = _FallbackRequestsSession
+
+    requests = _FallbackRequestsModule()
     WebPushException = Exception
     webpush = None
 
