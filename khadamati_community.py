@@ -39,6 +39,8 @@ DEFAULT_SETTINGS = {
     "communityProviderOffersEnabled": True,
     "communityUserRecommendationsEnabled": True,
     "communityModerationRequired": False,
+    "featuredPackagesEnabled": True,
+    "featuredPackageIntervalSeconds": 3,
     "communityWantedExpiryDays": 30,
     "communityPackageExpiryDays": 30,
     "communityFirstPackageFreeDays": 30,
@@ -263,6 +265,12 @@ def community_settings(con: sqlite3.Connection) -> dict[str, Any]:
     result["communityModerationRequired"] = _bool(
         result.get("communityModerationRequired"), False
     )
+    result["featuredPackagesEnabled"] = _bool(
+        result.get("featuredPackagesEnabled"), True
+    )
+    result["featuredPackageIntervalSeconds"] = _integer(
+        result.get("featuredPackageIntervalSeconds"), 3, minimum=2, maximum=30
+    )
     result["communityWantedExpiryDays"] = _integer(
         result.get("communityWantedExpiryDays"), 30, minimum=1, maximum=90
     )
@@ -316,6 +324,19 @@ def save_community_settings(
             "communityModerationRequired": _bool(
                 payload.get("communityModerationRequired"),
                 current["communityModerationRequired"],
+            ),
+            "featuredPackagesEnabled": _bool(
+                payload.get("featuredPackagesEnabled"),
+                current["featuredPackagesEnabled"],
+            ),
+            "featuredPackageIntervalSeconds": _integer(
+                payload.get(
+                    "featuredPackageIntervalSeconds",
+                    current["featuredPackageIntervalSeconds"],
+                ),
+                current["featuredPackageIntervalSeconds"],
+                minimum=2,
+                maximum=30,
             ),
             "communityWantedExpiryDays": _integer(
                 payload.get(

@@ -389,6 +389,8 @@ class RequestAgreementService:
             raise DomainError("agreement_not_found", 404)
         if int(version or 0) != int(agreement["version"]):
             raise DomainError("agreement_version_changed", 409)
+        if agreement.get("status") != "pending_confirmation":
+            raise DomainError("agreement_not_pending", 409)
         if actor_kind == agreement.get("updatedByKind"):
             raise DomainError("agreement_sender_cannot_confirm", 409)
         update_params = (
@@ -456,6 +458,8 @@ class RequestAgreementService:
             raise DomainError("agreement_not_found", 404)
         if int(version or 0) != int(agreement["version"]):
             raise DomainError("agreement_version_changed", 409)
+        if agreement.get("status") != "pending_confirmation":
+            raise DomainError("agreement_not_pending", 409)
         if actor_kind == agreement.get("updatedByKind"):
             raise DomainError("agreement_sender_cannot_reject", 409)
         self.con.execute(
