@@ -13,7 +13,7 @@ const IS_MOBILE = VIEWPORT_WIDTH <= 760;
 let LOCAL_SERVER = null;
 
 const APP_SOURCE = fs.readFileSync(path.resolve(__dirname, '..', 'index.html'), 'utf8');
-assertSource(APP_SOURCE.includes("const APP_VERSION = '1.1.0'") && APP_SOURCE.includes("const APP_BUILD = 'khadamati-v1.1.0-booking-v2-r1-2026-08-08'"), 'Booking v2 application version/build marker is missing.');
+assertSource(APP_SOURCE.includes("const APP_VERSION = '1.1.1'") && APP_SOURCE.includes("const APP_BUILD = 'khadamati-v1.1.1-ux-polish-r1-2026-08-09'"), 'UX-polish application version/build marker is missing.');
 assertSource(APP_SOURCE.includes('actionPromptRoot') && APP_SOURCE.includes('renderActionPrompt()'), 'The actionable notification root is not wired to rendering.');
 assertSource(APP_SOURCE.includes("'change_propose'") && APP_SOURCE.includes("'change_decide'"), 'Change-order propose/decision UI is missing.');
 assertSource(APP_SOURCE.includes('work-order-summary') && APP_SOURCE.includes('review_change_order'), 'Work-order summary or change-order routing is missing.');
@@ -28,6 +28,16 @@ assertSource(APP_SOURCE.includes("notification.requiresAction&&notification._ser
 const INSTANT_CONFLICT_CODES = ['instant_slot_reserved', 'instant_slot_not_found', 'instant_slot_expired', 'instant_slot_policy_changed', 'provider_no_longer_available', 'instant_booking_stage_not_allowed', 'provider_area_mismatch', 'provider_daily_capacity_reached', 'instant_booking_conflict', 'instant_slot_service_mismatch'];
 assertSource(INSTANT_CONFLICT_CODES.every(code => APP_SOURCE.includes(`'${code}'`)) && APP_SOURCE.includes('if(definitiveConflict&&intent.requestId)') && APP_SOURCE.includes('if(definitiveConflict)setTimeout(()=>instantBookingSheet'), 'Instant-booking conflicts are not wired to orphan cleanup and slot reselection.');
 assertSource(['suggestion', 'community', 'offers', 'completion', 'change-order', 'quality', 'account'].every(route => APP_SOURCE.includes(`kind==='${route}'`)), 'Structured notification routes are incomplete.');
+const COMMUNITY_PACKAGE_FLOW = APP_SOURCE.slice(APP_SOURCE.indexOf('function communityPackageRequestSheet'), APP_SOURCE.indexOf('function communityReportSheet'));
+const FEATURED_PACKAGE_FLOW = APP_SOURCE.slice(APP_SOURCE.indexOf('function activeFeaturedPackages'), APP_SOURCE.indexOf('function showFeaturedPackage'));
+const PROVIDER_TASK_FLOW = APP_SOURCE.slice(APP_SOURCE.indexOf('function providerActiveTasks'), APP_SOURCE.indexOf('function providerWeekCalendar'));
+assertSource(COMMUNITY_PACKAGE_FLOW.includes("L('تأكيد الطلب','Confirm request')") && !COMMUNITY_PACKAGE_FLOW.includes('data-channel="whatsapp"'), 'Community package requests must confirm inside the app without a WhatsApp branch.');
+assertSource(FEATURED_PACKAGE_FLOW.includes('featuredPackageExposure(item).daysPerWeek>0') && !FEATURED_PACKAGE_FLOW.includes('item.featured&&'), 'Home packages do not follow provider-plan exposure automatically.');
+assertSource(PROVIDER_TASK_FLOW.includes('requestVisibleSteps(request)') && !PROVIDER_TASK_FLOW.includes('provider-task-summary'), 'Provider jobs must use the visible progress line instead of summary boxes.');
+assertSource(APP_SOURCE.includes('<details class="provider-space-group"') && APP_SOURCE.includes("contextHelpButton('provider_space')"), 'Provider space sections are not collapsible or lack contextual help.');
+assertSource(APP_SOURCE.includes("initialProviderAction=role==='provider'") && APP_SOURCE.includes('${esc(next.label)} ${dirFor'), 'Provider task buttons do not expose the exact next-action label.');
+assertSource(APP_SOURCE.includes('needsFreshRequest') && APP_SOURCE.includes('completionReviewSheet(request.id)'), 'Completion notifications do not refresh and open the exact request.');
+assertSource(APP_SOURCE.includes('save();syncVisibleNotificationCounters();') && APP_SOURCE.includes('void markConversationRead(r.id,role);'), 'Opening a conversation does not clear its unread count across entry points.');
 
 function assertSource(value, message) {
   if (!value) throw new Error(message);
@@ -1302,6 +1312,12 @@ async function clickProviderNav(page, tab) {
   await clickProviderNav(page, 'profile');
   await dismissProviderSectionGuide(page, '06b-provider-account-guide');
   assert(await page.locator('.provider-space-title h1').filter({ hasText: /مساحتك|Your space/i }).count(), 'Provider account did not open the structured Your space page.');
+  const providerSpaceGroups = page.locator('.provider-space-group');
+  assert(await providerSpaceGroups.count() === 5, 'Your space must contain five focused collapsible sections.');
+  assert(await providerSpaceGroups.first().getAttribute('open') !== null, 'Provider account section must open by default.');
+  assert(await providerSpaceGroups.nth(1).getAttribute('open') === null, 'Provider business section must start collapsed to reduce visual clutter.');
+  await providerSpaceGroups.nth(1).locator(':scope > summary').click();
+  assert(await providerSpaceGroups.nth(1).getAttribute('open') !== null, 'Provider business section does not expand.');
   await page.locator('[data-action="openProviderProfileEditor"]').click();
   await page.waitForSelector('.provider-profile-edit-sheet');
   assert(await page.locator('#ppEmail').count(), 'Provider profile editor is missing email.');

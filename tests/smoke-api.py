@@ -367,7 +367,7 @@ def main():
             "service": "homecare|electrician",
             "services": [
                 {"catId": "homecare", "serviceId": "electrician", "priceFrom": 8, "areas": ["السيب"]},
-                {"catId": "homecare", "serviceId": "locks", "priceFrom": 6, "areas": ["السيب"]},
+                {"catId": "homecare", "serviceId": "appliances", "priceFrom": 6, "areas": ["السيب"]},
             ],
             "priceFrom": 8,
             "note": "خدمة كهرباء منزلية دقيقة وموثوقة",
@@ -417,6 +417,49 @@ def main():
     )
     expect(status, decision, {200}, "Provider approval failed")
     assert decision.get("provider", {}).get("phone") == provider_phone
+    approved_services = decision.get("provider", {}).get("services", [])
+    assert len(approved_services) == 2, "Provider approval discarded an additional selected service"
+    assert {item.get("serviceId") for item in approved_services} == {
+        "electrician",
+        "appliances",
+    }, "Provider approval changed the selected services"
+
+    company_phone = "96895550993"
+    status, company_registration = request(
+        "/api/provider-requests",
+        {
+            "name": "شركة خدمات متعددة",
+            "companyName": "شركة خدمات متعددة",
+            "phone": company_phone,
+            "pin": "7320",
+            "providerType": "company",
+            "commercialNo": "TEST-CO-993",
+            "commercialExpiry": "2029-12-31",
+            "companySize": "2",
+            "gov": "مسقط",
+            "wilayah": "السيب",
+            "service": "homecare|electrician",
+            "services": [
+                {"catId": "homecare", "serviceId": "electrician", "priceFrom": 8, "areas": ["السيب"]},
+                {"catId": "cleaning", "serviceId": "home_clean", "priceFrom": 12, "areas": ["السيب"]},
+            ],
+            "note": "شركة تقدم خدمات منزلية متعددة موثوقة",
+            "hours": "الأحد، الاثنين: 8:00 ص - 8:00 م",
+            "documentsData": [TEST_PNG, TEST_PNG],
+        },
+    )
+    expect(status, company_registration, {201}, "Multi-category company registration failed")
+    status, company_decision = request(
+        "/api/admin/request-decision",
+        {"id": company_registration["request"]["id"], "decision": "accept"},
+        admin_token,
+    )
+    expect(status, company_decision, {200}, "Multi-category company approval failed")
+    company_services = company_decision.get("provider", {}).get("services", [])
+    assert {item.get("catId") for item in company_services} == {
+        "homecare",
+        "cleaning",
+    }, "Company approval kept only the first selected category"
 
     status, expired_pending_state = request("/api/bootstrap", token=pending_token)
     expect(status, expired_pending_state, {200}, "Expired pending session fallback failed")
@@ -427,6 +470,7 @@ def main():
     expect(status, admin_state, {200}, "Admin state failed")
     provider = next(item for item in admin_state["providers"] if item.get("phone") == provider_phone)
     provider_id = provider["id"]
+    assert len(provider.get("services", [])) == 2, "Approved provider state kept only the primary service"
 
     status, pending_subscription = request(
         "/api/admin/subscriptions",
