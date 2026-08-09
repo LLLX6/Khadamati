@@ -13,7 +13,9 @@ const IS_MOBILE = VIEWPORT_WIDTH <= 760;
 let LOCAL_SERVER = null;
 
 const APP_SOURCE = fs.readFileSync(path.resolve(__dirname, '..', 'index.html'), 'utf8');
-assertSource(APP_SOURCE.includes("const APP_VERSION = '1.1.1'") && APP_SOURCE.includes("const APP_BUILD = 'khadamati-v1.1.1-ux-polish-r1-2026-08-09'"), 'UX-polish application version/build marker is missing.');
+const STYLE_SOURCE = fs.readFileSync(path.resolve(__dirname, '..', 'assets', 'styles', 'khadamati-v1.css'), 'utf8');
+assertSource(APP_SOURCE.includes("const APP_VERSION = '1.1.1'") && APP_SOURCE.includes("const APP_BUILD = 'khadamati-v1.1.1-ux-polish-r2-2026-08-09'"), 'UX-polish application version/build marker is missing.');
+assertSource(APP_SOURCE.includes('access-atmosphere') && APP_SOURCE.includes('access-journey') && STYLE_SOURCE.includes('.app-shell:has(> .access-gateway)') && STYLE_SOURCE.includes('premium mobile access gateway'), 'The premium entry background or dynamic mobile-height fix is missing.');
 assertSource(APP_SOURCE.includes('actionPromptRoot') && APP_SOURCE.includes('renderActionPrompt()'), 'The actionable notification root is not wired to rendering.');
 assertSource(APP_SOURCE.includes("'change_propose'") && APP_SOURCE.includes("'change_decide'"), 'Change-order propose/decision UI is missing.');
 assertSource(APP_SOURCE.includes('work-order-summary') && APP_SOURCE.includes('review_change_order'), 'Work-order summary or change-order routing is missing.');
@@ -314,12 +316,19 @@ async function clickProviderNav(page, tab) {
       return {
         cardHeight: cardBox.height,
         viewportHeight: window.innerHeight,
+        documentHeight: document.documentElement.scrollHeight,
+        documentWidth: document.documentElement.scrollWidth,
+        viewportWidth: window.innerWidth,
         topGap: utilities ? utilities.top - cardBox.top : 999,
         bottomGap: trust ? cardBox.bottom - trust.bottom : 999,
+        roleCount: card.querySelectorAll('.access-role-card').length,
+        roleMinHeight: Math.min(...[...card.querySelectorAll('.access-role-card')].map(item => item.getBoundingClientRect().height)),
       };
     });
     assert(entryLayout.cardHeight <= entryLayout.viewportHeight - 8, 'The mobile entry card extends beyond the usable screen height.');
     assert(entryLayout.topGap <= 32 && entryLayout.bottomGap <= 36, 'The mobile entry content leaves an excessive blank band at the top or bottom.');
+    assert(entryLayout.documentHeight <= entryLayout.viewportHeight + 1 && entryLayout.documentWidth <= entryLayout.viewportWidth + 1, 'The entry gateway creates viewport scrolling on mobile.');
+    assert(entryLayout.roleCount === 2 && entryLayout.roleMinHeight >= 70, 'Entry role actions are missing or too small for touch.');
   }
 
   await page.locator('[data-action="openUserLogin"]').click();
