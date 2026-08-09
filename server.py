@@ -111,8 +111,25 @@ try:
     import requests
     from pywebpush import WebPushException, webpush
 except ImportError:
-    requests = None
-    WebPushException = Exception
+    class _FallbackRequestsSession:
+        def post(self, *_args, **_kwargs):
+            raise RuntimeError("requests dependency is not installed")
+
+        def close(self):
+            """Match the requests.Session lifecycle contract used by push delivery."""
+            return None
+
+    class _FallbackRequestsModule:
+        Session = _FallbackRequestsSession
+
+    requests = _FallbackRequestsModule()
+    class WebPushException(Exception):
+        """Small compatibility type for tests and installations without pywebpush."""
+
+        def __init__(self, message="", response=None):
+            super().__init__(message)
+            self.response = response
+
     webpush = None
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -6372,7 +6389,7 @@ class Handler(SimpleHTTPRequestHandler):
             }
             item["note"] = item["bio"]
             raw_services = data.get("services") if isinstance(data.get("services"), list) else []
-            if not item["services"] and "|" in item["service"]:
+            if not raw_services and "|" in item["service"]:
                 cat_id, service_id = item["service"].split("|", 1)
                 raw_services = [{
                     "catId": cat_id, "serviceId": service_id,
