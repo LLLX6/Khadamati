@@ -14,7 +14,7 @@ let LOCAL_SERVER = null;
 
 const APP_SOURCE = fs.readFileSync(path.resolve(__dirname, '..', 'index.html'), 'utf8');
 const STYLE_SOURCE = fs.readFileSync(path.resolve(__dirname, '..', 'assets', 'styles', 'khadamati-v1.css'), 'utf8');
-assertSource(APP_SOURCE.includes("const APP_VERSION = '1.1.1'") && APP_SOURCE.includes("const APP_BUILD = 'khadamati-v1.1.1-matching-admin-sync-r6-2026-08-10'"), 'Matching/admin/sync application version/build marker is missing.');
+assertSource(APP_SOURCE.includes("const APP_VERSION = '1.1.1'") && APP_SOURCE.includes("const APP_BUILD = 'khadamati-v1.1.1-matching-admin-sync-r7-2026-08-10'"), 'Matching/admin/sync application version/build marker is missing.');
 assertSource(APP_SOURCE.includes('access-horizon-hero') && APP_SOURCE.includes('renderHorizonEntry()') && STYLE_SOURCE.includes("nearby-services.webp") && STYLE_SOURCE.includes('Oman Horizon entry screen'), 'The Oman Horizon entry composition or local background asset is missing.');
 assertSource(APP_SOURCE.includes('<img src="app-icon-192.png"') && APP_SOURCE.includes("L('شعار خدماتي','Khadamati logo')") && APP_SOURCE.includes("L('زائر','Guest')") && !APP_SOURCE.includes("L('دخول زائر','Guest access')"), 'The entry screen is not using the official Khadamati logo or the concise visitor label.');
 assertSource(['للمستخدم','للمزود','رحلة واضحة للطرفين'].every(copy => APP_SOURCE.includes(copy)), 'The first-open guidance does not explain the customer, provider, and shared journey.');
@@ -539,18 +539,26 @@ async function clickProviderNav(page, tab) {
 
   assert((await page.locator('.clean-grid .category-tile').count()) <= 6, 'Home must show no more than six categories.');
   assert(await page.locator('main.view > .home-ad.ad-slider').count(), 'Advertisement slider must be the first home block.');
-  const adCopyFit = await page.locator('.home-ad.ad-slider').evaluate(ad => {
-    const copy = ad.querySelector('.ad-slider-copy');
-    if (!copy || copy.hidden) return true;
-    const adBox = ad.getBoundingClientRect();
-    const copyBox = copy.getBoundingClientRect();
-    const style = getComputedStyle(copy);
-    const alpha = Number(style.backgroundColor.match(/[\d.]+(?=\))/g)?.at(-1) || 1);
-    return copyBox.height <= adBox.height * 0.46
-      && copyBox.width <= adBox.width * 0.8
-      && alpha < 0.8;
-  });
-  assert(adCopyFit, 'Advertisement copy is oversized or hides too much of the image.');
+  const adSlideCount = Math.max(1, await page.locator('.home-ad.ad-slider .ad-dot').count());
+  await page.evaluate(() => clearInterval(window.__khadamatiAdTimer));
+  for (let slideIndex = 0; slideIndex < adSlideCount; slideIndex += 1) {
+    if (adSlideCount > 1) await page.locator('.home-ad.ad-slider .ad-dot').nth(slideIndex).click();
+    await page.waitForTimeout(25);
+    const adCopyFit = await page.locator('.home-ad.ad-slider').evaluate(ad => {
+      const copy = ad.querySelector('.ad-slider-copy');
+      if (!copy || copy.hidden) return { fits: true, hidden: true };
+      const adBox = ad.getBoundingClientRect();
+      const copyBox = copy.getBoundingClientRect();
+      const style = getComputedStyle(copy);
+      const alpha = Number(style.backgroundColor.match(/[\d.]+(?=\))/g)?.at(-1) || 1);
+      return {
+        fits: copyBox.height <= adBox.height * 0.46 && copyBox.width <= adBox.width * 0.8 && alpha < 0.8,
+        adWidth: Math.round(adBox.width), adHeight: Math.round(adBox.height),
+        copyWidth: Math.round(copyBox.width), copyHeight: Math.round(copyBox.height), alpha,
+      };
+    });
+    assert(adCopyFit.fits, `Advertisement ${slideIndex + 1} copy is oversized or hides too much of the image: ${JSON.stringify(adCopyFit)}`);
+  }
   assert((await page.locator('.popular-rail').count()) === 0, 'Popular services rail should be removed from home.');
   assert((await page.locator('.offline-sync-card').count()) === 0, 'Offline queue banner should not crowd the home page.');
   assert(await page.locator('.direct-request-card').count(), 'Direct request card is missing.');

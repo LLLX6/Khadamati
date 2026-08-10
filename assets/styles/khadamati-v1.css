@@ -743,7 +743,9 @@ button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-vis
   box-shadow:var(--shadow-foundation)!important;
 }
 .home-ad.ad-slider .ad-slide-image{object-position:center!important}
-.ad-slider-copy{border-radius:8px!important;backdrop-filter:blur(5px)}
+.home-ad.ad-slider .ad-slider-copy{width:min(72%,620px)!important;max-width:72%!important;max-height:42%!important;overflow:hidden!important;box-sizing:border-box!important;border-radius:8px!important;backdrop-filter:blur(5px)}
+.home-ad.ad-slider .ad-slider-copy h3{display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:1;overflow:hidden}
+.home-ad.ad-slider .ad-slider-copy p{display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:2;overflow:hidden}
 .direct-request-card{
   min-height:68px!important;
   grid-template-columns:42px minmax(0,1fr) auto!important;
