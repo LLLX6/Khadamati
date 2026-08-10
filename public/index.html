@@ -19,7 +19,7 @@
 <link rel="stylesheet" href="vendor/leaflet.css" />
 <script src="vendor/leaflet.js"></script>
 <title>خدماتي | Khadamati App</title>
-<link rel="stylesheet" href="assets/styles/khadamati-v1.css?v=1.1.1-brand-onboarding-r4" />
+<link rel="stylesheet" href="assets/styles/khadamati-v1.css?v=1.1.1-official-brand-onboarding-r5" />
 </head>
 <body>
 <div id="app" class="app-shell"><div class="startup-skeleton" aria-label="جاري تحميل خدماتي"><div class="skeleton-bar"></div><div class="skeleton-search"></div><div class="skeleton-banner"></div><div class="skeleton-grid"><i></i><i></i><i></i><i></i><i></i><i></i></div></div></div>
@@ -36,7 +36,7 @@ const STORAGE_KEY = 'KHADAMATI_MARKET_OS_V21';
 const PRIVATE_STATE_KEY = 'KHADAMATI_PRIVATE_STATE_V1';
 const APP_SCHEMA_VERSION = 71;
 const APP_VERSION = '1.1.1';
-const APP_BUILD = 'khadamati-v1.1.1-brand-onboarding-r4-2026-08-10';
+const APP_BUILD = 'khadamati-v1.1.1-official-brand-onboarding-r5-2026-08-10';
 const LEGACY_STORAGE_KEYS = ['KHADAMATI_MARKET_OS_V20','FORAN_MARKET_OS_V14'];
 const ONBOARDING_STORAGE_KEY = 'KHADAMATI_ONBOARDING_V4';
 const DIRECT_REQUEST_GUIDE_KEY = 'KHADAMATI_DIRECT_REQUEST_GUIDE_V1';
@@ -2183,7 +2183,7 @@ function upgradeActionIcons(root=document){
  const composer=root.querySelector('.chat-composer');if(composer){const attach=composer.querySelector('label.chat-icon-btn svg'),send=composer.querySelector('[data-action="sendChatMessage"]');if(attach)attach.outerHTML=icon('image');if(send)send.innerHTML=icon('send');}
  const reportActions=[['exportReportsCsv','download','CSV'],['exportReportsWord','file','Word'],['printReports','printer',L('طباعة أو PDF','Print or PDF')]];reportActions.forEach(([action,visual,label])=>{const button=root.querySelector(`[data-action="${action}"]`);if(button)button.innerHTML=`${icon(visual)} <span>${label}</span>`;});
 }
-function logoMark(){ return `<span class="brand-mark image-mark"><img src="logo.svg" alt="خدماتي" width="192" height="192"></span>`; }
+function logoMark(){ return `<span class="brand-mark image-mark"><img src="app-icon-192.png" alt="${L('شعار خدماتي','Khadamati logo')}" width="192" height="192"></span>`; }
 function navIcon(v){ return ({home:icon('home'),services:icon('grid'),tasks:icon('briefcase'),requestBoard:icon('search'),search:icon('search'),favorites:icon('heart'),myAccount:icon('user'),help:icon('chat')})[v]||icon('sparkle'); }
 function catIconName(id){ return `kh-category:${String(id||'homecare')}`; }
 function serviceIconName(id,catId=''){
@@ -5393,9 +5393,9 @@ function roleOnboardingSlides(role){
    {k:L('مطابقة أدق','Better matching'),t:L('قارن الأنسب لخدمتك ومنطقتك','Compare the best matches for your service and area'),d:L('يصل الطلب إلى المزودين المطابقين فقط، ثم ترى الردود والتوفر والموقع قبل اختيار من يناسبك.','The request reaches matching providers only, then you can compare replies, availability and location before choosing.'),b:[[L('تخصص مطابق للطلب','Exact specialty match'),'shield'],[L('خيارات مرتبة وواضحة','Clear ranked options'),'user']]}
   ],
   guest:[
-   {k:L('منصة واحدة','One service platform'),t:L('اطلب خدمتك وتابعها من مكان واحد','Request and track your service in one place'),d:L('اختر الخدمة، حدّد مكان التنفيذ، واكتب احتياجك. يصل طلبك إلى المزودين المناسبين.','Choose the service, set the location, and describe your need. Your request reaches suitable providers.'),b:[[L('خدمات منزلية ومهنية','Home and professional services'),'grid'],[L('طلب واضح في دقائق','A clear request in minutes'),'sparkle']]},
-   {k:L('اختيار مطمئن','Choose with confidence'),t:L('قارن العروض واختر المزود المناسب','Compare offers and choose the right provider'),d:L('راجع السعر والموعد والتقييم قبل القبول، ثم تصبح المهمة واضحة للطرفين.','Review price, timing, and rating before accepting. The job then becomes clear to both sides.'),b:[[L('مزودون مناسبون للطلب','Providers matched to the request'),'user'],[L('السعر والموعد قبل القبول','Price and timing before acceptance'),'clock']]},
-   {k:L('متابعة واضحة','Clear follow-up'),t:L('اعرف أين وصل الطلب حتى يكتمل','Know where your request is until completion'),d:L('تابع المحادثة والخطوة التالية من طلبك، ثم راجع الإنجاز وقيّم التجربة بسهولة.','Follow the chat and next action from your request, then review completion and rate the experience.'),b:[[L('تنبيهات للخطوات المهمة','Alerts for important actions'),'bell'],[L('مراجعة الإنجاز والتقييم','Completion review and rating'),'star']]}
+   {k:L('للمستخدم','For customers'),t:L('اطلب الخدمة التي تحتاجها بسهولة','Request the service you need with ease'),d:L('اختر الخدمة، حدّد موقعك، واكتب احتياجك. يرسل خدماتي طلبك إلى مزودين مناسبين قريبين منك.','Choose a service, set your location, and describe what you need. Khadamati sends your request to suitable nearby providers.'),b:[[L('خدمات منزلية ومهنية','Home and professional services'),'grid'],[L('طلب واحد يصل للأنسب','One request reaches the right providers'),'sparkle']]},
+   {k:L('للمزود','For providers'),t:L('استقبل فرصاً تناسب تخصصك','Receive opportunities that match your specialty'),d:L('تصل إليك الطلبات المطابقة لخدماتك ومنطقة عملك. راجع التفاصيل ثم أرسل عرضك وموعدك بوضوح.','Receive requests that match your services and work area. Review the details, then send a clear offer and appointment.'),b:[[L('طلبات مطابقة لخدمتك','Requests matched to your service'),'user'],[L('عرض وموعد واضحان','A clear offer and appointment'),'clock']]},
+   {k:L('رحلة واضحة للطرفين','A clear journey for both sides'),t:L('تابع كل خطوة حتى يكتمل العمل','Follow every step until the work is complete'),d:L('بعد قبول العرض، يجتمع الحجز والمحادثة والتنبيهات ومراجعة الإنجاز والتقييم داخل الطلب نفسه.','After an offer is accepted, booking, chat, alerts, completion review, and rating stay together in the same request.'),b:[[L('الخطوة التالية واضحة دائماً','The next step is always clear'),'bell'],[L('إنجاز وتقييم في مكان واحد','Completion and rating in one place'),'star']]}
   ],
   provider:[
    {k:L('ملف مهني','Professional profile'),t:L('اعرض تخصصك وأعمالك بصورة واضحة','Present your specialty and work clearly'),d:L('اختر قسماً رئيسياً واحداً، أضف خدماتك الفرعية داخله، وحدد مناطق التغطية والصورة الرئيسية وصور الأعمال.','Choose one main category, add its related sub-services, and set your coverage, main image and work gallery.'),b:[[L('تخصص منظم بلا تكرار','One organized specialty'),'user'],[L('صورة رئيسية وأعمال','Main image and portfolio'),'grid']]},

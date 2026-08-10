@@ -14,9 +14,10 @@ let LOCAL_SERVER = null;
 
 const APP_SOURCE = fs.readFileSync(path.resolve(__dirname, '..', 'index.html'), 'utf8');
 const STYLE_SOURCE = fs.readFileSync(path.resolve(__dirname, '..', 'assets', 'styles', 'khadamati-v1.css'), 'utf8');
-assertSource(APP_SOURCE.includes("const APP_VERSION = '1.1.1'") && APP_SOURCE.includes("const APP_BUILD = 'khadamati-v1.1.1-brand-onboarding-r4-2026-08-10'"), 'Brand/onboarding application version/build marker is missing.');
+assertSource(APP_SOURCE.includes("const APP_VERSION = '1.1.1'") && APP_SOURCE.includes("const APP_BUILD = 'khadamati-v1.1.1-official-brand-onboarding-r5-2026-08-10'"), 'Brand/onboarding application version/build marker is missing.');
 assertSource(APP_SOURCE.includes('access-horizon-hero') && APP_SOURCE.includes('renderHorizonEntry()') && STYLE_SOURCE.includes("nearby-services.webp") && STYLE_SOURCE.includes('Oman Horizon entry screen'), 'The Oman Horizon entry composition or local background asset is missing.');
-assertSource(APP_SOURCE.includes('<img src="logo.svg" alt="خدماتي"') && APP_SOURCE.includes("L('زائر','Guest')") && !APP_SOURCE.includes("L('دخول زائر','Guest access')"), 'The entry screen is not using the Khadamati logo or the concise visitor label.');
+assertSource(APP_SOURCE.includes('<img src="app-icon-192.png"') && APP_SOURCE.includes("L('شعار خدماتي','Khadamati logo')") && APP_SOURCE.includes("L('زائر','Guest')") && !APP_SOURCE.includes("L('دخول زائر','Guest access')"), 'The entry screen is not using the official Khadamati logo or the concise visitor label.');
+assertSource(['للمستخدم','للمزود','رحلة واضحة للطرفين'].every(copy => APP_SOURCE.includes(copy)), 'The first-open guidance does not explain the customer, provider, and shared journey.');
 assertSource(APP_SOURCE.includes('actionPromptRoot') && APP_SOURCE.includes('renderActionPrompt()'), 'The actionable notification root is not wired to rendering.');
 assertSource(APP_SOURCE.includes("'change_propose'") && APP_SOURCE.includes("'change_decide'"), 'Change-order propose/decision UI is missing.');
 assertSource(APP_SOURCE.includes('work-order-summary') && APP_SOURCE.includes('review_change_order'), 'Work-order summary or change-order routing is missing.');
@@ -305,35 +306,42 @@ async function clickProviderNav(page, tab) {
   await page.waitForTimeout(180);
   if (await page.locator('.role-onboarding').count()) {
     assert(await page.locator('.role-onboarding .onboarding-dot').count() === 3, 'First-open onboarding must contain three concise steps.');
-    const firstOpenImage = page.locator('.role-onboarding .onboarding-visual img');
-    assert(/assets\/ads\/campaigns\/nearby-services\.webp/.test(await firstOpenImage.getAttribute('src')), 'First-open onboarding is not using the Khadamati service-platform artwork.');
-    await firstOpenImage.evaluate(image => image.complete ? true : new Promise(resolve => image.addEventListener('load', () => resolve(true), { once: true })));
-    const firstOpenLayout = await page.locator('.role-onboarding').evaluate(dialog => {
-      const image = dialog.querySelector('.onboarding-visual img');
-      const copy = dialog.querySelector('.onboarding-copy');
-      const footer = dialog.querySelector('.onboarding-bottom');
-      const visibleCopyNodes = [...copy.querySelectorAll('.onboarding-kicker,h2,p,.onboarding-benefit')];
-      return {
-        direction: getComputedStyle(dialog).direction,
-        documentDirection: document.documentElement.dir,
-        imageFit: getComputedStyle(image).objectFit,
-        imageLoaded: image.naturalWidth > 0 && image.naturalHeight > 0,
-        dialogBottom: dialog.getBoundingClientRect().bottom,
-        viewportHeight: window.innerHeight,
-        copyScroll: copy.scrollHeight - copy.clientHeight,
-        copyVisible: visibleCopyNodes.every(node => {
-          const box = node.getBoundingClientRect();
-          const copyBox = copy.getBoundingClientRect();
-          return box.top >= copyBox.top - 1 && box.bottom <= copyBox.bottom + 1;
-        }),
-        footerVisible: footer.getBoundingClientRect().bottom <= window.innerHeight + 1,
-      };
-    });
-    assert(firstOpenLayout.direction === firstOpenLayout.documentDirection, 'First-open onboarding does not follow the active RTL/LTR document direction.');
-    assert(firstOpenLayout.imageFit === 'contain' && firstOpenLayout.imageLoaded, 'First-open onboarding must show each full service image without cropping.');
-    assert(firstOpenLayout.dialogBottom <= firstOpenLayout.viewportHeight + 1 && firstOpenLayout.footerVisible, 'First-open onboarding extends below the phone viewport.');
-    assert(firstOpenLayout.copyScroll <= 1 && firstOpenLayout.copyVisible, 'First-open onboarding copy is clipped or requires hidden scrolling.');
-    await capture(page, '00a-first-open-onboarding', { fullPage: false });
+    const expectedArtwork = ['nearby-services.webp','home-services.webp','business-services.webp'];
+    for (let step = 0; step < expectedArtwork.length; step += 1) {
+      const firstOpenImage = page.locator('.role-onboarding .onboarding-visual img');
+      assert((await firstOpenImage.getAttribute('src') || '').endsWith(expectedArtwork[step]), `First-open step ${step + 1} is using the wrong artwork.`);
+      await firstOpenImage.evaluate(image => image.complete ? true : new Promise(resolve => image.addEventListener('load', () => resolve(true), { once: true })));
+      const firstOpenLayout = await page.locator('.role-onboarding').evaluate(dialog => {
+        const image = dialog.querySelector('.onboarding-visual img');
+        const copy = dialog.querySelector('.onboarding-copy');
+        const footer = dialog.querySelector('.onboarding-bottom');
+        const visibleCopyNodes = [...copy.querySelectorAll('.onboarding-kicker,h2,p,.onboarding-benefit')];
+        return {
+          direction: getComputedStyle(dialog).direction,
+          documentDirection: document.documentElement.dir,
+          imageFit: getComputedStyle(image).objectFit,
+          imageLoaded: image.naturalWidth > 0 && image.naturalHeight > 0,
+          dialogBottom: dialog.getBoundingClientRect().bottom,
+          viewportHeight: window.innerHeight,
+          copyScroll: copy.scrollHeight - copy.clientHeight,
+          copyVisible: visibleCopyNodes.every(node => {
+            const box = node.getBoundingClientRect();
+            const copyBox = copy.getBoundingClientRect();
+            return box.top >= copyBox.top - 1 && box.bottom <= copyBox.bottom + 1;
+          }),
+          footerVisible: footer.getBoundingClientRect().bottom <= window.innerHeight + 1,
+        };
+      });
+      assert(firstOpenLayout.direction === firstOpenLayout.documentDirection, 'First-open onboarding does not follow the active RTL/LTR document direction.');
+      assert(firstOpenLayout.imageFit === 'contain' && firstOpenLayout.imageLoaded, 'First-open onboarding must show each full service image without cropping.');
+      assert(firstOpenLayout.dialogBottom <= firstOpenLayout.viewportHeight + 1 && firstOpenLayout.footerVisible, 'First-open onboarding extends below the phone viewport.');
+      assert(firstOpenLayout.copyScroll <= 1 && firstOpenLayout.copyVisible, 'First-open onboarding copy is clipped or requires hidden scrolling.');
+      await capture(page, `00a-first-open-onboarding-${step + 1}`, { fullPage: false });
+      if (step < expectedArtwork.length - 1) {
+        await page.locator('[data-action="onboardingNext"]').click();
+        await page.waitForFunction(expected => document.querySelector('.role-onboarding .onboarding-visual img')?.getAttribute('src')?.endsWith(expected), expectedArtwork[step + 1]);
+      }
+    }
     await page.locator('[data-action="skipOnboarding"]').click();
   }
   await capture(page, '00-entry');
