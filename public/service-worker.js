@@ -1,4 +1,4 @@
-const CACHE_NAME = 'khadamati-app-shell-v1.1.1-ux-polish-r2';
+const CACHE_NAME = 'khadamati-app-shell-v1.1.1-brand-onboarding-r4';
 const SHELL = [
   './',
   './index.html',
@@ -22,9 +22,6 @@ const SHELL = [
   './assets/onboarding/core/user-direct-request.webp',
   './assets/onboarding/core/user-matching.webp',
   './assets/onboarding/core/user-track.webp',
-  './assets/onboarding/core/guest-browse.webp',
-  './assets/onboarding/core/guest-compare.webp',
-  './assets/onboarding/core/guest-signin.webp',
   './assets/onboarding/core/guest-privacy.webp',
   './assets/onboarding/core/provider-account-v2.webp',
   './assets/onboarding/core/provider-community-v2.webp',

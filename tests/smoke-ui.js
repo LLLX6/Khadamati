@@ -14,8 +14,9 @@ let LOCAL_SERVER = null;
 
 const APP_SOURCE = fs.readFileSync(path.resolve(__dirname, '..', 'index.html'), 'utf8');
 const STYLE_SOURCE = fs.readFileSync(path.resolve(__dirname, '..', 'assets', 'styles', 'khadamati-v1.css'), 'utf8');
-assertSource(APP_SOURCE.includes("const APP_VERSION = '1.1.1'") && APP_SOURCE.includes("const APP_BUILD = 'khadamati-v1.1.1-ux-polish-r2-2026-08-09'"), 'UX-polish application version/build marker is missing.');
-assertSource(APP_SOURCE.includes('access-atmosphere') && APP_SOURCE.includes('access-journey') && STYLE_SOURCE.includes('.app-shell:has(> .access-gateway)') && STYLE_SOURCE.includes('premium mobile access gateway'), 'The premium entry background or dynamic mobile-height fix is missing.');
+assertSource(APP_SOURCE.includes("const APP_VERSION = '1.1.1'") && APP_SOURCE.includes("const APP_BUILD = 'khadamati-v1.1.1-brand-onboarding-r4-2026-08-10'"), 'Brand/onboarding application version/build marker is missing.');
+assertSource(APP_SOURCE.includes('access-horizon-hero') && APP_SOURCE.includes('renderHorizonEntry()') && STYLE_SOURCE.includes("nearby-services.webp") && STYLE_SOURCE.includes('Oman Horizon entry screen'), 'The Oman Horizon entry composition or local background asset is missing.');
+assertSource(APP_SOURCE.includes('<img src="logo.svg" alt="خدماتي"') && APP_SOURCE.includes("L('زائر','Guest')") && !APP_SOURCE.includes("L('دخول زائر','Guest access')"), 'The entry screen is not using the Khadamati logo or the concise visitor label.');
 assertSource(APP_SOURCE.includes('actionPromptRoot') && APP_SOURCE.includes('renderActionPrompt()'), 'The actionable notification root is not wired to rendering.');
 assertSource(APP_SOURCE.includes("'change_propose'") && APP_SOURCE.includes("'change_decide'"), 'Change-order propose/decision UI is missing.');
 assertSource(APP_SOURCE.includes('work-order-summary') && APP_SOURCE.includes('review_change_order'), 'Work-order summary or change-order routing is missing.');
@@ -304,15 +305,50 @@ async function clickProviderNav(page, tab) {
   await page.waitForTimeout(180);
   if (await page.locator('.role-onboarding').count()) {
     assert(await page.locator('.role-onboarding .onboarding-dot').count() === 3, 'First-open onboarding must contain three concise steps.');
+    const firstOpenImage = page.locator('.role-onboarding .onboarding-visual img');
+    assert(/assets\/ads\/campaigns\/nearby-services\.webp/.test(await firstOpenImage.getAttribute('src')), 'First-open onboarding is not using the Khadamati service-platform artwork.');
+    await firstOpenImage.evaluate(image => image.complete ? true : new Promise(resolve => image.addEventListener('load', () => resolve(true), { once: true })));
+    const firstOpenLayout = await page.locator('.role-onboarding').evaluate(dialog => {
+      const image = dialog.querySelector('.onboarding-visual img');
+      const copy = dialog.querySelector('.onboarding-copy');
+      const footer = dialog.querySelector('.onboarding-bottom');
+      const visibleCopyNodes = [...copy.querySelectorAll('.onboarding-kicker,h2,p,.onboarding-benefit')];
+      return {
+        direction: getComputedStyle(dialog).direction,
+        documentDirection: document.documentElement.dir,
+        imageFit: getComputedStyle(image).objectFit,
+        imageLoaded: image.naturalWidth > 0 && image.naturalHeight > 0,
+        dialogBottom: dialog.getBoundingClientRect().bottom,
+        viewportHeight: window.innerHeight,
+        copyScroll: copy.scrollHeight - copy.clientHeight,
+        copyVisible: visibleCopyNodes.every(node => {
+          const box = node.getBoundingClientRect();
+          const copyBox = copy.getBoundingClientRect();
+          return box.top >= copyBox.top - 1 && box.bottom <= copyBox.bottom + 1;
+        }),
+        footerVisible: footer.getBoundingClientRect().bottom <= window.innerHeight + 1,
+      };
+    });
+    assert(firstOpenLayout.direction === firstOpenLayout.documentDirection, 'First-open onboarding does not follow the active RTL/LTR document direction.');
+    assert(firstOpenLayout.imageFit === 'contain' && firstOpenLayout.imageLoaded, 'First-open onboarding must show each full service image without cropping.');
+    assert(firstOpenLayout.dialogBottom <= firstOpenLayout.viewportHeight + 1 && firstOpenLayout.footerVisible, 'First-open onboarding extends below the phone viewport.');
+    assert(firstOpenLayout.copyScroll <= 1 && firstOpenLayout.copyVisible, 'First-open onboarding copy is clipped or requires hidden scrolling.');
     await capture(page, '00a-first-open-onboarding', { fullPage: false });
     await page.locator('[data-action="skipOnboarding"]').click();
   }
   await capture(page, '00-entry');
+  const visitorAction = page.locator('[data-action="enterGuest"]');
+  assert(['زائر', 'Guest'].includes((await visitorAction.textContent()).trim()), 'The visitor action contains extra sign-in wording.');
+  assert(await visitorAction.locator('svg').count() === 1, 'The visitor eye icon was removed.');
+  const entryDirection = await page.locator('.access-horizon-stage').evaluate(stage => ({ stage: getComputedStyle(stage).direction, document: document.documentElement.dir }));
+  assert(entryDirection.stage === entryDirection.document, 'The entry screen does not follow the active RTL/LTR document direction.');
   if (IS_MOBILE && VIEWPORT_HEIGHT > 700) {
     const entryLayout = await page.locator('.access-stage').evaluate(card => {
       const cardBox = card.getBoundingClientRect();
       const utilities = card.querySelector('.access-utility')?.getBoundingClientRect();
       const trust = card.querySelector('.access-assurance')?.getBoundingClientRect();
+      const hero = card.querySelector('.access-horizon-hero');
+      const roleGrid = card.querySelector('.access-role-grid');
       return {
         cardHeight: cardBox.height,
         viewportHeight: window.innerHeight,
@@ -321,6 +357,9 @@ async function clickProviderNav(page, tab) {
         viewportWidth: window.innerWidth,
         topGap: utilities ? utilities.top - cardBox.top : 999,
         bottomGap: trust ? cardBox.bottom - trust.bottom : 999,
+        heroHeight: hero?.getBoundingClientRect().height || 0,
+        hasLocalHero: hero ? getComputedStyle(hero).backgroundImage.includes('nearby-services.webp') : false,
+        roleColumns: roleGrid ? getComputedStyle(roleGrid).gridTemplateColumns.split(' ').filter(Boolean).length : 0,
         roleCount: card.querySelectorAll('.access-role-card').length,
         roleMinHeight: Math.min(...[...card.querySelectorAll('.access-role-card')].map(item => item.getBoundingClientRect().height)),
       };
@@ -328,6 +367,8 @@ async function clickProviderNav(page, tab) {
     assert(entryLayout.cardHeight <= entryLayout.viewportHeight - 8, 'The mobile entry card extends beyond the usable screen height.');
     assert(entryLayout.topGap <= 32 && entryLayout.bottomGap <= 36, 'The mobile entry content leaves an excessive blank band at the top or bottom.');
     assert(entryLayout.documentHeight <= entryLayout.viewportHeight + 1 && entryLayout.documentWidth <= entryLayout.viewportWidth + 1, 'The entry gateway creates viewport scrolling on mobile.');
+    assert(entryLayout.heroHeight >= 170 && entryLayout.hasLocalHero, 'The Oman Horizon hero is missing, too short, or not using the local optimized asset.');
+    assert(entryLayout.roleColumns === 2, 'The two entry roles must remain side by side on mobile.');
     assert(entryLayout.roleCount === 2 && entryLayout.roleMinHeight >= 70, 'Entry role actions are missing or too small for touch.');
   }
 
@@ -369,14 +410,14 @@ async function clickProviderNav(page, tab) {
     assert(!IS_MOBILE && await page.locator('.app-top').isVisible(), 'Desktop sign-in reached neither onboarding nor the authenticated application.');
   }
   const onboardingSets = [
-    { role: 'user', slides: ['user-service', 'user-direct-request', 'user-matching', 'user-track'] },
-    { role: 'guest', slides: ['guest-browse', 'guest-compare', 'guest-signin', 'guest-privacy'] },
-    { role: 'provider', slides: ['provider-account-v2', 'provider-community-v2', 'provider-today-v2', 'provider-tasks-v2'] },
-    { role: 'company', slides: ['company-profile', 'company-dispatch', 'company-analytics', 'company-team'] },
-  ].map(set => ({ ...set, slides: set.slides.map(name => `assets/onboarding/core/${name}.webp`) }));
+    { role: 'user', slides: ['user-service', 'user-direct-request', 'user-matching', 'user-track'].map(name => `assets/onboarding/core/${name}.webp`) },
+    { role: 'guest', slides: ['assets/ads/campaigns/nearby-services.webp', 'assets/ads/campaigns/home-services.webp', 'assets/ads/campaigns/business-services.webp', 'assets/onboarding/core/guest-privacy.webp'] },
+    { role: 'provider', slides: ['provider-account-v2', 'provider-community-v2', 'provider-today-v2', 'provider-tasks-v2'].map(name => `assets/onboarding/core/${name}.webp`) },
+    { role: 'company', slides: ['company-profile', 'company-dispatch', 'company-analytics', 'company-team'].map(name => `assets/onboarding/core/${name}.webp`) },
+  ];
   for (const set of onboardingSets) {
     assert(set.slides.length === 4, `${set.role} onboarding must contain four focused steps.`);
-    assert(set.slides.every(src => /assets\/onboarding\/core\//.test(src)), `${set.role} onboarding is using an outdated image.`);
+    assert(set.slides.every(src => /assets\/(?:onboarding\/core|ads\/campaigns)\//.test(src)), `${set.role} onboarding is using an outdated image.`);
     assert(new Set(set.slides).size === set.slides.length, `${set.role} onboarding repeats the same artwork.`);
   }
   assert(new Set(onboardingSets.flatMap(set => set.slides)).size === 16, 'Every onboarding state must use its own artwork.');
@@ -1410,7 +1451,7 @@ async function clickProviderNav(page, tab) {
   await page.waitForSelector('[data-action="enterGuest"]');
   await page.locator('[data-action="enterGuest"]').click();
   if (await page.locator('.role-onboarding').count()) {
-    assert(/assets\/onboarding\/core\/guest-browse\.webp/.test(await page.locator('.role-onboarding .onboarding-visual img').getAttribute('src')), 'Guest onboarding did not open its dedicated artwork.');
+    assert(/assets\/ads\/campaigns\/nearby-services\.webp/.test(await page.locator('.role-onboarding .onboarding-visual img').getAttribute('src')), 'Guest onboarding did not open its dedicated Khadamati service artwork.');
     await page.locator('[data-action="skipOnboarding"]').click();
   }
   assert(await page.locator('.app-top [data-action="openNotifications"] .notification-badge').count() === 0, 'Guest must not inherit the previous user notification badge.');

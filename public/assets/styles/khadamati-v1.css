@@ -9848,3 +9848,183 @@ body{
   .access-stage{gap:9px!important;padding:12px!important;border-radius:24px!important}.access-utility button{min-height:36px}.access-brand .logo-mark{width:46px;height:46px;flex-basis:46px}.access-brand h1{font-size:1.3rem}.access-brand>em{display:none}.access-promise{min-height:94px;padding:13px}.access-promise-copy>small{display:none}.access-promise h2{font-size:1rem}.access-journey{margin-top:1px}.access-promise-art{width:48px;height:48px}.access-role-card{min-height:70px!important;padding-block:8px!important}.access-choice-head small{display:none}.access-assurance span{font-size:.55rem}
 }
 @media(prefers-reduced-motion:reduce){.access-orb{animation:none!important}.access-role-card{transition:none!important}}
+
+/* 1.1.1 Oman Horizon entry screen: code-native controls over an existing local asset. */
+.access-horizon.access-gateway{
+  place-items:center!important;
+  padding:max(10px,env(safe-area-inset-top,0px)) 10px max(10px,env(safe-area-inset-bottom,0px))!important;
+  background:radial-gradient(circle at 16% 12%,rgba(33,190,177,.22),transparent 29%),radial-gradient(circle at 86% 88%,rgba(217,169,57,.2),transparent 25%),linear-gradient(150deg,#021a29,#064454 56%,#08796f);
+}
+.access-horizon-stage.access-stage{
+  width:min(100%,460px);
+  height:min(900px,calc(100dvh - 20px - env(safe-area-inset-top,0px) - env(safe-area-inset-bottom,0px)));
+  min-height:0!important;
+  display:grid;
+  grid-template-rows:minmax(220px,40%) minmax(0,1fr)!important;
+  gap:0!important;
+  padding:0!important;
+  overflow:hidden;
+  border:1px solid rgba(255,255,255,.58);
+  border-radius:38px!important;
+  background:#e7f2f0;
+  box-shadow:0 32px 90px rgba(0,20,31,.38),inset 0 1px 0 rgba(255,255,255,.75);
+  backdrop-filter:none;
+}
+.access-horizon-stage.access-stage::before{display:none}
+.access-horizon-hero{
+  position:relative;
+  min-height:0;
+  overflow:hidden;
+  background-image:linear-gradient(180deg,rgba(2,35,48,.28) 0%,rgba(2,43,54,.18) 42%,rgba(2,45,55,.8) 100%),url('../ads/campaigns/nearby-services.webp');
+  background-size:cover;
+  background-position:8% 48%;
+}
+.access-horizon-hero::after{content:"";position:absolute;inset:auto 0 0;height:46%;background:linear-gradient(180deg,transparent,rgba(1,37,47,.64));pointer-events:none}
+.access-horizon-utility.access-utility{position:absolute;z-index:4;inset:14px 14px auto;display:flex;justify-content:space-between}
+.access-horizon-utility.access-utility button{
+  min-height:44px;
+  padding-inline:13px;
+  border-color:rgba(255,255,255,.38);
+  border-radius:16px;
+  background:rgba(2,38,50,.57);
+  color:#fff;
+  box-shadow:0 10px 25px rgba(0,20,29,.2);
+  backdrop-filter:blur(14px) saturate(130%);
+}
+.access-horizon-utility.access-utility button svg{color:#6fe4d4}
+.access-horizon-utility.access-utility button:hover,.access-horizon-utility.access-utility button:focus-visible{border-color:rgba(255,255,255,.8);background:rgba(2,45,56,.78);outline:3px solid rgba(102,229,211,.24)}
+.access-horizon-brand.access-brand{
+  position:absolute;
+  z-index:3;
+  inset:76px 16px auto;
+  display:grid;
+  justify-content:center!important;
+  justify-items:center;
+  gap:6px;
+  padding:0;
+  text-align:center;
+  color:#fff;
+}
+.access-horizon-brand.access-brand .logo-mark{width:66px;height:66px;flex-basis:66px;border-radius:20px;border:1px solid rgba(255,255,255,.4);box-shadow:0 16px 34px rgba(0,21,31,.35)}
+.access-horizon-brand.access-brand>div{justify-items:center;gap:2px}
+.access-horizon-brand.access-brand small{color:rgba(255,255,255,.76);font-size:.68rem;text-shadow:0 2px 10px rgba(0,25,35,.6)}
+.access-horizon-brand.access-brand h1{color:#fff;font-size:1.82rem;letter-spacing:-.045em;text-shadow:0 4px 18px rgba(0,25,35,.72)}
+.access-horizon-trail{position:absolute;z-index:2;inset:auto 15% 11px;height:34px;border-bottom:2px solid rgba(104,235,217,.82);border-radius:0 0 50% 50%;filter:drop-shadow(0 0 8px rgba(73,229,208,.72))}
+.access-horizon-trail i{position:absolute;bottom:-5px;width:9px;height:9px;border:2px solid rgba(255,255,255,.84);border-radius:999px;background:#20bca8;box-shadow:0 0 0 4px rgba(41,196,176,.18),0 0 13px rgba(83,235,214,.9)}
+.access-horizon-trail i:nth-child(1){inset-inline-start:0}.access-horizon-trail i:nth-child(2){inset-inline-start:50%;transform:translateX(-50%)}.access-horizon-trail i:nth-child(3){inset-inline-end:0}
+.access-horizon-sheet{
+  position:relative;
+  z-index:5;
+  min-height:0;
+  margin-top:-30px;
+  display:grid;
+  grid-template-rows:auto auto minmax(0,1fr) auto auto;
+  gap:9px;
+  padding:22px 18px 14px;
+  overflow:hidden;
+  border-radius:36px 36px 0 0;
+  background:radial-gradient(circle at 12% 12%,rgba(47,186,170,.1),transparent 27%),linear-gradient(160deg,#f8fbfa,#e7f2f0 78%,#dceae7);
+  box-shadow:0 -16px 36px rgba(1,44,51,.18),inset 0 1px 0 #fff;
+}
+.access-horizon-sheet::before{content:"";position:absolute;inset:0;pointer-events:none;background:linear-gradient(115deg,rgba(255,255,255,.66),transparent 34%)}
+.access-horizon-sheet>*{position:relative;z-index:1}
+.access-horizon-heading.access-choice-head{position:relative;display:grid!important;grid-template-columns:1fr;justify-items:center;min-height:48px;padding:0 40px;text-align:center}
+.access-horizon-heading>div{display:grid;justify-items:center;gap:3px}
+.access-horizon-heading.access-choice-head b{color:#07394a;font-size:1.2rem;line-height:1.25}
+.access-horizon-heading.access-choice-head small{color:#627781;font-size:.62rem;font-weight:800}
+.access-horizon-heading .context-help-button{position:absolute;inset-inline-end:0;top:50%;transform:translateY(-50%);border-color:rgba(6,122,119,.2);background:rgba(255,255,255,.68);color:#087d78}
+.access-horizon-divider{display:flex;align-items:center;justify-content:center;gap:8px;color:#c4932e}
+.access-horizon-divider i{width:min(22%,72px);height:1px;background:linear-gradient(90deg,transparent,rgba(191,139,35,.62))}.access-horizon-divider i:last-child{transform:scaleX(-1)}
+.access-horizon-divider span{font-size:.72rem;filter:drop-shadow(0 2px 5px rgba(196,147,46,.3))}
+.access-horizon .access-role-grid{min-height:0;display:grid;grid-template-columns:repeat(2,minmax(0,1fr))!important;align-items:stretch;gap:12px!important}
+.access-horizon .access-role-card{
+  min-height:0!important;
+  height:100%;
+  display:flex!important;
+  flex-direction:column;
+  align-items:center;
+  justify-content:center;
+  gap:12px!important;
+  padding:15px 10px!important;
+  border-radius:29px!important;
+  text-align:center!important;
+  box-shadow:0 17px 34px rgba(2,44,54,.13);
+}
+.access-horizon .access-role-card::before{width:150px;height:150px;inset:auto -70px -76px;opacity:.055}
+.access-horizon .access-role-card>span{width:66px!important;height:66px!important;flex:0 0 66px;border-radius:22px!important;box-shadow:inset 0 0 0 1px rgba(255,255,255,.46),0 12px 24px rgba(2,37,46,.14)}
+.access-horizon .access-role-card>span svg{width:31px;height:31px}
+.access-horizon .access-role-card>div{display:grid;justify-items:center;gap:5px}
+.access-horizon .access-role-card b{font-size:1.04rem;line-height:1.3}
+.access-horizon .access-role-card small{order:initial;font-size:.61rem;line-height:1.45}
+.access-horizon .access-role-card>i{display:none!important}
+.access-horizon .access-role-card.is-user{border-color:rgba(79,224,204,.7);background:radial-gradient(circle at 28% 18%,rgba(62,202,184,.34),transparent 33%),linear-gradient(160deg,#087a77,#053b4b 78%)!important;color:#fff}
+.access-horizon .access-role-card.is-user>span{background:linear-gradient(145deg,rgba(255,255,255,.2),rgba(47,204,184,.17));color:#dffffa}
+.access-horizon .access-role-card.is-user b,.access-horizon .access-role-card.is-user small{color:#fff}
+.access-horizon .access-role-card.is-provider{border-color:rgba(205,156,49,.46);background:radial-gradient(circle at 76% 14%,rgba(226,182,79,.2),transparent 32%),linear-gradient(155deg,#fffdf7,#f3e7cc 82%)!important;color:#a56f17}
+.access-horizon .access-role-card.is-provider>span{background:linear-gradient(145deg,#fffaf0,#f0dcae);color:#b77f20}
+.access-horizon .access-role-card.is-provider b{color:#49351e}.access-horizon .access-role-card.is-provider small{color:#7a684e}
+.access-horizon .access-role-card:hover,.access-horizon .access-role-card:focus-visible{transform:translateY(-4px) scale(1.01);box-shadow:0 22px 42px rgba(2,44,54,.2)}
+.access-horizon-route{display:flex;align-items:center;justify-content:center;gap:0;color:#c9942a}
+.access-horizon-route i{width:min(24%,78px);height:2px;background:linear-gradient(90deg,transparent,#32b9a7)}.access-horizon-route i:last-child{background:linear-gradient(90deg,#c99937,transparent)}
+.access-horizon-route span{display:grid;place-items:center;width:28px;height:28px;border:1px solid rgba(199,148,43,.52);border-radius:999px;background:#fff9e8;box-shadow:0 0 0 5px rgba(44,183,166,.09)}
+.access-horizon-route svg{width:14px;height:14px}
+.access-horizon .access-assurance{align-self:end;gap:8px;padding-top:0}
+.access-horizon .access-assurance span{min-height:28px;padding:0 8px;border-color:rgba(7,111,111,.11);background:rgba(255,255,255,.54);color:#607781;font-size:.58rem}
+[data-theme="dark"] .access-horizon-stage.access-stage{border-color:rgba(255,255,255,.5);background:#e7f2f0}
+[data-theme="dark"] .access-horizon-sheet{background:radial-gradient(circle at 12% 12%,rgba(47,186,170,.1),transparent 27%),linear-gradient(160deg,#f8fbfa,#e7f2f0 78%,#dceae7)}
+[data-theme="dark"] .access-horizon-heading.access-choice-head b{color:#07394a}[data-theme="dark"] .access-horizon-heading.access-choice-head small{color:#627781}
+[data-theme="dark"] .access-horizon .access-role-card.is-provider b{color:#49351e}[data-theme="dark"] .access-horizon .access-role-card.is-provider small{color:#7a684e}
+@media(max-width:431px){
+  .access-horizon.access-gateway{padding:max(6px,env(safe-area-inset-top,0px)) 6px max(6px,env(safe-area-inset-bottom,0px))!important}
+  .access-horizon-stage.access-stage{width:100%;height:calc(100dvh - 12px - env(safe-area-inset-top,0px) - env(safe-area-inset-bottom,0px));grid-template-rows:minmax(220px,39%) minmax(0,1fr)!important;border-radius:31px!important}
+  .access-horizon-utility.access-utility{inset:12px 12px auto}.access-horizon-utility.access-utility button{min-height:41px;padding-inline:11px}
+  .access-horizon-brand.access-brand{inset:70px 12px auto!important;justify-content:center!important}.access-horizon-brand.access-brand .logo-mark{width:58px;height:58px;flex-basis:58px}.access-horizon-brand.access-brand h1{font-size:1.55rem}
+  .access-horizon-sheet{margin-top:-28px;padding:18px 14px 12px;border-radius:32px 32px 0 0;gap:8px}
+  .access-horizon-heading.access-choice-head{padding-inline:36px}.access-horizon-heading.access-choice-head b{font-size:1.12rem}
+  .access-horizon .access-role-grid{grid-template-columns:repeat(2,minmax(0,1fr))!important;gap:9px!important}
+  .access-horizon .access-role-card{min-height:0!important;grid-template-columns:none!important;padding:12px 8px!important;border-radius:25px!important}
+  .access-horizon .access-role-card>span{width:58px!important;height:58px!important;flex-basis:58px}.access-horizon .access-role-card>span svg{width:28px;height:28px}
+  .access-horizon .access-role-card b{font-size:.9rem}.access-horizon .access-role-card small{font-size:.57rem}
+}
+@media(max-width:350px){
+  .access-horizon-stage.access-stage{border-radius:25px!important}.access-horizon-sheet{padding-inline:11px}.access-horizon-heading.access-choice-head{padding-inline:32px}.access-horizon-heading.access-choice-head b{font-size:1.03rem}
+  .access-horizon .access-role-grid{gap:7px!important}.access-horizon .access-role-card{padding-inline:6px!important;border-radius:21px!important}.access-horizon .access-role-card>span{width:52px!important;height:52px!important;flex-basis:52px}.access-horizon .access-role-card small{display:none}
+  .access-horizon .access-assurance span:last-child{display:none}
+}
+@media(max-height:680px){
+  .access-horizon-stage.access-stage{grid-template-rows:minmax(170px,35%) minmax(0,1fr)!important}
+  .access-horizon-utility.access-utility{inset:8px 10px auto}.access-horizon-utility.access-utility button{min-height:36px}
+  .access-horizon-brand.access-brand{inset:51px 10px auto!important}.access-horizon-brand.access-brand .logo-mark{width:44px;height:44px;flex-basis:44px;border-radius:14px}.access-horizon-brand.access-brand small{display:none}.access-horizon-brand.access-brand h1{font-size:1.22rem}
+  .access-horizon-sheet{margin-top:-22px;padding:12px 11px 8px;gap:5px}.access-horizon-heading.access-choice-head{min-height:35px}.access-horizon-heading.access-choice-head small,.access-horizon-divider{display:none}.access-horizon-heading.access-choice-head b{font-size:1rem}
+  .access-horizon .access-role-card{gap:7px!important;padding-block:8px!important}.access-horizon .access-role-card>span{width:44px!important;height:44px!important;flex-basis:44px}.access-horizon .access-role-card>span svg{width:22px;height:22px}.access-horizon .access-role-card small{display:none}
+  .access-horizon-route{display:none}.access-horizon .access-assurance span{min-height:24px}
+}
+
+/* 1.1.1 Khadamati brand/onboarding correction: true bidi and full first-open artwork. */
+[dir="rtl"] .access-horizon-stage,[dir="rtl"] .role-onboarding{direction:rtl;text-align:right}
+[dir="ltr"] .access-horizon-stage,[dir="ltr"] .role-onboarding{direction:ltr;text-align:left}
+.onboarding-visual.is-wide{display:grid;place-items:center;background:linear-gradient(145deg,#dcefed,#f5faf9)!important}
+.onboarding-visual.is-wide::before{content:"";display:block;position:absolute;z-index:0;inset:0;background:rgba(3,47,57,.13);backdrop-filter:blur(13px) saturate(115%)}
+.onboarding-visual.is-wide::after{display:none!important}
+.onboarding-visual.is-wide:has(img[src*="nearby-services.webp"]){background-image:linear-gradient(rgba(3,47,57,.18),rgba(3,47,57,.18)),url('../ads/campaigns/nearby-services.webp')!important;background-size:cover!important;background-position:center!important}
+.onboarding-visual.is-wide:has(img[src*="home-services.webp"]){background-image:linear-gradient(rgba(3,47,57,.18),rgba(3,47,57,.18)),url('../ads/campaigns/home-services.webp')!important;background-size:cover!important;background-position:center!important}
+.onboarding-visual.is-wide:has(img[src*="business-services.webp"]){background-image:linear-gradient(rgba(3,47,57,.18),rgba(3,47,57,.18)),url('../ads/campaigns/business-services.webp')!important;background-size:cover!important;background-position:center!important}
+.onboarding-visual.is-wide img{z-index:1!important;object-fit:contain!important;object-position:center!important;filter:drop-shadow(0 12px 24px rgba(0,27,35,.18))}
+@media(max-width:760px){
+  .role-onboarding:has(.onboarding-visual.is-wide){height:100dvh;grid-template-rows:auto minmax(0,1fr) auto}
+  .role-onboarding:has(.onboarding-visual.is-wide) .onboarding-main{min-height:0;display:grid!important;grid-template-columns:minmax(0,1fr)!important;grid-template-rows:auto minmax(0,1fr);grid-auto-flow:row;overflow:hidden!important}
+  .role-onboarding .onboarding-visual.is-wide{width:100%;height:clamp(190px,34dvh,286px)!important;min-height:0!important;max-height:none!important;aspect-ratio:auto!important;flex:none!important}
+  .role-onboarding .onboarding-visual.is-wide img{width:100%!important;height:100%!important;object-fit:contain!important;object-position:center!important}
+  .role-onboarding:has(.onboarding-visual.is-wide) .onboarding-copy{min-height:0;justify-content:flex-start;overflow:auto;padding:13px 16px 9px!important;background:radial-gradient(circle at 88% 82%,rgba(33,190,177,.11),transparent 31%),linear-gradient(180deg,#fff,#f4f9f8)}
+  .role-onboarding:has(.onboarding-visual.is-wide) .onboarding-copy h2{margin:9px 0 6px;font-size:1.22rem!important;line-height:1.32!important}
+  .role-onboarding:has(.onboarding-visual.is-wide) .onboarding-copy>p{font-size:.8rem!important;line-height:1.55!important}
+  .role-onboarding:has(.onboarding-visual.is-wide) .onboarding-benefits{margin-top:10px!important}
+  .role-onboarding:has(.onboarding-visual.is-wide) .onboarding-benefit{min-height:46px!important;font-size:.72rem}
+}
+@media(max-width:350px),(max-height:680px){
+  .role-onboarding .onboarding-visual.is-wide{height:clamp(165px,30dvh,205px)!important;max-height:none!important}
+  .role-onboarding:has(.onboarding-visual.is-wide) .onboarding-copy{padding:9px 13px 7px!important}
+  .role-onboarding:has(.onboarding-visual.is-wide) .onboarding-copy h2{font-size:1.05rem!important}
+  .role-onboarding:has(.onboarding-visual.is-wide) .onboarding-copy>p{font-size:.73rem!important;line-height:1.42!important}
+  .role-onboarding:has(.onboarding-visual.is-wide) .onboarding-benefit{min-height:39px!important;font-size:.65rem}
+}
