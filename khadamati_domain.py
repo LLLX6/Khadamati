@@ -9,14 +9,32 @@ import json
 import math
 import os
 import secrets
+import sqlite3
 from typing import Any, Callable, Iterable
 
 
 SUPPORT_EMAIL = os.environ.get("KHADAMATI_SUPPORT_EMAIL", "om.khadamati@gmail.com").strip()
 POLICY_VERSION = "2026-08-02.1"
 MIGRATION_KEY = "KHADAMATI_SUBSCRIPTION_MIGRATION_V2"
-RANKING_VERSION = "khadamati-ranking-v1"
+RANKING_VERSION = "khadamati-ranking-v2"
 OMR = "OMR"
+
+
+# Keep service-family matching explicit and reviewable.  A related service is
+# considered only inside the same requested category, so a coincidentally
+# reused service id cannot dispatch work across unrelated categories.
+RELATED_SERVICE_GROUPS: tuple[frozenset[str], ...] = (
+    frozenset({"ac", "ac_repair", "ac_clean", "ac_install", "ac_gas", "emergency_ac"}),
+    frozenset({"plumber", "water_leak"}),
+    frozenset({"electrician"}),
+    frozenset({"networks", "tech_support"}),
+    frozenset({"furniture_move", "items_delivery", "loading", "small_truck", "large_truck"}),
+    frozenset({"home_clean", "apt_clean", "deep_clean", "post_build", "rental_clean"}),
+    frozenset({"pc", "tech_support", "printer", "networks"}),
+    frozenset({"mechanic", "inspection", "car_electric", "battery", "tires", "tow", "ac_car"}),
+    frozenset({"photo", "commercial_photo", "product_photo", "property_photo"}),
+    frozenset({"building", "renovation", "tiles", "gypsum", "insulation"}),
+)
 
 
 PLAN_DEFINITIONS: tuple[dict[str, Any], ...] = (
@@ -830,20 +848,55 @@ class EntitlementService:
             raise DomainError("governorate_limit_exceeded", 409)
         return entitlements
 
-    def can_receive(self, provider_id: str) -> tuple[bool, str, dict[str, Any]]:
-        entitlements = self.for_provider(provider_id)
+    def can_receive(
+        self,
+        provider_id: str,
+        *,
+        enforce_subscription: bool = True,
+    ) -> tuple[bool, str, dict[str, Any]]:
+        """Return request eligibility without weakening provider safeguards.
+
+        ``enforce_subscription=False`` is reserved for the platform launch mode
+        in which management has disabled subscriptions globally.  It bypasses
+        only subscription access and plan response limits; provider approval,
+        availability, listing visibility, and request opt-in remain mandatory.
+        The default retains the historical subscription-enforced behaviour.
+        """
         provider = self.con.execute(
-            "SELECT active,verified,status,listing_enabled,request_enabled FROM providers WHERE id=?", (provider_id,)
+            """SELECT active,verified,status,listing_enabled,request_enabled,
+            provider_type FROM providers WHERE id=?""",
+            (provider_id,),
         ).fetchone()
+        if enforce_subscription:
+            entitlements = self.for_provider(provider_id)
+        else:
+            account_type = (
+                "company"
+                if provider and str(provider["provider_type"] or "individual") == "company"
+                else "individual"
+            )
+            # Stable response shape for callers while intentionally applying no
+            # package priority, delay, or quota in open-access launch mode.
+            entitlements = {
+                "providerId": provider_id,
+                "accountType": account_type,
+                "state": "not_enforced",
+                "planId": "",
+                "allowed": True,
+                "monthlyResponses": 0,
+                "leadDelayMinutes": 0,
+                "leadDelaySeconds": 0,
+                "subscriptionEnforced": False,
+            }
         if not provider or not int(provider["active"] or 0):
             return False, "provider_inactive", entitlements
         if not int(provider["verified"] or 0) or not int(provider["listing_enabled"] or 0):
             return False, "provider_not_approved", entitlements
         if provider["status"] != "available" or not int(provider["request_enabled"] or 0):
             return False, "provider_unavailable", entitlements
-        if not entitlements["allowed"]:
+        if enforce_subscription and not entitlements["allowed"]:
             return False, "subscription_inactive", entitlements
-        limit = entitlements["monthlyResponses"]
+        limit = entitlements["monthlyResponses"] if enforce_subscription else 0
         if limit:
             month = self.now.strftime("%Y-%m")
             count = self.con.execute(
@@ -955,22 +1008,115 @@ class RankingService:
         "company_gold_6m": 0.75,
         "company_elite_6m": 1.00,
     }
+    MATCH_QUALITY = {"exact": 1.0, "related": 0.82, "category": 0.65}
+    MATCH_PRIORITY = {"exact": 0, "related": 1, "category": 2}
+
+    @staticmethod
+    def _request_service(request: dict[str, Any]) -> tuple[str, str]:
+        value = str(request.get("service_value") or request.get("serviceValue") or "").strip()
+        if "|" in value:
+            category_id, service_id = value.split("|", 1)
+            return category_id.strip(), service_id.strip()
+        return "", value
+
+    @staticmethod
+    def _provider_services(provider: dict[str, Any]) -> list[dict[str, Any]]:
+        services = (
+            load(provider.get("services"), [])
+            if isinstance(provider.get("services"), str)
+            else provider.get("services", [])
+        )
+        return [item for item in services if isinstance(item, dict) and item.get("active", True)]
+
+    @classmethod
+    def related_service_match(cls, first: str, second: str) -> bool:
+        first = str(first or "").strip()
+        second = str(second or "").strip()
+        if not first or not second or first == second:
+            return False
+        return any(first in group and second in group for group in RELATED_SERVICE_GROUPS)
+
+    @classmethod
+    def service_family_members(cls, service_id: str) -> tuple[str, ...]:
+        """Return the canonical related-service family for availability APIs."""
+        service_id = str(service_id or "").strip()
+        if not service_id:
+            return ()
+        for group in RELATED_SERVICE_GROUPS:
+            if service_id in group:
+                return tuple(sorted(group))
+        return (service_id,)
+
+    @classmethod
+    def service_match_details(
+        cls, request: dict[str, Any], provider: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Describe the best catalog match without exposing provider identity."""
+        requested_cat, requested_service = cls._request_service(request)
+        services = cls._provider_services(provider)
+
+        for service in services:
+            service_id = str(service.get("serviceId") or "").strip()
+            category_id = str(service.get("catId") or "").strip()
+            if requested_service and service_id == requested_service and (
+                not requested_cat or category_id == requested_cat
+            ):
+                return {
+                    "matched": True,
+                    "kind": "exact",
+                    "quality": cls.MATCH_QUALITY["exact"],
+                    "matchedServiceId": service_id,
+                }
+
+        # Family matching is intentionally category-bound.  In particular,
+        # design is not in a related family and therefore remains exact-only.
+        if requested_cat and requested_service:
+            for service in services:
+                service_id = str(service.get("serviceId") or "").strip()
+                category_id = str(service.get("catId") or "").strip()
+                if category_id == requested_cat and cls.related_service_match(
+                    requested_service, service_id
+                ):
+                    return {
+                        "matched": True,
+                        "kind": "related",
+                        "quality": cls.MATCH_QUALITY["related"],
+                        "matchedServiceId": service_id,
+                    }
+
+        if requested_cat and not requested_service:
+            for service in services:
+                if str(service.get("catId") or "").strip() == requested_cat:
+                    return {
+                        "matched": True,
+                        "kind": "category",
+                        "quality": cls.MATCH_QUALITY["category"],
+                        "matchedServiceId": str(service.get("serviceId") or "").strip(),
+                    }
+        return {
+            "matched": False,
+            "kind": "none",
+            "quality": 0.0,
+            "matchedServiceId": "",
+        }
 
     @classmethod
     def exact_service_match(cls, request: dict[str, Any], provider: dict[str, Any]) -> bool:
-        value = str(request.get("service_value") or request.get("serviceValue") or "")
-        requested_cat, requested_service = (value.split("|", 1) + [""])[:2] if "|" in value else ("", value)
-        for service in load(provider.get("services"), []) if isinstance(provider.get("services"), str) else provider.get("services", []):
-            if not service.get("active", True):
-                continue
-            if requested_service:
-                if service.get("serviceId") == requested_service and (
-                    not requested_cat or service.get("catId") == requested_cat
-                ):
-                    return True
-            elif requested_cat and service.get("catId") == requested_cat:
-                return True
-        return False
+        """Retain the legacy exact-match helper for existing callers."""
+        return cls.service_match_details(request, provider)["kind"] in {"exact", "category"}
+
+    @classmethod
+    def service_match(cls, request: dict[str, Any], provider: dict[str, Any]) -> bool:
+        return bool(cls.service_match_details(request, provider)["matched"])
+
+    @classmethod
+    def exclusion_reason(cls, request: dict[str, Any], provider: dict[str, Any]) -> str:
+        """Return a stable, privacy-safe catalog/area exclusion code."""
+        if not cls.service_match(request, provider):
+            return "service_mismatch"
+        if not cls.area_match(request, provider):
+            return "area_mismatch"
+        return ""
 
     @classmethod
     def area_match(cls, request: dict[str, Any], provider: dict[str, Any]) -> bool:
@@ -1004,7 +1150,8 @@ class RankingService:
 
     @classmethod
     def score(cls, request: dict[str, Any], provider: dict[str, Any], plan_id: str, now: datetime) -> tuple[float, dict[str, float]]:
-        if not cls.exact_service_match(request, provider) or not cls.area_match(request, provider):
+        match = cls.service_match_details(request, provider)
+        if not match["matched"] or not cls.area_match(request, provider):
             return 0.0, {key: 0.0 for key in cls.WEIGHTS}
         services = load(provider.get("services"), []) if isinstance(provider.get("services"), str) else provider.get("services", [])
         areas = load(provider.get("areas"), []) if isinstance(provider.get("areas"), str) else provider.get("areas", [])
@@ -1017,7 +1164,7 @@ class RankingService:
         created = parse_datetime(provider.get("created_at") or provider.get("createdAt"))
         age = max(0, (now - created).days) if created else 730
         breakdown = {
-            "match": 1.0,
+            "match": float(match["quality"]),
             "availability": cls.availability_score(provider, now),
             "quality": max(0.0, min(1.0, float(provider.get("quality_score") or provider.get("qualityScore") or 0) / 100)),
             "response": response,
@@ -1048,8 +1195,95 @@ class RequestMarketplace:
             if isinstance(value, str):
                 return value.strip().lower() in {"1", "true", "yes", "on"}
             return bool(value)
-        except (TypeError, ValueError, KeyError):
+        except (TypeError, ValueError, KeyError, sqlite3.Error):
             return False
+
+    def _persist_diagnostics(
+        self,
+        request_id: str,
+        *,
+        total_providers: int,
+        eligible_providers: int,
+        reasons: dict[str, int],
+    ) -> None:
+        """Cache aggregate-only diagnostics when the host schema supports it."""
+        table = self.con.execute(
+            """SELECT 1 FROM sqlite_master
+            WHERE type='table' AND name='request_matching_diagnostics'"""
+        ).fetchone()
+        if not table:
+            return
+        self.con.execute(
+            """INSERT INTO request_matching_diagnostics(
+            request_id,total_providers,eligible_providers,reasons,ranking_version,captured_at)
+            VALUES(?,?,?,?,?,?)
+            ON CONFLICT(request_id) DO UPDATE SET
+            total_providers=excluded.total_providers,
+            eligible_providers=excluded.eligible_providers,
+            reasons=excluded.reasons,
+            ranking_version=excluded.ranking_version,
+            captured_at=excluded.captured_at""",
+            (
+                request_id,
+                int(total_providers),
+                int(eligible_providers),
+                dump(dict(sorted(reasons.items()))),
+                RANKING_VERSION,
+                iso(self.now),
+            ),
+        )
+
+    def diagnostics(self, request_id: str) -> dict[str, Any]:
+        """Return aggregate matching reasons suitable for an admin surface.
+
+        Provider identifiers, names, contact details, locations, and profile
+        fields are deliberately omitted.  Counts are recomputed from the same
+        server-side eligibility and matching rules used by scheduling.
+        """
+        request_row = self.con.execute(
+            "SELECT * FROM customer_requests WHERE id=?", (request_id,)
+        ).fetchone()
+        if not request_row:
+            raise DomainError("request_not_found", 404)
+        request = row_dict(request_row)
+        subscriptions_enabled = self.subscription_delays_enabled()
+        entitlements = EntitlementService(self.con, now=self.now)
+        requested_at = parse_datetime(request.get("requested_at")) or self.now
+        counts: dict[str, int] = {}
+        eligible = 0
+        total = 0
+        for provider_row in self.con.execute("SELECT * FROM providers"):
+            total += 1
+            provider = row_dict(provider_row)
+            allowed, reason, _ = entitlements.can_receive(
+                provider["id"], enforce_subscription=subscriptions_enabled
+            )
+            if not allowed:
+                counts[reason] = counts.get(reason, 0) + 1
+                continue
+            reason = RankingService.exclusion_reason(request, provider)
+            if reason:
+                counts[reason] = counts.get(reason, 0) + 1
+                continue
+            if not self.provider_has_capacity(provider, requested_at, request_id):
+                counts["daily_capacity_reached"] = counts.get("daily_capacity_reached", 0) + 1
+                continue
+            eligible += 1
+        self._persist_diagnostics(
+            request_id,
+            total_providers=total,
+            eligible_providers=eligible,
+            reasons=counts,
+        )
+        return {
+            "requestId": request_id,
+            "privacySafe": True,
+            "subscriptionsEnabled": subscriptions_enabled,
+            "totalProviders": total,
+            "eligibleProviders": eligible,
+            "excludedProviders": max(0, total - eligible),
+            "reasons": dict(sorted(counts.items())),
+        }
 
     def provider_has_capacity(
         self, provider: dict[str, Any], requested_at: datetime, request_id: str
@@ -1085,7 +1319,9 @@ class RequestMarketplace:
             AND COALESCE(listing_enabled,1)=1 AND COALESCE(request_enabled,1)=1"""
         ):
             provider = row_dict(provider_row)
-            allowed, reason, grants = entitlements.can_receive(provider["id"])
+            allowed, reason, grants = entitlements.can_receive(
+                provider["id"], enforce_subscription=apply_plan_delay
+            )
             if not allowed:
                 continue
             if not self.provider_has_capacity(provider, requested_at, request_id):
@@ -1095,14 +1331,20 @@ class RequestMarketplace:
             )
             if score <= 0:
                 continue
+            match = RankingService.service_match_details(request, provider)
             ranked.append({
                 "providerId": provider["id"],
                 "score": score,
                 "breakdown": breakdown,
+                "matchType": match["kind"],
                 "delaySeconds": grants["leadDelaySeconds"] if apply_plan_delay else 0,
                 "planId": grants["planId"],
             })
-        ranked.sort(key=lambda item: (-item["score"], item["providerId"]))
+        ranked.sort(key=lambda item: (
+            RankingService.MATCH_PRIORITY.get(item["matchType"], 99),
+            -item["score"],
+            item["providerId"],
+        ))
         ranked = ranked[:10]
         self.con.execute(
             "DELETE FROM request_dispatches WHERE request_id=? AND status='scheduled'", (request_id,)
@@ -1139,6 +1381,9 @@ class RequestMarketplace:
                 matching_provider_ids='[]',waitlisted=1,updated_at=CURRENT_TIMESTAMP WHERE id=?""",
                 (request_id,),
             )
+            # No-match diagnostics are computed only on the failure path and
+            # cached as aggregate counts, keeping normal scheduling lightweight.
+            self.diagnostics(request_id)
         return ranked
 
     def release_due(self, request_id: str | None = None) -> list[dict[str, Any]]:

@@ -14,7 +14,7 @@ let LOCAL_SERVER = null;
 
 const APP_SOURCE = fs.readFileSync(path.resolve(__dirname, '..', 'index.html'), 'utf8');
 const STYLE_SOURCE = fs.readFileSync(path.resolve(__dirname, '..', 'assets', 'styles', 'khadamati-v1.css'), 'utf8');
-assertSource(APP_SOURCE.includes("const APP_VERSION = '1.1.1'") && APP_SOURCE.includes("const APP_BUILD = 'khadamati-v1.1.1-official-brand-onboarding-r5-2026-08-10'"), 'Brand/onboarding application version/build marker is missing.');
+assertSource(APP_SOURCE.includes("const APP_VERSION = '1.1.1'") && APP_SOURCE.includes("const APP_BUILD = 'khadamati-v1.1.1-matching-admin-sync-r6-2026-08-10'"), 'Matching/admin/sync application version/build marker is missing.');
 assertSource(APP_SOURCE.includes('access-horizon-hero') && APP_SOURCE.includes('renderHorizonEntry()') && STYLE_SOURCE.includes("nearby-services.webp") && STYLE_SOURCE.includes('Oman Horizon entry screen'), 'The Oman Horizon entry composition or local background asset is missing.');
 assertSource(APP_SOURCE.includes('<img src="app-icon-192.png"') && APP_SOURCE.includes("L('شعار خدماتي','Khadamati logo')") && APP_SOURCE.includes("L('زائر','Guest')") && !APP_SOURCE.includes("L('دخول زائر','Guest access')"), 'The entry screen is not using the official Khadamati logo or the concise visitor label.');
 assertSource(['للمستخدم','للمزود','رحلة واضحة للطرفين'].every(copy => APP_SOURCE.includes(copy)), 'The first-open guidance does not explain the customer, provider, and shared journey.');
@@ -1568,7 +1568,7 @@ async function clickProviderNav(page, tab) {
   await page.locator('[data-action="closeModal"]').click();
   await clickAdminTab(page, 'reports');
   assert(await page.locator('.report-command-bar').count(), 'The production reports command bar is missing.');
-  assert(await page.locator('.report-summary-grid .report-summary-card').count() === 4, 'Report decision summaries are incomplete.');
+  assert(await page.locator('.report-summary-grid .report-summary-card').count() === 6, 'Report decision summaries must include matching and first-offer metrics.');
   assert(await page.locator('[data-action="exportReportsCsv"]').count(), 'CSV export is missing from reports.');
   assert(await page.locator('[data-action="exportReportsWord"]').count(), 'Word export is missing from reports.');
   assert(await page.locator('[data-action="printReports"]').count(), 'Print/PDF export is missing from reports.');

@@ -8,7 +8,12 @@ import json
 import secrets
 from typing import Any
 
-from khadamati_domain import DomainError, EntitlementService, RankingService
+from khadamati_domain import (
+    DomainError,
+    EntitlementService,
+    RankingService,
+    RequestMarketplace,
+)
 
 
 def install_growth_schema(con) -> None:
@@ -102,10 +107,15 @@ class KnownProviderInvitationService:
     def _assert_eligible(self, request_row, provider_row) -> None:
         request = dict(request_row)
         provider = dict(provider_row)
-        if not RankingService.exact_service_match(request, provider):
+        if not RankingService.service_match(request, provider) or not RankingService.area_match(
+            request, provider
+        ):
             raise DomainError("provider_not_eligible_for_request", 409)
+        enforce_subscription = RequestMarketplace(
+            self.con, now=self.now
+        ).subscription_delays_enabled()
         allowed, _, _ = EntitlementService(self.con, now=self.now).can_receive(
-            provider["id"]
+            provider["id"], enforce_subscription=enforce_subscription
         )
         if not allowed:
             raise DomainError("provider_no_longer_available", 409)

@@ -13,7 +13,7 @@ class _AllowedEntitlements:
     def __init__(self, *_args, **_kwargs):
         pass
 
-    def can_receive(self, _provider_id):
+    def can_receive(self, _provider_id, *, enforce_subscription=True):
         return True, "ok", {"planId": "foundation_12m"}
 
 

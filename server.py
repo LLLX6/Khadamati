@@ -137,6 +137,7 @@ PUBLIC_DIR = BASE_DIR / "public"
 UPLOAD_DIR = Path(os.environ.get("KHADAMATI_UPLOAD_DIR") or os.environ.get("FORAN_UPLOAD_DIR") or (PUBLIC_DIR / "uploads"))
 _legacy_db = BASE_DIR / "foran.sqlite3"
 DB_PATH = Path(os.environ.get("KHADAMATI_DB_PATH") or os.environ.get("FORAN_DB_PATH") or (_legacy_db if _legacy_db.exists() else BASE_DIR / "khadamati.sqlite3"))
+BACKUP_DIR = Path(os.environ.get("KHADAMATI_BACKUP_DIR") or (DB_PATH.parent / "backups"))
 APP_ENV = os.environ.get("KHADAMATI_ENV", "development").strip().lower() or "development"
 
 
@@ -965,11 +966,10 @@ def create_pre_migration_backup(migration_key=MIGRATION_KEY):
             migrated = None
         if migrated:
             return None
-        backup_dir = Path(os.environ.get("KHADAMATI_BACKUP_DIR") or (DB_PATH.parent / "backups"))
-        backup_dir.mkdir(parents=True, exist_ok=True)
+        BACKUP_DIR.mkdir(parents=True, exist_ok=True)
         stamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
         safe_key = re.sub(r"[^a-z0-9_-]+", "-", migration_key.lower()).strip("-")
-        target = backup_dir / f"khadamati-pre-{safe_key}-{stamp}.sqlite3"
+        target = BACKUP_DIR / f"khadamati-pre-{safe_key}-{stamp}.sqlite3"
         destination = sqlite3.connect(target)
         try:
             source.backup(destination)
@@ -990,6 +990,7 @@ def init_db():
     for backup_path in dict.fromkeys(path for path in backup_paths if path):
         log_event("database.pre_migration_backup", file=backup_path.name)
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    BACKUP_DIR.mkdir(parents=True, exist_ok=True)
     with db() as con:
         con.executescript(
             """
@@ -1193,6 +1194,14 @@ def init_db():
               accepted_at TEXT DEFAULT '', created_at TEXT DEFAULT CURRENT_TIMESTAMP,
               updated_at TEXT DEFAULT CURRENT_TIMESTAMP, UNIQUE(request_id,provider_id)
             );
+            CREATE TABLE IF NOT EXISTS request_matching_diagnostics(
+              request_id TEXT PRIMARY KEY,
+              total_providers INTEGER NOT NULL DEFAULT 0,
+              eligible_providers INTEGER NOT NULL DEFAULT 0,
+              reasons TEXT NOT NULL DEFAULT '{}',
+              ranking_version TEXT NOT NULL DEFAULT '',
+              captured_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
             CREATE TABLE IF NOT EXISTS invoices(
               id TEXT PRIMARY KEY, payment_id TEXT NOT NULL UNIQUE, subscription_id TEXT NOT NULL,
               provider_id TEXT NOT NULL, number TEXT NOT NULL UNIQUE, currency TEXT NOT NULL DEFAULT 'OMR',
@@ -1261,6 +1270,8 @@ def init_db():
             CREATE INDEX IF NOT EXISTS idx_sessions_hash ON auth_sessions(token_hash, expires_at);
             CREATE INDEX IF NOT EXISTS idx_dispatch_release ON request_dispatches(status,release_at,wave);
             CREATE INDEX IF NOT EXISTS idx_dispatch_provider ON request_dispatches(provider_id,status,notified_at);
+            CREATE INDEX IF NOT EXISTS idx_match_diagnostics_captured
+              ON request_matching_diagnostics(captured_at);
             CREATE INDEX IF NOT EXISTS idx_push_outbox_pending
               ON push_delivery_outbox(status,available_at,created_at);
             CREATE INDEX IF NOT EXISTS idx_consent_lookup ON contact_consents(request_id,provider_id,channel,status);
@@ -1312,6 +1323,20 @@ def init_db():
         ensure_column(con, "providers", "deleted_at", "TEXT DEFAULT ''")
         ensure_column(con, "providers", "delete_reason", "TEXT DEFAULT ''")
         ensure_column(con, "providers", "hidden_history", "TEXT DEFAULT '[]'")
+        ensure_column(con, "providers", "lifecycle_state", "TEXT NOT NULL DEFAULT 'active'")
+        ensure_column(con, "providers", "lifecycle_version", "INTEGER NOT NULL DEFAULT 0")
+        ensure_column(con, "providers", "lifecycle_snapshot", "TEXT DEFAULT '{}'")
+        ensure_column(con, "providers", "status_reason", "TEXT DEFAULT ''")
+        ensure_column(con, "providers", "suspended_at", "TEXT DEFAULT ''")
+        ensure_column(con, "providers", "archived_at", "TEXT DEFAULT ''")
+        con.execute(
+            """UPDATE providers SET lifecycle_state=CASE
+            WHEN status='deleted' OR COALESCE(deleted_at,'')!='' THEN 'deleted'
+            WHEN status='archived' THEN 'archived'
+            WHEN status='suspended' OR active=0 THEN 'suspended'
+            ELSE 'active' END
+            WHERE COALESCE(lifecycle_state,'')='' OR lifecycle_state='active'"""
+        )
         ensure_column(con, "app_users", "location_updated_at", "TEXT DEFAULT ''")
         ensure_column(con, "app_users", "updated_at", "TEXT DEFAULT ''")
         ensure_column(con, "app_users", "gender", "TEXT DEFAULT 'not_specified'")
@@ -1782,6 +1807,16 @@ def row_provider(r, private=False, sign_private=False):
     d["locationSharingExpiresAt"] = d.pop("location_sharing_expires_at", "")
     d["deletedAt"] = d.pop("deleted_at", "")
     d["deleteReason"] = d.pop("delete_reason", "")
+    d["lifecycleState"] = d.pop("lifecycle_state", "active") or "active"
+    d["lifecycleVersion"] = int(d.pop("lifecycle_version", 0) or 0)
+    lifecycle_snapshot = jload(d.pop("lifecycle_snapshot", "{}"), {})
+    d["statusReason"] = d.pop("status_reason", "")
+    d["suspendedAt"] = d.pop("suspended_at", "")
+    d["archivedAt"] = d.pop("archived_at", "")
+    if private:
+        d["lifecycleSnapshot"] = (
+            lifecycle_snapshot if isinstance(lifecycle_snapshot, dict) else {}
+        )
     hidden_history = jload(d.pop("hidden_history", "[]"), [])
     if private:
         d["hiddenHistoryIds"] = hidden_history if isinstance(hidden_history, list) else []
@@ -1805,7 +1840,8 @@ def row_provider(r, private=False, sign_private=False):
             "phone", "email", "adminNote", "documents", "commercialNo", "companyId",
             "verificationExpiry", "commercialExpiry", "licenseExpiry", "pinConfigured",
             "locationSharingExpiresAt", "deletedAt", "deleteReason",
-            "hiddenHistoryIds",
+            "hiddenHistoryIds", "statusReason", "suspendedAt", "archivedAt",
+            "lifecycleSnapshot",
         ):
             d.pop(key, None)
     return d
@@ -2763,7 +2799,6 @@ def provider_profile_complete(provider):
 
 def ranked_suggestion_candidates(con, request_row, *, limit=10):
     request = dict(request_row)
-    entitlements = EntitlementService(con)
     blocks = InteractionBlockService(con)
     request_user_id = str(request.get("user_id") or request.get("userId") or "")
     candidates = []
@@ -2777,13 +2812,13 @@ def ranked_suggestion_candidates(con, request_row, *, limit=10):
         if not provider_profile_complete(provider):
             continue
         try:
-            allowed, _, grants = entitlements.can_receive(provider["id"])
+            allowed, _, grants = provider_receive_entitlement(con, provider["id"])
         except DomainError:
             allowed, grants = False, {}
         if not allowed:
             continue
         score, breakdown = RankingService.score(request, provider, grants.get("planId", provider.get("package_id", "")), datetime.now(UTC))
-        if score <= 0 or not RankingService.exact_service_match(request, provider):
+        if score <= 0 or not RankingService.service_match(request, provider):
             continue
         distance = distance_km(request, provider)
         area_priority = 0 if request.get("wilayah") and request.get("wilayah") == provider.get("wilayah") else 1
@@ -3288,35 +3323,33 @@ def create_notification(
 
 
 def request_matches_provider(request_item, provider):
-    service_value = str(request_item.get("serviceValue") or "")
-    requested_cat, requested_service = ("", "")
-    if "|" in service_value:
-        requested_cat, requested_service = service_value.split("|", 1)
-    service_ok = any(
-        svc.get("active", True)
-        and requested_service
-        and svc.get("serviceId") == requested_service
-        and (not requested_cat or svc.get("catId") == requested_cat)
-        for svc in provider.get("services") or []
+    """Use the same catalog-family and area contract as marketplace ranking."""
+    return RankingService.service_match(
+        request_item, provider
+    ) and RankingService.area_match(request_item, provider)
+
+
+def provider_receive_entitlement(con, provider_id):
+    """Apply the server-side subscription flag consistently at every intake gate."""
+    enforce_subscription = RequestMarketplace(con).subscription_delays_enabled()
+    return EntitlementService(con).can_receive(
+        provider_id, enforce_subscription=enforce_subscription
     )
-    if not service_ok:
-        return False
-    request_area = {str(request_item.get("gov") or ""), str(request_item.get("wilayah") or "")} - {""}
-    provider_area = {
-        str(provider.get("gov") or ""),
-        str(provider.get("wilayah") or ""),
-        *(str(item) for item in provider.get("governorates") or []),
-        *(str(a) for a in provider.get("areas") or []),
-    } - {""}
-    return not request_area or bool(request_area & provider_area)
 
 
 def provider_eligibility(con, provider, *, receive_requests=False, map_only=False):
     """Single source of truth for public listing, request intake, and map markers."""
     item = dict(provider) if not isinstance(provider, dict) else provider
+    lifecycle_state = str(
+        item.get("lifecycle_state", item.get("lifecycleState", "active")) or "active"
+    )
+    if lifecycle_state in {"suspended", "archived", "deleted"}:
+        return False, f"provider_{lifecycle_state}"
     if not int(item.get("active") or 0) or not int(item.get("verified") or 0):
         return False, "provider_inactive"
-    if item.get("status") in {"unavailable", "under_review", "pending", "suspended", "deleted"}:
+    if item.get("status") in {
+        "unavailable", "under_review", "pending", "suspended", "archived", "deleted"
+    }:
         return False, "provider_unavailable"
     if not int(item.get("listing_enabled", item.get("listingEnabled", 1)) or 0):
         return False, "listing_disabled"
@@ -3330,19 +3363,235 @@ def provider_eligibility(con, provider, *, receive_requests=False, map_only=Fals
             return False, "map_hidden"
         if item.get("latitude") is None or item.get("longitude") is None:
             return False, "location_missing"
-    allowed, reason, _ = EntitlementService(con).can_receive(item.get("id", ""))
+    subscriptions_enabled = RequestMarketplace(con).subscription_delays_enabled()
+    allowed, reason, _ = provider_receive_entitlement(con, item.get("id", ""))
     if receive_requests and not allowed:
         return False, reason or "subscription_inactive"
-    if not receive_requests:
+    if not receive_requests and subscriptions_enabled:
         grants = EntitlementService(con).for_provider(item.get("id", ""))
         if not grants.get("allowed"):
             return False, "subscription_inactive"
     return True, ""
 
 
+PROVIDER_LIFECYCLE_STATES = {"active", "suspended", "archived", "deleted"}
+
+
+def provider_lifecycle_state(provider):
+    """Normalize old provider rows into the additive lifecycle contract."""
+    item = dict(provider) if not isinstance(provider, dict) else provider
+    explicit = str(item.get("lifecycle_state") or "").strip()
+    if explicit in PROVIDER_LIFECYCLE_STATES and explicit != "active":
+        return explicit
+    status = str(item.get("status") or "")
+    if status == "deleted" or item.get("deleted_at"):
+        return "deleted"
+    if status == "archived":
+        return "archived"
+    if status == "suspended" or not int(item.get("active") or 0):
+        return "suspended"
+    return "active"
+
+
+def anonymize_provider_account(con, provider_id, *, reason=""):
+    """Irreversibly remove provider-owned identity after explicit deletion."""
+    provider_id = safe_text(provider_id, 120)
+    reason = safe_text(reason, 500)
+    anonymous_phone = (
+        f"deleted-{hashlib.sha256(provider_id.encode('utf-8')).hexdigest()[:16]}"
+    )
+    con.execute(
+        """UPDATE providers SET active=0,status='deleted',listing_enabled=0,
+        request_enabled=0,verified=0,featured=0,name='حساب مزود محذوف',phone=?,
+        email='',age=0,nationality='',gov='',wilayah='',governorates='[]',areas='[]',
+        bio='',hours='',admin_note='',pin_hash='',image_path='',card_image='',
+        services='[]',work_images='[]',documents='[]',before_after='[]',
+        intro_video_url='',company_name='',company_id='',commercial_no='',
+        verification_expiry='',commercial_expiry='',license_expiry='',latitude=NULL,
+        longitude=NULL,location_updated_at='',location_sharing_expires_at='',
+        deleted_at=CURRENT_TIMESTAMP,delete_reason=?,lifecycle_state='deleted',
+        lifecycle_version=lifecycle_version+1,lifecycle_snapshot='{}',status_reason='',
+        updated_at=CURRENT_TIMESTAMP WHERE id=?""",
+        (anonymous_phone, reason, provider_id),
+    )
+    con.execute(
+        """UPDATE provider_team_members SET name='عضو محذوف',phone='deleted-' || id,
+        role='provider_staff',pin_hash='',permissions='[]',active=0,
+        updated_at=CURRENT_TIMESTAMP WHERE provider_id=?""",
+        (provider_id,),
+    )
+    con.execute(
+        """UPDATE provider_branches SET name='فرع محذوف',gov='',wilayah='',address='',
+        latitude=NULL,longitude=NULL,phone='',active=0,updated_at=CURRENT_TIMESTAMP
+        WHERE provider_id=?""",
+        (provider_id,),
+    )
+    con.execute(
+        """UPDATE provider_legal_profiles SET nationality='',residency_status='not_applicable',
+        employer_name='',employer_authorization_status='not_applicable',
+        work_permit_expiry='',residency_expiry='',commercial_expiry='',
+        activity_license_expiry='',review_note='',updated_at=CURRENT_TIMESTAMP
+        WHERE provider_id=?""",
+        (provider_id,),
+    )
+    con.execute(
+        """UPDATE provider_crm_records SET display_name='',note='',stage='archived',
+        updated_at=CURRENT_TIMESTAMP WHERE provider_id=?""",
+        (provider_id,),
+    )
+    con.execute(
+        """UPDATE leads SET customer_name='',phone='',note='',status='archived'
+        WHERE provider_id=?""",
+        (provider_id,),
+    )
+    con.execute(
+        """UPDATE foundation_claims SET phone='',commercial_no=''
+        WHERE provider_id=?""",
+        (provider_id,),
+    )
+    con.execute(
+        """UPDATE push_subscription_bindings SET active=0,
+        updated_at=CURRENT_TIMESTAMP
+        WHERE target_kind='provider' AND target_id=?""",
+        (provider_id,),
+    )
+    revoke_account_sessions(con, "provider", provider_id)
+
+
+def provider_lifecycle_transition(
+    con,
+    session,
+    provider_id,
+    action,
+    *,
+    reason="",
+):
+    """Suspend, archive, or safely restore a provider without deleting data."""
+    provider_id = safe_text(provider_id, 120)
+    action = safe_text(action, 24)
+    reason = safe_text(reason, 500)
+    if action not in {"suspend", "archive", "restore"}:
+        raise DomainError("invalid_provider_lifecycle_action", 400)
+    if action in {"suspend", "archive"} and len(reason) < 3:
+        raise DomainError("provider_status_reason_required", 400)
+    row = con.execute("SELECT * FROM providers WHERE id=?", (provider_id,)).fetchone()
+    if not row:
+        raise DomainError("provider_not_found", 404)
+    current = provider_lifecycle_state(row)
+    requested_state = {
+        "suspend": "suspended",
+        "archive": "archived",
+        "restore": "active",
+    }[action]
+    if current == "deleted":
+        raise DomainError("provider_already_deleted", 409)
+    if action == "restore" and current not in {"suspended", "archived"}:
+        raise DomainError("provider_not_restorable", 409)
+    if requested_state == current:
+        return {
+            "provider": row_provider(row, private=True),
+            "transitioned": False,
+            "fromState": current,
+            "toState": current,
+        }
+
+    existing_snapshot = jload(row["lifecycle_snapshot"], {})
+    if current == "active" or not isinstance(existing_snapshot, dict) or not existing_snapshot:
+        snapshot = {
+            "active": int(row["active"] or 0),
+            "verified": int(row["verified"] or 0),
+            "featured": int(row["featured"] or 0),
+            "status": str(row["status"] or "unavailable"),
+            "listingEnabled": int(row["listing_enabled"] or 0),
+            "requestEnabled": int(row["request_enabled"] or 0),
+        }
+    else:
+        snapshot = existing_snapshot
+
+    next_version = int(row["lifecycle_version"] or 0) + 1
+    if action in {"suspend", "archive"}:
+        next_state = requested_state
+        con.execute(
+            """UPDATE providers SET active=0,status=?,listing_enabled=0,
+            request_enabled=0,featured=0,lifecycle_state=?,lifecycle_version=?,
+            lifecycle_snapshot=?,status_reason=?,suspended_at=CASE
+            WHEN ?='suspended' THEN CURRENT_TIMESTAMP ELSE suspended_at END,
+            archived_at=CASE WHEN ?='archived' THEN CURRENT_TIMESTAMP ELSE '' END,
+            updated_at=CURRENT_TIMESTAMP WHERE id=?""",
+            (
+                next_state,
+                next_state,
+                next_version,
+                jdump(snapshot),
+                reason,
+                next_state,
+                next_state,
+                provider_id,
+            ),
+        )
+        title = "تم إيقاف حساب المزود" if next_state == "suspended" else "تمت أرشفة حساب المزود"
+        message = (
+            "أوقفت الإدارة استقبال الطلبات والظهور مؤقتاً. تواصل مع الدعم للمراجعة."
+            if next_state == "suspended"
+            else "نُقل الحساب إلى الأرشيف وتوقفت الطلبات والظهور حتى استعادته إدارياً."
+        )
+        action_text = "فتح الدعم"
+        action_route = "provider:account:support"
+    else:
+        next_state = "active"
+        # Restoration recovers the account, not marketplace visibility.  A
+        # separate explicit admin approval is required before new requests.
+        con.execute(
+            """UPDATE providers SET active=1,status='unavailable',
+            verified=?,featured=0,listing_enabled=0,request_enabled=0,
+            lifecycle_state='active',lifecycle_version=?,status_reason='',
+            suspended_at='',archived_at='',updated_at=CURRENT_TIMESTAMP
+            WHERE id=?""",
+            (int(bool(snapshot.get("verified", row["verified"]))), next_version, provider_id),
+        )
+        title = "تمت استعادة حساب المزود"
+        message = "أصبح الحساب قابلاً للدخول، وسيبقى غير ظاهر حتى اعتماد جاهزيته لاستقبال الطلبات."
+        action_text = "فتح مساحتك"
+        action_route = "provider:account"
+
+    create_notification(
+        con,
+        "provider",
+        provider_id,
+        title,
+        message,
+        type_="provider_lifecycle",
+        related_id=provider_id,
+        priority="high",
+        action_text=action_text,
+        action_route=action_route,
+        dedupe_key=f"provider:{provider_id}:lifecycle:{next_state}:v{next_version}",
+        entity_kind="provider",
+        entity_id=provider_id,
+        action_kind=f"lifecycle_{next_state}",
+        state_version=next_version,
+    )
+    revoke_account_sessions(con, "provider", provider_id)
+    log_audit(
+        con,
+        session,
+        f"provider.lifecycle.{action}",
+        provider_id,
+        f"{current}->{next_state}",
+    )
+    updated = con.execute("SELECT * FROM providers WHERE id=?", (provider_id,)).fetchone()
+    return {
+        "provider": row_provider(updated, private=True),
+        "transitioned": True,
+        "fromState": current,
+        "toState": next_state,
+    }
+
+
 def service_availability_snapshot(con):
     """Return privacy-safe provider counts used by the direct-request UI."""
     services = {}
+    exact_services = {}
     categories = {}
     for row in con.execute("SELECT * FROM providers"):
         eligible, _ = provider_eligibility(con, row, receive_requests=True)
@@ -3350,6 +3599,8 @@ def service_availability_snapshot(con):
             continue
         provider_services = jload(row["services"], [])
         provider_categories = set()
+        provider_exact_keys = set()
+        provider_compatible_keys = set()
         for service in provider_services:
             if not isinstance(service, dict) or service.get("active") is False:
                 continue
@@ -3358,14 +3609,194 @@ def service_availability_snapshot(con):
             if not cat_id or not service_id:
                 continue
             key = f"{cat_id}|{service_id}"
-            services[key] = int(services.get(key, 0)) + 1
+            provider_exact_keys.add(key)
+            for family_service_id in RankingService.service_family_members(service_id):
+                provider_compatible_keys.add(f"{cat_id}|{family_service_id}")
             provider_categories.add(cat_id)
+        for key in provider_exact_keys:
+            exact_services[key] = int(exact_services.get(key, 0)) + 1
+        for key in provider_compatible_keys:
+            services[key] = int(services.get(key, 0)) + 1
         for cat_id in provider_categories:
             categories[cat_id] = int(categories.get(cat_id, 0)) + 1
     return {
         "services": services,
+        "exactServices": exact_services,
         "categories": categories,
+        "contractVersion": "matching_v2",
+        "providerSource": "server",
+        "demoProvidersAllowed": bool(SAMPLE_DATA_ENABLED),
+        "subscriptionsEnforced": RequestMarketplace(con).subscription_delays_enabled(),
         "generatedAt": datetime.now(UTC).isoformat(),
+    }
+
+
+def provider_request_diagnostic(con, request_row, provider_row):
+    """Explain one candidate using stable codes and no private profile data."""
+    request = dict(request_row)
+    provider = dict(provider_row)
+    reasons = []
+    eligible, eligibility_reason = provider_eligibility(
+        con, provider, receive_requests=True
+    )
+    if not eligible and eligibility_reason:
+        reasons.append(eligibility_reason)
+    match = RankingService.service_match_details(request, provider)
+    if not match["matched"]:
+        reasons.append("service_mismatch")
+    if not RankingService.area_match(request, provider):
+        reasons.append("area_mismatch")
+    declined = jload(request.get("declined_provider_ids", "[]"), [])
+    if provider.get("id") in declined:
+        reasons.append("provider_previously_declined")
+    if request.get("user_id") and InteractionBlockService(con).is_blocked(
+        request["user_id"], provider.get("id", "")
+    ):
+        reasons.append("interaction_blocked")
+    marketplace = RequestMarketplace(con)
+    requested_at = parse_iso(request.get("requested_at")) or marketplace.now
+    if not marketplace.provider_has_capacity(
+        provider, requested_at, request.get("id", "")
+    ):
+        reasons.append("daily_capacity_reached")
+    reasons = list(dict.fromkeys(reasons))
+    score = 0.0
+    if not reasons:
+        _, _, grants = provider_receive_entitlement(con, provider.get("id", ""))
+        score, _ = RankingService.score(
+            request, provider, grants.get("planId", ""), requested_at
+        )
+    return {
+        "providerId": provider.get("id", ""),
+        "eligible": not reasons and score > 0,
+        "reasons": reasons,
+        "matchType": match.get("kind", "none"),
+        "matchedServiceId": match.get("matchedServiceId", ""),
+        "score": score,
+        "privacySafe": True,
+    }
+
+
+def admin_dispatch_request(con, session, request_id, provider_id):
+    """Notify one eligible provider without selecting them for the customer."""
+    request_id = safe_text(request_id, 120)
+    provider_id = safe_text(provider_id, 120)
+    request_row = con.execute(
+        "SELECT * FROM customer_requests WHERE id=?", (request_id,)
+    ).fetchone()
+    if not request_row:
+        raise DomainError("request_not_found", 404)
+    if request_row["status"] in {
+        "accepted", "appointmentConfirmed", "inProgress", "awaitingConfirmation",
+        "qualityReview", "closed", "archived", "cancelled", "deleted", "expired",
+    } or request_row["accepted_provider_id"]:
+        raise DomainError("request_not_open_for_dispatch", 409)
+    if not int(request_row["offers_open"] or 0) or request_row["status"] == "paused":
+        raise DomainError("request_offers_paused", 409)
+    provider_row = con.execute(
+        "SELECT * FROM providers WHERE id=?", (provider_id,)
+    ).fetchone()
+    if not provider_row:
+        raise DomainError("provider_not_found", 404)
+    diagnostic = provider_request_diagnostic(con, request_row, provider_row)
+    if not diagnostic["eligible"]:
+        return {"ok": False, "diagnostic": diagnostic}
+
+    existing = con.execute(
+        """SELECT status FROM request_dispatches
+        WHERE request_id=? AND provider_id=?""",
+        (request_id, provider_id),
+    ).fetchone()
+    already_dispatched = bool(
+        existing
+        and existing["status"] in {"notified", "opened", "offered", "accepted"}
+    )
+    matching_ids = jload(request_row["matching_provider_ids"], [])
+    if provider_id not in matching_ids:
+        matching_ids.append(provider_id)
+    if not already_dispatched:
+        next_rank = int(con.execute(
+            "SELECT COALESCE(MAX(rank),0)+1 n FROM request_dispatches WHERE request_id=?",
+            (request_id,),
+        ).fetchone()["n"] or 1)
+        con.execute(
+            """INSERT INTO request_dispatches(
+            id,request_id,provider_id,rank,score,score_breakdown,wave,release_at,
+            status,notified_at,updated_at)
+            VALUES(?,?,?,?,?, ?,1,CURRENT_TIMESTAMP,'notified',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)
+            ON CONFLICT(request_id,provider_id) DO UPDATE SET
+            score=excluded.score,score_breakdown=excluded.score_breakdown,
+            wave=1,release_at=CURRENT_TIMESTAMP,status='notified',
+            notified_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP""",
+            (
+                slug("dispatch"),
+                request_id,
+                provider_id,
+                next_rank,
+                diagnostic["score"],
+                jdump({
+                    "source": "admin_dispatch",
+                    "matchType": diagnostic["matchType"],
+                }),
+            ),
+        )
+        con.execute(
+            """UPDATE customer_requests SET matching_provider_ids=?,status='matching',
+            marketplace_status='notified',waitlisted=0,updated_at=CURRENT_TIMESTAMP
+            WHERE id=?""",
+            (jdump(matching_ids), request_id),
+        )
+        create_notification(
+            con,
+            "provider",
+            provider_id,
+            "طلب مناسب أرسلته الإدارة",
+            "لديك طلب يطابق خدمتك ومنطقة تغطيتك. افتحه لمراجعته وتقديم عرضك.",
+            type_="request",
+            related_id=request_id,
+            priority="high",
+            action_text="فتح الطلب",
+            action_route=f"provider:request:{request_id}",
+            dedupe_key=f"request:{request_id}:admin_dispatch:provider:{provider_id}",
+            entity_kind="request",
+            entity_id=request_id,
+            action_kind="review_request",
+        )
+        if request_row["user_id"]:
+            create_notification(
+                con,
+                "user",
+                request_row["user_id"],
+                "تم توسيع البحث عن مزود",
+                "أرسلت الإدارة طلبك إلى مزود إضافي مطابق، وسيظهر عرضه عند إرساله.",
+                type_="request",
+                related_id=request_id,
+                priority="normal",
+                action_text="فتح الطلب",
+                action_route=f"user:request:{request_id}",
+                dedupe_key=f"request:{request_id}:admin_dispatch_user:{provider_id}",
+            )
+        log_audit(
+            con,
+            session,
+            "customer_request.provider_dispatched",
+            request_id,
+            provider_id,
+        )
+    else:
+        con.execute(
+            """UPDATE customer_requests SET matching_provider_ids=?,waitlisted=0,
+            updated_at=CURRENT_TIMESTAMP WHERE id=?""",
+            (jdump(matching_ids), request_id),
+        )
+    updated = con.execute(
+        "SELECT * FROM customer_requests WHERE id=?", (request_id,)
+    ).fetchone()
+    return {
+        "ok": True,
+        "alreadyDispatched": already_dispatched,
+        "diagnostic": diagnostic,
+        "request": row_customer_request(updated, sign_private=True),
     }
 
 
@@ -3403,6 +3834,102 @@ def provider_operational_insights(con, provider_id):
         "offerRate": round(100 * offered / max(1, dispatched), 1),
         "winRate": round(100 * accepted / max(1, offered), 1),
         "averageMatchScore": round(float(dispatch["average_score"] or 0), 1),
+    }
+
+
+def admin_request_reporting(con):
+    """Return aggregate marketplace health metrics without request/provider rows."""
+    counts = con.execute(
+        """SELECT
+        SUM(CASE WHEN status!='deleted' THEN 1 ELSE 0 END) total,
+        SUM(CASE WHEN status IN ('completed','closed','archived') THEN 1 ELSE 0 END) completed,
+        SUM(CASE WHEN status='unavailable' THEN 1 ELSE 0 END) unavailable,
+        SUM(CASE WHEN status='awaitingConfirmation' THEN 1 ELSE 0 END) awaiting_confirmation
+        FROM customer_requests"""
+    ).fetchone()
+    customer_requests = {
+        "total": int(counts["total"] or 0),
+        "completed": int(counts["completed"] or 0),
+        "unavailable": int(counts["unavailable"] or 0),
+        "awaitingConfirmation": int(counts["awaiting_confirmation"] or 0),
+    }
+
+    diagnosed_requests = int(
+        con.execute(
+            "SELECT COUNT(*) n FROM request_matching_diagnostics"
+        ).fetchone()["n"]
+        or 0
+    )
+    no_match_reasons = {
+        row["reason"]: int(row["n"] or 0)
+        for row in con.execute(
+            """SELECT reason.key reason,
+            SUM(CAST(reason.value AS INTEGER)) n
+            FROM request_matching_diagnostics diagnostics,
+            json_each(CASE WHEN json_valid(diagnostics.reasons)
+            THEN diagnostics.reasons ELSE '{}' END) reason
+            GROUP BY reason.key ORDER BY reason.key"""
+        )
+    }
+    unavailable_without_diagnostics = int(
+        con.execute(
+            """SELECT COUNT(*) n FROM customer_requests requests
+            LEFT JOIN request_matching_diagnostics diagnostics
+            ON diagnostics.request_id=requests.id
+            WHERE requests.status='unavailable' AND diagnostics.request_id IS NULL"""
+        ).fetchone()["n"]
+        or 0
+    )
+    request_matching = {
+        "noMatchReasons": no_match_reasons,
+        "totalDiagnosedRequests": diagnosed_requests,
+        "unavailableWithoutDiagnostics": unavailable_without_diagnostics,
+        "privacySafe": True,
+    }
+
+    try:
+        offers = con.execute(
+            """WITH offer_times AS (
+              SELECT requests.id,requests.created_at,
+              COALESCE(
+                (SELECT MIN(NULLIF(dispatches.offered_at,''))
+                 FROM request_dispatches dispatches
+                 WHERE dispatches.request_id=requests.id),
+                (SELECT MIN(json_extract(offer.value,'$.createdAt'))
+                 FROM json_each(CASE WHEN json_valid(requests.offers)
+                 THEN requests.offers ELSE '[]' END) offer)
+              ) first_offer_at
+              FROM customer_requests requests WHERE requests.status!='deleted'
+            )
+            SELECT COUNT(first_offer_at) requests_with_offer,
+            AVG(CASE WHEN julianday(first_offer_at)>=julianday(created_at)
+            THEN (julianday(first_offer_at)-julianday(created_at))*1440.0 END)
+            average_minutes FROM offer_times WHERE COALESCE(first_offer_at,'')!=''"""
+        ).fetchone()
+    except sqlite3.OperationalError:
+        offers = con.execute(
+            """SELECT COUNT(*) requests_with_offer,
+            AVG((julianday(first_offer_at)-julianday(created_at))*1440.0) average_minutes
+            FROM (
+              SELECT requests.id,requests.created_at,MIN(dispatches.offered_at) first_offer_at
+              FROM customer_requests requests JOIN request_dispatches dispatches
+              ON dispatches.request_id=requests.id
+              WHERE COALESCE(dispatches.offered_at,'')!=''
+              GROUP BY requests.id,requests.created_at
+            )"""
+        ).fetchone()
+    offer_performance = {
+        "requestsWithOffer": int(offers["requests_with_offer"] or 0),
+        "averageTimeToFirstOfferMinutes": (
+            round(float(offers["average_minutes"]), 1)
+            if offers["average_minutes"] is not None
+            else None
+        ),
+    }
+    return {
+        "customerRequests": customer_requests,
+        "requestMatching": request_matching,
+        "offerPerformance": offer_performance,
     }
 
 
@@ -4381,6 +4908,7 @@ def get_bootstrap(session=None):
             }
         reports = {}
         if is_admin and can_view_reports:
+            request_reports = admin_request_reporting(con)
             reports = {
                 "topProviders": sorted(
                     [{"id": p["id"], "name": p["name"], "rating": p["rating"], "qualityScore": p["qualityScore"], "stats": p["stats"]} for p in providers],
@@ -4398,6 +4926,7 @@ def get_bootstrap(session=None):
                         "SELECT status, COUNT(*) n FROM complaints GROUP BY status"
                     )
                 },
+                **request_reports,
             }
         admin_entities = {}
         financial_metrics = {}
@@ -4643,6 +5172,14 @@ def get_bootstrap(session=None):
             "platform": platform,
             "serverTime": datetime.now(UTC).isoformat(),
             "serviceAvailability": service_availability_snapshot(con),
+            "marketplaceContract": {
+                "version": "matching_v2",
+                "providerSource": "server",
+                "demoProvidersAllowed": bool(SAMPLE_DATA_ENABLED),
+                "subscriptionsEnforced": RequestMarketplace(
+                    con
+                ).subscription_delays_enabled(),
+            },
             "providerInsights": provider_operational_insights(
                 con, session["providerId"]
             ) if is_provider else {},
@@ -5462,6 +5999,7 @@ class Handler(SimpleHTTPRequestHandler):
             storage_writable = (
                 os.access(DB_PATH.parent, os.W_OK)
                 and os.access(UPLOAD_DIR, os.W_OK)
+                and os.access(BACKUP_DIR, os.W_OK)
             )
             if not storage_writable:
                 issues.append("storage_not_writable")
@@ -7859,14 +8397,14 @@ class Handler(SimpleHTTPRequestHandler):
                         "gov": data.get("gov", user_row["gov"]),
                         "wilayah": data.get("wilayah", user_row["wilayah"]),
                     }
-                    if not RankingService.exact_service_match(
+                    if not RankingService.service_match(
                         request_probe, dict(preferred_provider_row)
                     ):
                         return self.send_json(
                             {"error": "provider_not_eligible_for_request"}, 409
                         )
-                    allowed, _, _ = EntitlementService(con).can_receive(
-                        preferred_provider_id
+                    allowed, _, _ = provider_receive_entitlement(
+                        con, preferred_provider_id
                     )
                     if not allowed:
                         return self.send_json(
@@ -8590,7 +9128,7 @@ class Handler(SimpleHTTPRequestHandler):
                     return self.send_json({"error": "offer_expired"}, 409)
                 selected_provider = selected.get("providerId", "")
                 blocks.assert_allowed(item["userId"], selected_provider)
-                eligible, _, _ = EntitlementService(con).can_receive(selected_provider)
+                eligible, _, _ = provider_receive_entitlement(con, selected_provider)
                 if not eligible:
                     return self.send_json({"error": "provider_no_longer_available"}, 409)
                 # In-app chat opens after the customer deliberately selects an offer.
@@ -9486,7 +10024,7 @@ class Handler(SimpleHTTPRequestHandler):
                     provider_id = slot["providerId"]
                     if provider_id not in entitlement_cache:
                         entitlement_cache[provider_id] = bool(
-                            EntitlementService(con).can_receive(provider_id)[0]
+                            provider_receive_entitlement(con, provider_id)[0]
                         )
                     if entitlement_cache[provider_id]:
                         visible_slots.append(slot)
@@ -9496,7 +10034,7 @@ class Handler(SimpleHTTPRequestHandler):
                     return self.send_json({"error": "provider_required"}, 403)
                 if not con.in_transaction:
                     con.execute("BEGIN IMMEDIATE")
-                allowed, _, _ = EntitlementService(con).can_receive(actor_id)
+                allowed, _, _ = provider_receive_entitlement(con, actor_id)
                 if not allowed:
                     return self.send_json({"error": "provider_no_longer_available"}, 409)
                 slot = service.upsert_slot(
@@ -9525,8 +10063,8 @@ class Handler(SimpleHTTPRequestHandler):
             if not slot_row:
                 return self.send_json({"error": "instant_slot_not_found"}, 404)
             if not booking_replay:
-                allowed, _, _ = EntitlementService(con).can_receive(
-                    slot_row["provider_id"]
+                allowed, _, _ = provider_receive_entitlement(
+                    con, slot_row["provider_id"]
                 )
                 if not allowed:
                     return self.send_json(
@@ -10476,18 +11014,8 @@ class Handler(SimpleHTTPRequestHandler):
                 row = con.execute("SELECT pin_hash FROM providers WHERE id=?", (account_id,)).fetchone()
                 if not row or not verify_secret(pin, row["pin_hash"]):
                     return self.send_json({"error": "invalid_provider_login"}, 403)
-                anonymous_phone = f"deleted-{hashlib.sha256(account_id.encode('utf-8')).hexdigest()[:16]}"
-                con.execute(
-                    """UPDATE providers SET active=0,status='deleted',listing_enabled=0,request_enabled=0,
-                    phone=?,pin_hash='',latitude=NULL,longitude=NULL,location_updated_at='',updated_at=CURRENT_TIMESTAMP
-                    WHERE id=?""",
-                    (anonymous_phone, account_id),
-                )
-                con.execute(
-                    """UPDATE push_subscription_bindings SET active=0,
-                    updated_at=CURRENT_TIMESTAMP
-                    WHERE target_kind='provider' AND target_id=?""",
-                    (account_id,),
+                anonymize_provider_account(
+                    con, account_id, reason="self_service_delete"
                 )
             revoke_account_sessions(con, session["kind"], account_id)
             create_notification(
@@ -11106,6 +11634,7 @@ class Handler(SimpleHTTPRequestHandler):
             "/api/admin/app-user": "manage_admins",
             "/api/admin/request-decision": "review_requests",
             "/api/admin/customer-request-action": "review_requests",
+            "/api/admin/request-provider-dispatch": "review_requests",
             "/api/admin/review-status": "manage_quality",
             "/api/admin/complaint-status": "manage_quality",
             "/api/admin/complaint-case": "manage_quality",
@@ -11298,6 +11827,55 @@ class Handler(SimpleHTTPRequestHandler):
                         "complaint": secure_complaint_view(complaint),
                     }
                 )
+            if path == "/api/admin/request-provider-dispatch":
+                request_id = safe_text(data.get("requestId") or data.get("id"), 120)
+                action = safe_text(data.get("action") or "dispatch", 24)
+                if not request_id:
+                    return self.send_json({"error": "request_id_required"}, 400)
+                if action == "diagnose":
+                    try:
+                        aggregate = RequestMarketplace(con).diagnostics(request_id)
+                    except DomainError as err:
+                        return self.send_domain_error(err)
+                    provider_id = safe_text(data.get("providerId"), 120)
+                    candidate = None
+                    if provider_id:
+                        request_row = con.execute(
+                            "SELECT * FROM customer_requests WHERE id=?", (request_id,)
+                        ).fetchone()
+                        provider_row = con.execute(
+                            "SELECT * FROM providers WHERE id=?", (provider_id,)
+                        ).fetchone()
+                        if not provider_row:
+                            return self.send_json({"error": "provider_not_found"}, 404)
+                        candidate = provider_request_diagnostic(
+                            con, request_row, provider_row
+                        )
+                    return self.send_json({
+                        "ok": True,
+                        "diagnostics": aggregate,
+                        "candidate": candidate,
+                    })
+                if action != "dispatch":
+                    return self.send_json({"error": "invalid_dispatch_action"}, 400)
+                provider_id = safe_text(data.get("providerId"), 120)
+                if not provider_id:
+                    return self.send_json({"error": "provider_id_required"}, 400)
+                try:
+                    result = admin_dispatch_request(
+                        con, session, request_id, provider_id
+                    )
+                except DomainError as err:
+                    return self.send_domain_error(err)
+                if not result.get("ok"):
+                    return self.send_json(
+                        {
+                            "error": "provider_not_eligible_for_request",
+                            "diagnostic": result["diagnostic"],
+                        },
+                        409,
+                    )
+                return self.send_json(result)
             if path == "/api/admin/customer-request-action":
                 request_id = safe_text(data.get("id"), 120)
                 action = safe_text(data.get("action"), 24)
@@ -11520,8 +12098,24 @@ class Handler(SimpleHTTPRequestHandler):
                 return self.send_json({"ok": True, "provider": p})
             if path == "/api/admin/provider-status":
                 provider_id = safe_text(data.get("id"), 120)
+                lifecycle_action = safe_text(data.get("action"), 24)
+                if lifecycle_action:
+                    try:
+                        result = provider_lifecycle_transition(
+                            con,
+                            session,
+                            provider_id,
+                            lifecycle_action,
+                            reason=data.get("reason", ""),
+                        )
+                    except DomainError as err:
+                        return self.send_domain_error(err)
+                    return self.send_json({"ok": True, **result})
                 status = safe_text(data.get("status", "available"), 30)
-                if status not in {"available", "busy", "unavailable", "under_review", "pending", "suspended", "deleted"}:
+                if status not in {
+                    "available", "busy", "unavailable", "under_review", "pending",
+                    "suspended", "archived", "deleted",
+                }:
                     return self.send_json({"error": "invalid_provider_status"}, 400)
                 flags = []
                 for key, default in (("active", 1), ("verified", 0), ("featured", 0)):
@@ -11529,11 +12123,53 @@ class Handler(SimpleHTTPRequestHandler):
                     if value not in (True, False, 0, 1):
                         return self.send_json({"error": "invalid_boolean", "field": key}, 400)
                     flags.append(int(bool(value)))
-                if not con.execute("SELECT id FROM providers WHERE id=?", (provider_id,)).fetchone():
+                current_provider = con.execute(
+                    "SELECT * FROM providers WHERE id=?", (provider_id,)
+                ).fetchone()
+                if not current_provider:
                     return self.send_json({"error": "provider_not_found"}, 404)
+                if status == "deleted":
+                    return self.send_json({"error": "use_provider_delete_endpoint"}, 409)
+                if not flags[0] or status in {"suspended", "archived"}:
+                    try:
+                        result = provider_lifecycle_transition(
+                            con,
+                            session,
+                            provider_id,
+                            "archive" if status == "archived" else "suspend",
+                            reason=(
+                                data.get("reason")
+                                or "إيقاف إداري موثق من إدارة المزودين"
+                            ),
+                        )
+                    except DomainError as err:
+                        return self.send_domain_error(err)
+                    return self.send_json({"ok": True, **result})
+
+                restored_snapshot = {}
+                if provider_lifecycle_state(current_provider) in {"suspended", "archived"}:
+                    try:
+                        restored = provider_lifecycle_transition(
+                            con, session, provider_id, "restore"
+                        )
+                    except DomainError as err:
+                        return self.send_domain_error(err)
+                    restored_snapshot = restored["provider"].get("lifecycleSnapshot") or {}
+                listing_enabled = int(bool(
+                    restored_snapshot.get(
+                        "listingEnabled", current_provider["listing_enabled"]
+                    )
+                ))
+                request_enabled = int(bool(
+                    restored_snapshot.get(
+                        "requestEnabled", current_provider["request_enabled"]
+                    )
+                ))
                 con.execute(
-                    "UPDATE providers SET active=?, verified=?, featured=?, status=? WHERE id=?",
-                    (*flags, status, provider_id),
+                    """UPDATE providers SET active=?,verified=?,featured=?,status=?,
+                    listing_enabled=?,request_enabled=?,lifecycle_state='active',
+                    status_reason='',updated_at=CURRENT_TIMESTAMP WHERE id=?""",
+                    (*flags, status, listing_enabled, request_enabled, provider_id),
                 )
                 provider_row = con.execute(
                     """SELECT id,provider_type,verified,verification_expiry,status
@@ -11577,6 +12213,7 @@ class Handler(SimpleHTTPRequestHandler):
                 provider_id = str(data.get("id", "") or "")
                 admin_code = safe_text(data.get("adminCode", ""), 128)
                 delete_reason = safe_text(data.get("reason", ""), 500)
+                permanent = strict_bool(data.get("permanent"), False)
                 admin_row = con.execute(
                     "SELECT code_hash FROM admin_users WHERE id=? AND active=1",
                     (session.get("id", ""),),
@@ -11586,38 +12223,58 @@ class Handler(SimpleHTTPRequestHandler):
                 if len(delete_reason) < 3:
                     return self.send_json({"error": "delete_reason_required"}, 400)
                 provider_row = con.execute(
-                    "SELECT id,name,phone,active,status FROM providers WHERE id=?", (provider_id,)
+                    "SELECT * FROM providers WHERE id=?", (provider_id,)
                 ).fetchone()
                 if not provider_row:
                     return self.send_json({"error": "provider_not_found"}, 404)
                 if int(provider_row["active"] or 0) or provider_row["status"] not in {
-                    "unavailable", "suspended", "deleted"
+                    "unavailable", "suspended", "archived", "deleted"
                 }:
                     return self.send_json({"error": "provider_must_be_stopped_before_delete"}, 409)
-                anonymous_phone = f"deleted-{hashlib.sha256(provider_id.encode('utf-8')).hexdigest()[:16]}"
-                con.execute(
-                    """UPDATE providers SET active=0,status='deleted',listing_enabled=0,
-                    request_enabled=0,name='حساب مزود محذوف',phone=?,pin_hash='',image_path='',
-                    card_image='',work_images='[]',documents='[]',latitude=NULL,longitude=NULL,
-                    location_updated_at='',deleted_at=CURRENT_TIMESTAMP,delete_reason=?,
-                    updated_at=CURRENT_TIMESTAMP WHERE id=?""",
-                    (anonymous_phone, delete_reason, provider_id),
+                lifecycle_state = provider_lifecycle_state(provider_row)
+                if lifecycle_state == "deleted":
+                    return self.send_json({"ok": True, "deleted": True, "archived": False})
+                if lifecycle_state != "archived":
+                    if permanent:
+                        return self.send_json(
+                            {"error": "provider_must_be_archived_before_permanent_delete"},
+                            409,
+                        )
+                    try:
+                        archived = provider_lifecycle_transition(
+                            con,
+                            session,
+                            provider_id,
+                            "archive",
+                            reason=delete_reason,
+                        )
+                    except DomainError as err:
+                        return self.send_domain_error(err)
+                    return self.send_json({
+                        "ok": True,
+                        "deleted": False,
+                        "archived": True,
+                        "requiresPermanentConfirmation": True,
+                        **archived,
+                    })
+                if not permanent:
+                    return self.send_json({
+                        "ok": True,
+                        "deleted": False,
+                        "archived": True,
+                        "requiresPermanentConfirmation": True,
+                    })
+                anonymize_provider_account(
+                    con, provider_id, reason=delete_reason
                 )
-                con.execute(
-                    """UPDATE push_subscription_bindings SET active=0,
-                    updated_at=CURRENT_TIMESTAMP
-                    WHERE target_kind='provider' AND target_id=?""",
-                    (provider_id,),
-                )
-                revoke_account_sessions(con, "provider", provider_id)
                 log_audit(
                     con,
                     session,
                     "provider.deleted",
                     provider_id,
-                    f"{provider_row['name']} | {delete_reason}",
+                    "anonymized_after_archive",
                 )
-                return self.send_json({"ok": True})
+                return self.send_json({"ok": True, "deleted": True, "archived": False})
             if path == "/api/admin/app-user":
                 user_id = safe_text(data.get("id", ""), 120)
                 action = safe_text(data.get("action", "update"), 20)

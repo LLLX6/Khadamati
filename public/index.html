@@ -36,7 +36,7 @@ const STORAGE_KEY = 'KHADAMATI_MARKET_OS_V21';
 const PRIVATE_STATE_KEY = 'KHADAMATI_PRIVATE_STATE_V1';
 const APP_SCHEMA_VERSION = 71;
 const APP_VERSION = '1.1.1';
-const APP_BUILD = 'khadamati-v1.1.1-official-brand-onboarding-r5-2026-08-10';
+const APP_BUILD = 'khadamati-v1.1.1-matching-admin-sync-r6-2026-08-10';
 const LEGACY_STORAGE_KEYS = ['KHADAMATI_MARKET_OS_V20','FORAN_MARKET_OS_V14'];
 const ONBOARDING_STORAGE_KEY = 'KHADAMATI_ONBOARDING_V4';
 const DIRECT_REQUEST_GUIDE_KEY = 'KHADAMATI_DIRECT_REQUEST_GUIDE_V1';
@@ -74,6 +74,11 @@ let MODAL_PAGE_SCROLL_Y = 0;
 let TASK_LOADING_SEQUENCE = 0;
 const TASK_LOADING_HANDLES = new Map();
 let ACCOUNT_REFRESH_TIMER = null;
+const ACCOUNT_SYNC_MIN_INTERVAL_MS = 8000;
+const ACCOUNT_REFRESH_INTERVAL_MS = 15000;
+const CHAT_REFRESH_INTERVAL_MS = 10000;
+const ACCOUNT_SYNC = {inFlight:null,controller:null,context:'',sequence:0,lastCompletedAt:0,lastCompletedContext:''};
+const NOTIFICATION_READ_IN_FLIGHT = new Map();
 const MAP_INSTANCES = new Map();
 let MAP_WATCH_ID = null;
 const REVERSE_LOCATION_CACHE = new Map();
@@ -380,6 +385,18 @@ function queueOfflineOperation(path,body){
  const old=S.offlineQueue.find(x=>x.key===key);if(old)Object.assign(old,item,{id:old.id,createdAt:old.createdAt});else S.offlineQueue.push(item);
  S.offlineQueue=S.offlineQueue.slice(-40);try{save();}catch(_){}
 }
+function offlineRequestOperationMatches(request,item){
+ if(!request||item?.path!=='/api/user/requests')return false;
+ const body=item.body||{},requestIds=[request.id,request.serverId,request.idempotencyKey].filter(Boolean).map(String),operationIds=[body.id,body.requestId,body.idempotencyKey].filter(Boolean).map(String);
+ return requestIds.some(value=>operationIds.includes(value));
+}
+function requestHasPendingSync(request){
+ return request?.syncState==='pending'||request?.syncState==='failed'||(S.offlineQueue||[]).some(item=>offlineRequestOperationMatches(request,item));
+}
+function markOfflineRequestSyncState(item,state,error=''){
+ if(item?.path!=='/api/user/requests')return;
+ (S.customerRequests||[]).forEach(request=>{if(offlineRequestOperationMatches(request,item)){request.syncState=state;request.syncError=String(error||'').slice(0,120);request.syncUpdatedAt=nowISO();}});
+}
 function tokenForKind(kind){return kind==='admin'?AUTH.adminToken:kind==='provider'?AUTH.providerToken:kind==='user'?AUTH.userToken:'';}
 function authSubjectForKind(kind){return kind==='provider'?String(S?.currentProviderId||''):kind==='user'?String(S?.session?.userId||''):kind==='admin'?String(S?.adminUser?.id||'admin'):'';}
 function dropOfflineQueueFor(kind){if(S?.offlineQueue)S.offlineQueue=S.offlineQueue.filter(item=>item.tokenKind!==kind);}
@@ -418,8 +435,12 @@ async function flushOfflineQueue(){
  for(const item of pending){
   const token=tokenForKind(item.tokenKind),subject=authSubjectForKind(item.tokenKind);
   if(!token||!item.subjectId||item.subjectId!==subject){S.offlineQueue=S.offlineQueue.filter(x=>x.id!==item.id);continue;}
-  try{await api(item.path,item.body,token,{skipQueue:true});S.offlineQueue=S.offlineQueue.filter(x=>x.id!==item.id);}
-  catch(_){item.attempts=Number(item.attempts||0)+1;item.lastAttempt=nowISO();break;}
+  try{await api(item.path,item.body,token,{skipQueue:true});markOfflineRequestSyncState(item,'confirmed');S.offlineQueue=S.offlineQueue.filter(x=>x.id!==item.id);}
+  catch(error){
+   const code=String(error?.message||error||'request_failed');item.attempts=Number(item.attempts||0)+1;item.lastAttempt=nowISO();item.lastError=code.slice(0,120);
+   if(code!=='request_failed'){markOfflineRequestSyncState(item,'failed',code);S.offlineQueue=S.offlineQueue.filter(x=>x.id!==item.id);continue;}
+   markOfflineRequestSyncState(item,'pending',code);break;
+  }
  }
  save();if(!S.offlineQueue.length)toast(L('تمت مزامنة العمليات المحفوظة.','Saved operations are now synced.'));
 }
@@ -452,6 +473,7 @@ async function api(path, body=null, token='', options={}){
    }
   }
   if(!res.ok){
+   if(res.status>=500&&body&&!options.skipQueue)queueOfflineOperation(path,body);
    if(res.status===401&&token&&requestedKind){
     AUTH[authTokenField(requestedKind)]='';
     AUTH[authExpiryField(requestedKind)]='';
@@ -460,7 +482,7 @@ async function api(path, body=null, token='', options={}){
     if(!activeAuthToken())scrubPrivateSessionState(S);
    }
    recordApiMetric(false,path,performance.now()-started,data.error||res.status);
-   throw new Error(data.error || 'request_failed');
+   const requestError=new Error(data.error || 'request_failed');requestError.payload=data;requestError.status=res.status;throw requestError;
   }
   if(path==='/api/provider-requests'&&data.token){
    applySessionResponse('provider',data,true);
@@ -527,7 +549,7 @@ function normalizeProvider(p){
  const description=p.bio||p.note||'';
  const governorates=Array.isArray(p.governorates)&&p.governorates.length?p.governorates.filter(Boolean):(p.gov?[p.gov]:[]);
  const defaultPackage=(String(p.providerType||p.provider_type||'individual').toLowerCase()==='company'?'company_free_3m':'individual_free_3m');
- return {...p,bio:description,note:description,primaryServiceId,primaryCatId,governorates,location,mapVisible:p.mapVisible??p.map_visible??true,locationSharingExpiresAt:p.locationSharingExpiresAt||p.location_sharing_expires_at||'',avatar:image||p.avatar||initials(p.name),cardImage:apiAsset(p.cardImage||p.primaryImage||image||''),workImages,beforeAfter,introVideoUrl:apiAsset(p.introVideoUrl||p.intro_video_url||''),documents:(p.documents||p.documentUrls||[]).map(apiAsset),teamMembers:p.teamMembers||p.team_members||[],companySummary:p.companySummary||p.company_summary||{},commercialNo:p.commercialNo||p.commercial_no||p.licenseNo||'',licenseNo:p.licenseNo||p.commercialNo||p.commercial_no||'',subscriptionEnd:p.subscriptionUntil||p.subscriptionEnd||'',packageId:p.packageId||p.package_id||defaultPackage,subscriptionState:p.subscriptionState||p.subscription_state||'expired',listingEnabled:p.listingEnabled??p.listing_enabled??true,requestEnabled:p.requestEnabled??p.request_enabled??true,pinConfigured:!!p.pinConfigured,qualityScore:p.qualityScore??profileStrength(p),qualityBreakdown:p.qualityBreakdown||p.quality_breakdown||{},reviews:Number(p.reviews||0),rating:Number(p.rating||0),responseMinutes:Number(p.responseMinutes||p.response_minutes||30),completedJobs:Number(p.completedJobs||p.completed_jobs||0),acceptanceRate:Number(p.acceptanceRate||p.acceptance_rate||0),lastAvailableAt:p.lastAvailableAt||p.last_available_at||'',createdAt:p.createdAt||p.created_at||'',failedLoginCount:Number(p.failedLoginCount||0),stats:p.stats||{views:0,whatsapp:0,calls:0}};
+ return {...p,bio:description,note:description,primaryServiceId,primaryCatId,governorates,location,mapVisible:p.mapVisible??p.map_visible??true,locationSharingExpiresAt:p.locationSharingExpiresAt||p.location_sharing_expires_at||'',avatar:image||p.avatar||initials(p.name),cardImage:apiAsset(p.cardImage||p.primaryImage||image||''),workImages,beforeAfter,introVideoUrl:apiAsset(p.introVideoUrl||p.intro_video_url||''),documents:(p.documents||p.documentUrls||[]).map(apiAsset),teamMembers:p.teamMembers||p.team_members||[],companySummary:p.companySummary||p.company_summary||{},commercialNo:p.commercialNo||p.commercial_no||p.licenseNo||'',licenseNo:p.licenseNo||p.commercialNo||p.commercial_no||'',subscriptionEnd:p.subscriptionUntil||p.subscriptionEnd||'',packageId:p.packageId||p.package_id||defaultPackage,subscriptionState:p.subscriptionState||p.subscription_state||'expired',listingEnabled:p.listingEnabled??p.listing_enabled??true,requestEnabled:p.requestEnabled??p.request_enabled??true,lifecycleState:p.lifecycleState||p.lifecycle_state||(p.active===false?'suspended':'active'),statusReason:p.statusReason||p.status_reason||'',pinConfigured:!!p.pinConfigured,qualityScore:p.qualityScore??profileStrength(p),qualityBreakdown:p.qualityBreakdown||p.quality_breakdown||{},reviews:Number(p.reviews||0),rating:Number(p.rating||0),responseMinutes:Number(p.responseMinutes||p.response_minutes||30),completedJobs:Number(p.completedJobs||p.completed_jobs||0),acceptanceRate:Number(p.acceptanceRate||p.acceptance_rate||0),lastAvailableAt:p.lastAvailableAt||p.last_available_at||'',createdAt:p.createdAt||p.created_at||'',failedLoginCount:Number(p.failedLoginCount||0),stats:p.stats||{views:0,whatsapp:0,calls:0}};
 }
 function normalizeRequestExtras(r){
  const messages=(r.messages||[]).map(m=>({...m,image:apiAsset(m.image||''),audio:apiAsset(m.audio||'')}));
@@ -543,14 +565,37 @@ function normalizeNotificationRecord(item={}){
  const requiresAction=item.requiresAction??item.requires_action??false;
  return {...item,target:item.target||item.targetKind||item.target_kind||'',targetId:item.targetId||item.target_id||'',createdAt:item.createdAt||item.created_at||'',dedupeKey:item.dedupeKey||item.dedupe_key||'',entityKind:item.entityKind||item.entity_kind||'',entityId:item.entityId||item.entity_id||item.relatedId||item.related_id||'',relatedId:item.relatedId||item.related_id||item.entityId||item.entity_id||'',actionKind:item.actionKind||item.action_kind||'',actionRoute:item.actionRoute||item.action_route||'',actionText:item.actionText||item.action_text||'',requiresAction:requiresAction===true||requiresAction===1||requiresAction==='1',stateVersion:Number(item.stateVersion??item.state_version??0),seenAt:item.seenAt||item.seen_at||'',readAt:item.readAt||item.read_at||'',acknowledgedAt:item.acknowledgedAt||item.acknowledged_at||'',actedAt:item.actedAt||item.acted_at||'',dismissedAt:item.dismissedAt||item.dismissed_at||'',snoozedUntil:item.snoozedUntil||item.snoozed_until||'',supersededAt:item.supersededAt||item.superseded_at||'',expiresAt:item.expiresAt||item.expires_at||'',read:item.read===true||item.is_read===true||item.is_read===1||!!item.readAt||!!item.read_at};
 }
+function mergeNotificationState(previous={},incoming={}){
+ const old=normalizeNotificationRecord(previous),next=normalizeNotificationRecord(incoming),merged={...old,...next};
+ for(const field of ['seenAt','readAt','acknowledgedAt','actedAt','dismissedAt','supersededAt'])merged[field]=old[field]||next[field]||'';
+ merged.stateVersion=Math.max(Number(old.stateVersion||0),Number(next.stateVersion||0));
+ merged.read=!!(old.read||next.read||merged.readAt||merged.actedAt||merged.dismissedAt||merged.supersededAt);
+ merged._serverVerified=old._serverVerified===true||next._serverVerified===true;
+ return merged;
+}
 function mergeNotificationRecords(remote=[]){
  const records=new Map();
  for(const source of [...(S.notifications||[]),...(remote||[])]){
   const item=normalizeNotificationRecord(source),key=item.id||item.dedupeKey;
   if(!key)continue;
-  records.set(key,{...(records.get(key)||{}),...item});
+  records.set(key,mergeNotificationState(records.get(key)||{},item));
  }
  return [...records.values()].sort((a,b)=>String(b.createdAt||'').localeCompare(String(a.createdAt||''))).slice(0,600);
+}
+function requestIdentityValues(request={}){
+ return [request.id,request.serverId,request.idempotencyKey,request.idempotency_key].filter(Boolean).map(String);
+}
+function requestsReferToSameItem(left,right){
+ const rightValues=new Set(requestIdentityValues(right));return requestIdentityValues(left).some(value=>rightValues.has(value));
+}
+function reconcileCustomerRequests(remote=[]){
+ const local=(S.customerRequests||[]).map(normalizeRequestExtras),rows=(remote||[]).map(normalizeRequestExtras),pending=local.filter(requestHasPendingSync);
+ for(const localRequest of pending){
+  const index=rows.findIndex(remoteRequest=>requestsReferToSameItem(localRequest,remoteRequest));
+  if(index>=0){rows[index]=normalizeRequestExtras({...localRequest,...rows[index],syncState:'',syncError:'',syncUpdatedAt:nowISO()});continue;}
+  rows.push(localRequest);
+ }
+ return rows.sort((a,b)=>String(b.createdAt||b.created_at||'').localeCompare(String(a.createdAt||a.created_at||'')));
 }
 function mergeRemote(data){
  if(!data) return;
@@ -576,7 +621,7 @@ function mergeRemote(data){
   S.payments=data.payments||S.payments||[];
   S.leads=data.leads||S.leads||[];
  S.auditLogs=data.auditLogs||S.auditLogs||[];
- S.customerRequests=(data.customerRequests||S.customerRequests||[]).map(normalizeRequestExtras);
+ S.customerRequests=Array.isArray(data.customerRequests)?reconcileCustomerRequests(data.customerRequests):(S.customerRequests||[]).map(normalizeRequestExtras);
  S.marketplaceRequests=(data.marketplaceRequests||S.marketplaceRequests||[]).map(normalizeRequestExtras);
  if(Array.isArray(data.notifications)){const serverVerified=!!activeAuthToken();S.notifications=mergeNotificationRecords(data.notifications.map(item=>({...item,_serverVerified:serverVerified})));}
  S.users=data.users||S.users||[];
@@ -754,6 +799,8 @@ const SAMPLE_PROVIDER_IMAGES={
  p11:'assets/providers/omani-tailor.webp',
  p12:'assets/providers/omani-tech-company.webp'
 };
+const LOCAL_DEMO_PROVIDER_MODE=location.protocol==='file:'||/^(localhost|127\.0\.0\.1)$/i.test(location.hostname);
+const LEGACY_DEMO_PROVIDER_IDS=new Set(Array.from({length:12},(_,index)=>`p${index+1}`));
 function sampleProviderImage(id,name){if(SAMPLE_PROVIDER_IMAGES[id])return SAMPLE_PROVIDER_IMAGES[id];const [c1,c2,symbol]=SAMPLE_PROVIDER_ART[id]||['#164e63','#2dd4bf','خ'],initial=String(name||'خ').trim().slice(0,1),svg=`<svg xmlns="http://www.w3.org/2000/svg" width="720" height="720" viewBox="0 0 720 720"><defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1"><stop stop-color="${c1}"/><stop offset="1" stop-color="${c2}"/></linearGradient></defs><rect width="720" height="720" rx="54" fill="url(#g)"/><circle cx="570" cy="125" r="170" fill="#fff" opacity=".1"/><circle cx="135" cy="620" r="210" fill="#07131f" opacity=".12"/><rect x="110" y="112" width="500" height="496" rx="68" fill="#fff" opacity=".12" stroke="#fff" stroke-opacity=".34" stroke-width="4"/><text x="360" y="350" text-anchor="middle" font-family="Arial,Tahoma,sans-serif" font-size="150" font-weight="900" fill="#fff">${symbol}</text><text x="360" y="520" text-anchor="middle" font-family="Tahoma,Arial,sans-serif" font-size="110" font-weight="900" fill="#fff">${initial}</text></svg>`;return `data:image/svg+xml;charset=UTF-8,${encodeURIComponent(svg)}`;}
 const seedProviders = () => [
  {id:'p1',name:'سالم البلوشي',phone:'91234567',gov:'مسقط',wilayah:'السيب',areas:['السيب','بوشر'],bio:'تنفيذ أعمال الكهرباء المنزلية والصيانة الطارئة بدقة وتنظيم.',hours:'8:00 ص - 9:00 م',status:'available',active:true,verified:true,featured:true,packageId:'plus',subscriptionEnd:'2026-08-30',avatar:'س',rating:4.8,reviews:38,adminNote:'',stats:{views:162,whatsapp:74,calls:31},services:[{id:'ps1',catId:'homecare',serviceId:'electrician',priceFrom:5,active:true,areas:['السيب','بوشر']},{id:'ps2',catId:'homecare',serviceId:'appliances',priceFrom:7,active:true,areas:['السيب']} ]},
@@ -825,7 +872,7 @@ const launchAdSlides = () => [
 ];
 const seedState = () => ({
 version:APP_SCHEMA_VERSION,lang:'ar',theme:'light',view:'entry',lastView:'home',entrySeen:false,splashSeen:false,userUiMode:'simple',filtersOpen:false,user:{name:'',phone:'',email:'',age:0,nationality:'',gov:'مسقط',wilayah:'السيب',avatar:'',location:null},session:{mode:'none',userId:''},users:[],guestVisits:[],currentProviderId:null,providerLoginMemory:{phone:'',phoneMasked:'',name:'',id:''},loginFailures:{},admin:false,adminTab:'overview',adminNavScroll:0,adminCommunityView:'attention',providerTab:'home',providerNavScroll:0,favorites:[],supportNotes:[],customerRequests:[],marketplaceRequests:[],serviceAssets:[],providerInsights:{},demandGaps:[],communityListings:[],communitySettings:{communityEnabled:true,communityPackagesEnabled:true,communityBoardEnabled:true,communityProviderOffersEnabled:true,communityUserRecommendationsEnabled:true,featuredPackagesEnabled:true,featuredPackageIntervalSeconds:3,featuredPackagePlanExposure:DEFAULT_FEATURED_PLAN_EXPOSURE,communityWantedExpiryDays:30,communityPackageExpiryDays:30,communityFirstPackageFreeDays:30,communityRenewalFee:2},communityFavorites:[],communityStats:{},communityReports:[],demoContent:{allowed:false,counts:{}},communityTab:'packages',communitySearch:'',communityCategory:'all',communitySort:'featured',communityFiltersOpen:false,requestBoardFilter:'all',providerRegistrationStep:1,requestDraft:null,providerRegistrationDraft:null,activityEvents:[],recentSearches:[],notifications:[],assistantSearches:[],unavailableRequests:[],loyalty:{points:0,history:[]},loyaltySummary:null,rewardCampaigns:[],campaignEligibility:[],locationCatalog:null,serverTimeOffsetMs:0,adSlides:launchAdSlides(),launchAdsSeeded:true,sampleProviderImagesSeeded:true,adArchive:[],adIndex:0,featuredPackageIndex:0,mapFilters:{service:'',gov:''},serviceAvailability:{services:{},categories:{},generatedAt:''},serviceAreas:GOVS.map(g=>({ar:g.ar,en:g.en,w:g.w.map(x=>[...x])})),
- categories:seedCategories(),providers:seedProviders(),providerRequests:[],reviews:[],complaints:[],interactionBlocks:[],subscriptions:[],payments:[],leads:[],auditLogs:[],reports:{},serverStats:{},marketplacePlatform:{},
+ categories:seedCategories(),providers:LOCAL_DEMO_PROVIDER_MODE?seedProviders():[],providerRequests:[],reviews:[],complaints:[],interactionBlocks:[],subscriptions:[],payments:[],leads:[],auditLogs:[],reports:{},serverStats:{},marketplacePlatform:{},
  platform:{...PLATFORM_DEFAULTS,nameAr:'خدماتي',nameEn:'Khadamati App',supportWhatsapp:'',adminWhatsapp:'',defaultGov:'مسقط',defaultLang:'ar',acceptProviders:true,subscriptionsEnabled:false,paymentGatewayEnabled:false,monthlyGoal:500},
  packages:seedPackages(),
  finance:[],expenses:[],sponsors:[],coupons:[]
@@ -1009,6 +1056,7 @@ function migrateSubscriptionStorageV1(){
 }
 function mergeSeedProviders(existing=[]){
  const current=(existing||[]).map(p=>({...p,services:[...(p.services||[])],stats:{...(p.stats||{})}}));
+ if(!LOCAL_DEMO_PROVIDER_MODE)return current.filter(provider=>!provider.sample&&!provider.demo&&!LEGACY_DEMO_PROVIDER_IDS.has(String(provider.id||'')));
  const byId=new Map(current.map(p=>[p.id,p]));
  seedProviders().forEach(seed=>{
   const old=byId.get(seed.id);
@@ -1358,13 +1406,44 @@ const ASSISTANT_RULES=[
  {terms:'هدايا طباعة اكواب تيشيرت ستيكر لوحة محل هدية دعائية',serviceIds:['mug_print','shirt_print','sticker_print','promo_gifts','signboards'],role:'مزود طباعة وهدايا',cause:'تحتاج الخدمة إلى الكمية والمقاس والتصميم وموعد التسليم.'},
  {terms:'عبايه دشداشه كمه مصر تعديل ملابس خياطه كوي غسيل',serviceIds:['abaya','men_tailor','women_tailor','kumma_mussar','clothes_alter','tailor','ironing','laundry'],role:'خياط أو مزود عناية بالملابس',cause:'أرسل المقاس أو صورة القطعة ونوع التعديل للحصول على تقدير أسرع.'}
 ];
+const ASSISTANT_RULE_EN=Object.freeze({
+ ac_car:{terms:'car ac air conditioning warm refrigerant compressor',role:'Car AC technician',cause:'Possible causes include low refrigerant, a leak, compressor failure, or a weak cooling fan.'},
+ ac_repair:{terms:'ac air conditioning cooling warm filter gas compressor',role:'AC and refrigeration technician',cause:'Possible causes include low refrigerant, a dirty filter, compressor failure, or a unit that needs cleaning.'},
+ plumber:{terms:'water leak pipe tank tap blockage plumbing',role:'Plumber',cause:'The cause may be a broken pipe, tank leak, damaged fitting, or blockage.'},
+ electrician:{terms:'electricity breaker short circuit light switch socket wiring',role:'Electrician',cause:'The cause may be an overload, weak breaker, short circuit, or a wiring problem.'},
+ networks:{terms:'internet wifi router network weak coverage',role:'Network technician',cause:'The issue may relate to router placement, weak coverage, network settings, or the device.'},
+ math:{terms:'teacher tutor lessons mathematics english arabic exam',role:'Tutor for the selected subject',cause:'Choose the subject and grade to find the most suitable tutor.'},
+ furniture_move:{terms:'moving furniture delivery packing assembly dismantling',role:'Furniture mover',cause:'The job may need workers, a moving vehicle, packing, and assembly depending on volume.'},
+ battery:{terms:'car battery tyre tire towing wash inspection roadside',role:'Vehicle technician or service center',cause:'Describe the fault or service and the vehicle location to find the nearest suitable provider.'},
+ pc:{terms:'computer laptop printer camera point of sale technology',role:'IT technician',cause:'The issue may be in the device, operating system, connections, or network configuration.'},
+ home_clean:{terms:'home house apartment sofa carpet tank cleaning',role:'Cleaning provider',cause:'Choose the place or item to estimate the required equipment and time.'},
+ building:{terms:'building renovation tiles gypsum paint insulation contractor',role:'Contractor or finishing technician',cause:'An accurate estimate needs the area, type of work, and required materials.'},
+ photo:{terms:'event photography hospitality party coordination',role:'Events or hospitality provider',cause:'Add the date, location, and guest count for a more accurate match.'},
+ cockroach:{terms:'pest cockroach ants bedbugs rodents sanitization',role:'Pest-control and sanitization provider',cause:'The job may require safe treatment, locating the source, closing entry points, and sanitizing afterward.'},
+ locksmith:{terms:'lock key door locked lost key car key',role:'Locksmith',cause:'The cause may be a damaged cylinder, broken key, or car-key programming; add a photo or vehicle model if possible.'},
+ garden_design:{terms:'garden trees grass irrigation farm pruning',role:'Garden and irrigation technician',cause:'The service depends on area, soil, and irrigation; a site photo helps estimate the work.'},
+ interior_design:{terms:'interior design wallpaper lighting parquet kitchen majlis',role:'Interior designer or finishing technician',cause:'The provider usually needs the room size, preferred style, and budget before estimating materials and time.'},
+ elder_care_plus:{terms:'elder care babysitter patient home help organizing',role:'Trusted home-care provider',cause:'Specify hours, care type, and location to match a suitable and safe provider.'},
+ printing_docs:{terms:'printing documents photocopy letter presentation powerpoint excel',role:'Printing and office-services provider',cause:'Specify file type, page count, and deadline; attaching the file improves the estimate.'},
+ logo_design:{terms:'logo advertisement design content social website programming app video editing',role:'Designer or digital developer',cause:'Share the objective, size or platform, and deadline before the provider prepares an offer.'},
+ social_ads:{terms:'marketing campaign instagram snapchat tiktok product photography',role:'Digital marketer or commercial photographer',cause:'Specify the project, audience, and approximate budget so the campaign plan is realistic.'},
+ property_photo:{terms:'property apartment rental real estate photography broker maintenance',role:'Property-services provider',cause:'Add the property location, requested service, and initial photos to find the closest provider.'},
+ trip_plan:{terms:'trip travel booking airport pickup guide tour hotel flight',role:'Travel coordinator or pickup provider',cause:'Add the date, number of travelers, and destination to prepare a suitable offer.'},
+ fridge_repair:{terms:'fridge freezer heater washer oven appliance not working',role:'Home-appliance technician',cause:'The fault may be electrical or mechanical; include the appliance type and model if possible.'},
+ diagnostics:{terms:'car diagnostics engine light sensor auto electrical mechanic',role:'Vehicle diagnostics technician',cause:'The provider may need a diagnostic scan or inspection to identify the sensor or fault.'},
+ office_maintenance:{terms:'office maintenance attendance point of sale cashier business system',role:'Business systems provider',cause:'Specify the number of devices or employees and the office location to suggest the right system.'},
+ mug_print:{terms:'gifts mug shirt sticker sign promotional printing',role:'Printing and gifts provider',cause:'Add quantity, size, design, and delivery deadline.'},
+ abaya:{terms:'abaya dishdasha kumma mussar tailoring alteration ironing laundry',role:'Tailor or garment-care provider',cause:'Add measurements or a garment photo and the alteration type for a faster estimate.'}
+});
+function assistantRuleEnglish(rule={}){return ASSISTANT_RULE_EN[rule.serviceIds?.[0]]||{};}
+function assistantRuleText(result={},field='role'){return S.lang==='en'?(result[`${field}En`]||result[field]||''):(result[field]||result[`${field}En`]||'');}
 function findServiceRowByIds(ids){ for(const id of ids){const row=serviceSearchIndex().find(x=>x.svc.id===id);if(row)return row;} return null; }
 function assistantAnalyze(query){
  const q=normalizeSearchText(query); if(!q)return null;
  let best=null, bestScore=0;
- ASSISTANT_RULES.forEach(rule=>{const terms=normalizeSearchText(rule.terms).split(' ');const score=terms.reduce((n,t)=>n+(q.includes(t)||t.includes(q)?1:0),0);if(score>bestScore){bestScore=score;best={rule,row:findServiceRowByIds(rule.serviceIds)};}});
- const urgent=/عاجل|طوارئ|حريق|شرار|دخان|غرق|تسريب كبير|محبوس/.test(q);
- if(best?.row) return {...best.row,role:best.rule.role,cause:best.rule.cause,confidence:Math.min(98,55+bestScore*10),urgent};
+ ASSISTANT_RULES.forEach(rule=>{const english=assistantRuleEnglish(rule),terms=normalizeSearchText(`${rule.terms} ${english.terms||''}`).split(' ');const score=terms.reduce((n,t)=>n+(q.includes(t)||t.includes(q)?1:0),0);if(score>bestScore){bestScore=score;best={rule,english,row:findServiceRowByIds(rule.serviceIds)};}});
+ const urgent=/عاجل|طوارئ|حريق|شرار|دخان|غرق|تسريب كبير|محبوس|urgent|emergency|fire|sparks?|smoke|flood|trapped/.test(q);
+ if(best?.row) return {...best.row,role:best.rule.role,roleEn:best.english?.role||best.rule.role,cause:best.rule.cause,causeEn:best.english?.cause||best.rule.cause,confidence:Math.min(98,55+bestScore*10),urgent};
  const generic=searchServices(q,1)[0];
  if(generic) return {...generic,role:L(`مزود متخصص في ${generic.svc.ar}`,`${generic.svc.en} provider`),cause:L('هذه الخدمة هي الأقرب إلى وصف المشكلة الذي كتبته.','This is the closest service to the issue you described.'),confidence:52,urgent};
  return null;
@@ -1384,7 +1463,7 @@ function assistantRequestBrief(result,query){
  return [...(byCat[result.cat?.id]||[]),...base].slice(0,5).map(x=>`<span class="badge">${esc(x)}</span>`).join('');
 }
 function assistantPlan(result){
- const service=esc(loc(result.svc)), specialist=esc(L(result.role,result.role));
+ const service=esc(loc(result.svc)), specialist=esc(assistantRuleText(result,'role'));
  const steps=[L(`اختر ${service}`,`Choose ${service}`),L(`أرفق صورة أو وصفاً قصيراً`,`Attach a photo or short note`),L(`يصلك ${specialist} المناسب`,`Get the right ${specialist}`)];
  return `<div class="assistant-plan">${steps.map((x,i)=>`<span><b>${i+1}</b> ${x}</span>`).join('')}</div>`;
 }
@@ -1399,7 +1478,7 @@ function assistantResultHtml(query){
   ?L('يبدو أن الحالة عاجلة. أوقف مصدر الخطر إن كان ذلك آمناً، ولا تلمس الأسلاك أو المياه القريبة من الكهرباء.','This may be urgent. Isolate the hazard only if safe and avoid wires or water near electricity.')
   :L('أضف الموقع والوقت وصورة واضحة للمشكلة لتحصل على استجابة أدق وأسرع.','Add your location, preferred time, and a clear photo for a faster, more accurate response.');
  const plan=assistantPlan(result);
- return `<div class="assistant-result assistant-simple">${result.urgent?`<span class="badge warn">${L('تنبيه: قد تكون عاجلة','Alert: may be urgent')}</span>`:`<span class="badge ok">${Math.round(result.confidence)}% ${L('تطابق','match')}</span>`}<div class="assistant-main-answer"><small>${esc(loc(result.cat))}</small><h3>${esc(loc(result.svc))}</h3><p>${L('المختص المناسب','Recommended specialist')}: <b>${esc(L(result.role,result.role))}</b></p></div>${plan}<div class="assistant-guidance">${icon(result.urgent?'bell':'shield')} ${esc(safety)}</div><div class="assistant-match-strip">${matches.slice(0,3).map(p=>`<span>${esc(p.name)} • ${providerDistanceLabel(p)||esc(p.wilayah||p.gov||'عُمان')}</span>`).join('')||`<span>${L('سنرسل الطلب للإدارة إذا لم يتوفر مزود مناسب.','Management will be notified if no suitable provider is available.')}</span>`}</div><div class="row-actions assistant-actions"><button class="pill-btn primary" data-action="assistantRequest" data-value="${esc(result.value)}">${L('ابدأ الطلب','Start request')}</button><button class="ghost-btn" data-action="assistantProviders" data-cat="${result.cat.id}" data-service="${result.svc.id}">${matches.length?L(`عرض أفضل ${matches.length}`,`Show best ${matches.length}`):L('عرض المزودين','Show providers')}</button></div><details class="assistant-details"><summary>${L('ما الذي يحتاجه المزود؟','What does the provider need?')}</summary><div class="provider-service-chips compact">${assistantRequestBrief(result,query)}</div><p>${esc(L(result.cause,result.cause))}</p>${alternatives.length?`<div class="assistant-match-grid">${alternatives.map(x=>`<button class="assistant-match" data-action="assistantChooseService" data-value="${esc(x.value)}"><b>${esc(loc(x.svc))}</b><small>${esc(loc(x.cat))}</small></button>`).join('')}</div>`:''}</details></div>`;
+ return `<div class="assistant-result assistant-simple">${result.urgent?`<span class="badge warn">${L('تنبيه: قد تكون عاجلة','Alert: may be urgent')}</span>`:`<span class="badge ok">${Math.round(result.confidence)}% ${L('تطابق','match')}</span>`}<div class="assistant-main-answer"><small>${esc(loc(result.cat))}</small><h3>${esc(loc(result.svc))}</h3><p>${L('المختص المناسب','Recommended specialist')}: <b>${esc(assistantRuleText(result,'role'))}</b></p></div>${plan}<div class="assistant-guidance">${icon(result.urgent?'bell':'shield')} ${esc(safety)}</div><div class="assistant-match-strip">${matches.slice(0,3).map(p=>`<span>${esc(p.name)} • ${providerDistanceLabel(p)||esc(p.wilayah||p.gov||L('عُمان','Oman'))}</span>`).join('')||`<span>${L('سنرسل الطلب للإدارة إذا لم يتوفر مزود مناسب.','Management will be notified if no suitable provider is available.')}</span>`}</div><div class="row-actions assistant-actions"><button class="pill-btn primary" data-action="assistantRequest" data-value="${esc(result.value)}">${L('ابدأ الطلب','Start request')}</button><button class="ghost-btn" data-action="assistantProviders" data-cat="${result.cat.id}" data-service="${result.svc.id}">${matches.length?L(`عرض أفضل ${matches.length}`,`Show best ${matches.length}`):L('عرض المزودين','Show providers')}</button></div><details class="assistant-details"><summary>${L('ما الذي يحتاجه المزود؟','What does the provider need?')}</summary><div class="provider-service-chips compact">${assistantRequestBrief(result,query)}</div><p>${esc(assistantRuleText(result,'cause'))}</p>${alternatives.length?`<div class="assistant-match-grid">${alternatives.map(x=>`<button class="assistant-match" data-action="assistantChooseService" data-value="${esc(x.value)}"><b>${esc(loc(x.svc))}</b><small>${esc(loc(x.cat))}</small></button>`).join('')}</div>`:''}</details></div>`;
 }
 function assistantSheet(initial=''){
  const examples=[L('المكيف ما يبرد','AC is not cooling'),L('تسريب ماء','Water leak'),L('الكهرباء تقطع','Power keeps cutting'),L('أريد نقل أثاث','I need furniture moving'),L('تنظيف كنب','Sofa cleaning'),L('مكيف السيارة حار','Car AC is warm'),L('صراصير في المطبخ','Cockroaches in the kitchen'),L('كمبيوتر لا يعمل','Computer not working')];
@@ -1507,7 +1586,24 @@ function ui(key, fallback){ return ensurePlatform()[key] ?? fallback; }
 function boolUi(key, fallback=true){ const v=ui(key,fallback); return v===true || v==='true' || v===1 || v==='1'; }
 function uiMode(){ return S.userUiMode || ui('uiMode','simple'); }
 function isAdvanced(){ return uiMode()==='advanced'; }
-const setLang = lang => { S.lang = lang; document.documentElement.lang=lang; document.documentElement.dir=dirFor(lang); save(); render(); };
+function localizedInstructionSnapshot(){
+ if(ONBOARDING_FLOW)return {kind:'onboarding'};
+ if(document.querySelector('.assistant-sheet'))return {kind:'assistant',value:document.getElementById('assistantQuery')?.value||''};
+ if(document.querySelector('.direct-request-guide'))return {kind:'direct-request',value:document.querySelector('.direct-request-guide [data-action="continueDirectRequestGuide"]')?.dataset.value||''};
+ if(document.querySelector('.provider-section-guide'))return {kind:'provider-guide',tab:S.providerTab||'home',providerId:S.currentProviderId||''};
+ return null;
+}
+function rebuildLocalizedInstructionSurface(snapshot){
+ if(!snapshot)return;
+ if(snapshot.kind==='onboarding'&&ONBOARDING_FLOW){
+  const slides=roleOnboardingSlides(ONBOARDING_FLOW.role);ONBOARDING_FLOW.slides=ONBOARDING_FLOW.identity==='first-open'?slides.slice(0,3):slides;ONBOARDING_FLOW.step=Math.min(ONBOARDING_FLOW.step,ONBOARDING_FLOW.slides.length-1);renderRoleOnboarding();return;
+ }
+ const root=document.getElementById('modalRoot');if(!root)return;root.innerHTML='';
+ if(snapshot.kind==='assistant')assistantSheet(snapshot.value);
+ else if(snapshot.kind==='direct-request')directRequestGuideSheet(snapshot.value);
+ else if(snapshot.kind==='provider-guide')showProviderSectionGuide(snapshot.tab,getProvider(snapshot.providerId));
+}
+const setLang = lang => {const instruction=localizedInstructionSnapshot();S.lang=lang;document.documentElement.lang=lang;document.documentElement.dir=dirFor(lang);save();render();rebuildLocalizedInstructionSurface(instruction);};
 const getCat = id => S.categories.find(c=>c.id===id);
 const getSvc = (catId, serviceId) => getCat(catId)?.services.find(s=>s.id===serviceId);
 const getProvider = id => S.providers.find(p=>p.id===id) || S.providerRequests.find(p=>p.id===id);
@@ -1729,6 +1825,12 @@ function niceError(err){
   ,provider_invitation_not_found:'دعوة المزود غير موجودة أو لم تعد صالحة.'
   ,provider_invitation_expired:'انتهت صلاحية دعوة المزود. اطلب رابطًا جديدًا من العميل.'
   ,invalid_provider_invitation_action:'إجراء دعوة المزود غير صحيح.'
+  ,provider_status_reason_required:'اكتب سبباً واضحاً لقرار الإيقاف أو الأرشفة.'
+  ,provider_must_be_archived_before_permanent_delete:'انقل المزود إلى الأرشيف قبل الحذف النهائي.'
+  ,provider_not_eligible_for_request:'هذا المزود لا يطابق الخدمة أو المنطقة أو شروط الاستقبال الحالية.'
+  ,request_not_open_for_dispatch:'لم يعد الطلب مفتوحاً لإرسال مزودين جدد.'
+  ,request_offers_paused:'استأنف استقبال العروض قبل إرسال الطلب إلى مزود.'
+  ,delete_reason_required:'اكتب سبب الحذف.'
   };
  const mapEn={
 name_phone_pin_required:'Complete the provider name, phone number, and access code.',invalid_provider_login:'The phone number or access code is incorrect.',provider_auth_required:'Sign in as a provider first.',pin_too_short:'The access code must contain at least 4 digits.',documents_required:'Attach the required verification document for management review.',company_name_required:'Enter the company or establishment name.',commercial_number_required:'Complete the commercial registration or licence number.',description_word_limit:'The description must contain 3 to 20 words.',service_required:'Choose the required service.',availability_required:'Choose available days and hours.',invalid_user_phone:'Enter a valid Omani phone number.',invalid_image_type:'This image type is not supported. Use JPG, PNG, or WebP.',invalid_document_type:'This document type is not supported. Use a PDF or clear image.',upload_too_large:'The file is too large. Choose a smaller file.',package_not_found:'This plan is currently unavailable.',provider_or_package_missing:'Choose a provider and plan before saving.',not_found:'The requested item was not found.',forbidden:'You do not have permission to perform this action.',permission_denied:'The current management session cannot perform this action. Sign in again with the owner account.',provider_owner_required:'This action belongs to the provider account owner, not the management account.',invalid_code:'The management code is incorrect.',invalid_user_pin:'The account access code is incorrect.',current_pin_incorrect:'The current code is incorrect.',valid_phone_required:'Enter a valid Omani phone number.',account_inactive:'This account is inactive. Contact management.',account_not_found:'No account was found for this number.',recovery_not_found:'The recovery request was not found or was already used.',recovery_expired:'The recovery code has expired. Request a new one.',invalid_recovery_code:'The verification code is incorrect.',request_already_accepted:'Another provider has already accepted this request.',request_not_assigned_to_provider:'This request is not assigned to your service or area.',accepted_request_cannot_be_edited:'A request cannot be edited after a provider is selected.',accepted_request_cannot_be_deleted:'A request cannot be deleted after a provider is selected. End the agreement through the supported flow first.',document_access_denied:'Verification documents are available only to authorised management.',request_failed:'Could not connect to the service. Try again.',storage_full:'Device storage is full. Remove old images or export a backup.',invalid_json:'This file is not valid.',provider_not_found:'The provider was not found.',pin_required:'Choose an access code with at least 4 digits.',pin_not_configured:'Set an access code first or use account recovery.',otp_or_new_pin_required:'Use the verification code or set a new access code.',otp_delivery_unavailable:'The verification code could not be sent. Check messaging settings or contact support.',otp_rate_limited:'Too many codes were requested. Wait briefly and try again.',otp_invalid:'The verification code is incorrect.',otp_expired:'The verification code has expired. Request a new one.',foundation_already_used:'The foundation period was already used for this account, number, or registration.',foundation_requires_verification:'The foundation period requires completed management verification.',business_plan_requires_company:'The Business plan is available only to company accounts.',payment_amount_mismatch:'The amount does not match the server price. Reload the plan.',subscription_not_found:'The subscription record was not found.',subscription_not_waiting_for_payment:'This subscription is not awaiting payment.',subscription_cannot_be_activated:'A cancelled or refunded subscription cannot be activated.',refunded_subscription_cannot_be_cancelled:'This refunded subscription is already closed.',invalid_payment_method:'Choose a valid collection method.',fixed_plan_catalog:'There are five production plans. Edit them without adding or deleting a plan.',payment_webhook_not_configured:'Automatic payment verification is not configured yet.',provider_must_be_stopped_before_delete:'Stop the provider account before deleting it.',contact_consent_not_allowed:'You cannot change contact consent for this request.',chat_consent_required:'The requester must allow chat for this request first.',team_member_limit_exceeded:'This plan has reached its team-member limit.',branch_limit_exceeded:'This plan has reached its branch limit.',provider_category_limit:'This account has reached the category limit for its current plan.',service_limit_exceeded:'This account has reached the service limit for its current plan.',area_limit_exceeded:'This account has reached the coverage-area limit for its current plan.',wilayah_limit_exceeded:'This account has reached the wilayah limit for its current plan.',completed_request_required:'A review can be submitted only after this provider completes the request.',request_already_reviewed:'This request has already been reviewed.',accepted_provider_required:'Choose a provider before completing or archiving the request.',request_owner_cannot_suggest:'You cannot recommend a provider for your own request. Open the matched results instead.',request_not_open:'This request is not accepting new recommendations.',suggestion_comment_required:'Choose a recommendation reason; you may also add a short note.',provider_not_eligible_for_request:'This provider is unavailable or does not match the requested service.',suggestion_already_exists:'This provider has already been recommended for this request.',suggestion_rate_limited:'You have reached the current recommendation limit. Try again later.',suggestion_action_denied:'You do not have permission to change this recommendation.',suggestion_not_active:'This recommendation is no longer active.',report_reason_required:'Enter a short report reason.',provider_no_longer_available:'This provider is currently unavailable. Choose another provider.',suggestion_not_found:'The requested recommendation was not found.',catalog_item_in_use:'This item is used by a request or provider profile. Pause it instead of deleting it.',catalog_name_required:'Complete the Arabic and English names.',invalid_catalog_id:'The item could not be saved because its identifier is invalid.',category_not_found:'The category was not found.',service_not_found:'The service was not found or is paused.',authentication_required:'Your session has ended. Sign in and try again.',refresh_session_required:'Verify this account again to continue.',session_expired:'Your session has expired. Open the account and enter its access code.',session_kind_mismatch:'The active account cannot perform this action.',campaign_name_required:'Complete the campaign title in Arabic and English.',campaign_date_required:'Set the campaign start and end dates.',campaign_start_required:'Set the campaign start time.',campaign_end_must_follow_start:'The campaign must end after it starts.',invalid_campaign_date:'Enter a valid campaign date and time.',invalid_campaign_audience:'Choose a valid campaign audience.',invalid_campaign_metric:'Choose an available campaign progress metric.',invalid_campaign_status:'Choose a valid campaign status.',invalid_campaign_target:'The campaign target must be a positive whole number.',invalid_reward_type:'Choose a valid reward type.',campaign_not_found:'The reward campaign was not found.',eligibility_not_found:'The reward eligibility record was not found.',location_name_required:'Complete the location name in Arabic and English.',invalid_location:'The governorate or wilayah could not be identified from this location.',invalid_location_id:'The location could not be saved because its identifier is invalid.',invalid_location_action:'The requested location action is not supported.',location_not_found:'The requested location was not found.',location_in_use:'This location is linked to accounts or requests. Pause it instead of deleting it.',governorate_not_found:'The governorate was not found.',wilayat_not_found:'The wilayah was not found.',governorate_already_exists:'This governorate already exists.',wilayat_already_exists:'This wilayah already exists within the governorate.',invalid_sort_order:'Enter a valid display order.'
@@ -1755,6 +1857,11 @@ name_phone_pin_required:'Complete the provider name, phone number, and access co
  mapEn.provider_invitation_not_found='The provider invitation was not found or is no longer valid.';
  mapEn.provider_invitation_expired='The provider invitation expired. Ask the customer for a new link.';
  mapEn.invalid_provider_invitation_action='The provider invitation action is invalid.';
+ mapEn.provider_status_reason_required='Enter a clear reason for suspending or archiving the provider.';
+ mapEn.provider_must_be_archived_before_permanent_delete='Archive the provider before permanent deletion.';
+ mapEn.request_not_open_for_dispatch='This request is no longer open for provider dispatch.';
+ mapEn.request_offers_paused='Resume offers before sending this request to a provider.';
+ mapEn.delete_reason_required='Enter the deletion reason.';
  const workflowMessages={
   invalid_service_value:['الخدمة المحددة غير صالحة.','The selected service is invalid.'],
   invalid_fulfillment_mode:['نمط تنفيذ الخدمة غير صالح.','The service fulfillment mode is invalid.'],
@@ -1884,8 +1991,10 @@ function activeAccountRefreshSignature(){
  const kind=activeAuthKind(),identity=authSubjectForKind(kind);
  const notifications=targetNotifications(kind,identity).map(n=>`${n.id}:${n.read?'1':'0'}:${n.requiresAction?'1':'0'}:${n.stateVersion||0}:${n.seenAt||''}:${n.readAt||''}:${n.acknowledgedAt||''}:${n.actedAt||''}:${n.dismissedAt||''}:${n.snoozedUntil||''}:${n.supersededAt||''}:${n.createdAt||n.created_at||''}`).join('|');
  const requests=(S.customerRequests||[]).map(r=>`${r.id}:${r.status}:${r.visibleState||''}:${r.pendingActionCount||0}:${r.nextAction?.type||r.nextAction?.action||''}:${r.nextAction?.stateVersion||r.nextAction?.version||0}:${r.updatedAt||r.updated_at||''}:${(r.messages||[]).length}:${(r.offers||[]).length}`).join('|');
- const providerRequests=kind==='admin'?(S.providerRequests||[]).map(r=>r.id).join('|'):'';
- return `${notifications}::${requests}::${providerRequests}`;
+ const providers=(S.providers||[]).map(provider=>`${provider.id}:${provider.status}:${provider.active!==false?'1':'0'}:${provider.verified?'1':'0'}:${provider.updatedAt||provider.updated_at||''}:${(provider.services||[]).length}:${Number(provider.rating||0)}:${Number(provider.completedJobs||0)}`).join('|');
+ const providerRequests=kind==='admin'?(S.providerRequests||[]).map(request=>`${request.id}:${request.status||''}:${request.updatedAt||request.updated_at||request.createdAt||''}`).join('|'):'';
+ const account=kind==='provider'?`${S.currentProviderId||''}:${S.providerEntitlements?.subscription?.state||''}`:kind==='user'?`${S.session?.userId||''}:${S.user?.name||''}:${S.user?.gov||''}:${S.user?.wilayah||''}`:kind;
+ return `${notifications}::${requests}::${providers}::${providerRequests}::${account}`;
 }
 function foregroundInteractionInProgress(){
  const surface=document.querySelector('#modalRoot .modal:not(.notification-center-sheet), #drawerRoot .drawer');
@@ -1896,19 +2005,53 @@ const ACCOUNT_SYNC_CHANNEL=typeof BroadcastChannel==='function'?new BroadcastCha
 function announceAccountDataChanged(){try{ACCOUNT_SYNC_CHANNEL?.postMessage({type:'refresh',at:Date.now()});localStorage.setItem('KHADAMATI_ACCOUNT_SYNC_PULSE',String(Date.now()));}catch(_){}}
 ACCOUNT_SYNC_CHANNEL?.addEventListener('message',event=>{if(event.data?.type==='refresh')refreshActiveAccountData();});
 window.addEventListener('storage',event=>{if(event.key==='KHADAMATI_ACCOUNT_SYNC_PULSE')refreshActiveAccountData();});
-async function refreshActiveAccountData(){
- const token=activeAuthToken();
- if(!token||document.hidden||!navigator.onLine||window.__khadamatiAccountRefreshBusy)return;
- window.__khadamatiAccountRefreshBusy=true;
- try{
-  const before=activeAccountRefreshSignature(),preserveForeground=foregroundInteractionInProgress();
-  mergeRemote(await api('/api/bootstrap',null,token,{silentLoading:true}));
-  const changed=before!==activeAccountRefreshSignature();
-  save();
-  if(changed&&!preserveForeground)render();else if(changed)syncVisibleNotificationCounters();
- }catch(err){if(String(err?.message||err)!=='request_failed')console.warn('Account refresh skipped');}
- finally{window.__khadamatiAccountRefreshBusy=false;queueMicrotask(renderActionPrompt);}
+function accountSyncContext(token=activeAuthToken()){
+ const kind=kindForAuthToken(token)||activeAuthKind(),subject=authSubjectForKind(kind);return {kind,subject,key:`${kind}:${subject}`};
 }
+function currentOpenChatSnapshot(){
+ const sheet=document.querySelector('.chat-sheet'),requestId=sheet?.dataset.requestId||'',role=sheet?.dataset.chatRole||'';
+ return requestId?{requestId,role,before:chatMessagesSignature(requestByAnyId(requestId)?.messages||[])}:null;
+}
+function refreshVisibleChatFromState(snapshot){
+ if(!snapshot||!document.querySelector(`.chat-sheet[data-request-id="${CSS.escape(String(snapshot.requestId))}"]`))return false;
+ const request=requestByAnyId(snapshot.requestId),thread=document.getElementById('chatThread');if(!request||!thread)return false;
+ const after=chatMessagesSignature(request.messages||[]);if(snapshot.before===after)return false;
+ thread.innerHTML=(request.messages||[]).map(message=>chatMessageHtml(message,snapshot.role)).join('')||`<div class="empty">${L('ابدأ المحادثة بتأكيد التفاصيل أو الموعد.','Start by confirming the details or appointment.')}</div>`;
+ bindVoicePlayers(thread);thread.scrollTop=thread.scrollHeight;return true;
+}
+async function coordinatedAccountSync({token=activeAuthToken(),reason='account',force=false}={}){
+ if(!token||document.hidden||!navigator.onLine)return {applied:false,skipped:true};
+ const context=accountSyncContext(token),now=Date.now();if(!context.kind||!context.subject)return {applied:false,skipped:true};
+ if(ACCOUNT_SYNC.inFlight){
+  if(ACCOUNT_SYNC.context===context.key)return ACCOUNT_SYNC.inFlight;
+  ACCOUNT_SYNC.controller?.abort();
+ }
+ if(!force&&ACCOUNT_SYNC.lastCompletedContext===context.key&&now-ACCOUNT_SYNC.lastCompletedAt<ACCOUNT_SYNC_MIN_INTERVAL_MS)return {applied:false,skipped:true};
+ const sequence=++ACCOUNT_SYNC.sequence,controller=new AbortController();ACCOUNT_SYNC.controller=controller;ACCOUNT_SYNC.context=context.key;
+ const task=(async()=>{
+  const before=activeAccountRefreshSignature(),preserveForeground=foregroundInteractionInProgress(),chatSnapshot=currentOpenChatSnapshot();
+  try{
+   const data=await api('/api/bootstrap',null,token,{silentLoading:true,signal:controller.signal});
+   const activeContext=accountSyncContext();
+   if(sequence!==ACCOUNT_SYNC.sequence||controller.signal.aborted||activeContext.key!==context.key)return {applied:false,stale:true};
+   mergeRemote(data);
+   const openChat=chatSnapshot&&document.querySelector('.chat-sheet')?requestByAnyId(chatSnapshot.requestId):null,readIds=openChat?conversationUnreadIds(openChat,chatSnapshot.role):[];
+   if(readIds.length)markNotificationIdsReadLocally(readIds);
+   const changed=before!==activeAccountRefreshSignature();
+   if(changed)save();
+   refreshVisibleChatFromState(chatSnapshot);
+    if(changed&&!preserveForeground)render();else if(changed)syncVisibleNotificationCounters();
+    if(changed)queueMicrotask(renderActionPrompt);
+   if(readIds.length){const readToken=chatSnapshot.role==='provider'?AUTH.providerToken:AUTH.userToken;if(readToken)void persistNotificationReads(readIds,readToken);}
+    ACCOUNT_SYNC.lastCompletedAt=Date.now();ACCOUNT_SYNC.lastCompletedContext=context.key;
+   return {applied:true,changed,reason};
+   }catch(error){
+    const code=String(error?.message||error);if(error?.name!=='AbortError'&&code!=='request_failed')console.warn('Account refresh skipped');return {applied:false,error:code};
+   }
+ })().finally(()=>{if(ACCOUNT_SYNC.sequence===sequence){ACCOUNT_SYNC.inFlight=null;ACCOUNT_SYNC.controller=null;ACCOUNT_SYNC.context='';}});
+ ACCOUNT_SYNC.inFlight=task;return task;
+}
+async function refreshActiveAccountData(options={}){return coordinatedAccountSync({reason:options.reason||'account',force:!!options.force});}
 function ensurePullRefreshIndicator(){
  let indicator=document.getElementById('pullRefreshIndicator');
  if(indicator)return indicator;
@@ -1923,7 +2066,7 @@ async function refreshFromPullGesture(){
  const indicator=ensurePullRefreshIndicator();window.__khadamatiPullRefreshing=true;
  indicator.classList.add('is-refreshing');indicator.querySelector('b').textContent=L('جارٍ التحديث','Refreshing');
  try{
-  if(serverApiAvailable()&&navigator.onLine){mergeRemote(await api('/api/bootstrap',null,activeAuthToken(),{silentLoading:true}));save();render();}
+  if(serverApiAvailable()&&navigator.onLine)await refreshActiveAccountData({reason:'pull',force:true});
   else render();
   toast(L('تم تحديث الصفحة','Page refreshed'));
  }catch(error){toast(L('تعذر التحديث الآن','Could not refresh now'));}
@@ -1952,7 +2095,7 @@ function initPullToRefresh(){
 }
 function startAccountAutoRefresh(){
  clearInterval(ACCOUNT_REFRESH_TIMER);
- ACCOUNT_REFRESH_TIMER=setInterval(refreshActiveAccountData,15000);
+ ACCOUNT_REFRESH_TIMER=setInterval(()=>refreshActiveAccountData({reason:'timer'}),ACCOUNT_REFRESH_INTERVAL_MS);
 }
 async function boot(){
  const started=performance.now();
@@ -2355,32 +2498,85 @@ async function conversationsSheet(){
  if(token&&serverApiAvailable()){try{mergeRemote(await api('/api/bootstrap',null,token,{silentLoading:true}));save();}catch(err){if(String(err?.message||err)!=='request_failed')showError(err);}}
  if((role==='provider'&&S.view==='provider'&&S.providerTab==='conversations')||(role==='user'&&S.view==='conversations'))render();
 }
+function markNotificationIdsReadLocally(ids=[]){
+ const markedAt=nowISO();let changed=false;
+ ids.forEach(id=>{const item=(S.notifications||[]).find(notification=>notification.id===id);if(item&&!item.read){item.read=true;item.readAt=item.readAt||markedAt;changed=true;}});
+ return changed;
+}
+function persistNotificationRead(id,token){
+ if(!id||!token)return Promise.resolve(false);
+ if(NOTIFICATION_READ_IN_FLIGHT.has(id))return NOTIFICATION_READ_IN_FLIGHT.get(id);
+ const task=(async()=>{
+  for(let attempt=0;attempt<3;attempt+=1){
+   try{
+    const result=await api('/api/notifications/action',{id,action:'read'},token,{silentLoading:true,skipQueue:false});
+    if(result.notification)S.notifications=mergeNotificationRecords([{...result.notification,_serverVerified:true}]);
+    return true;
+   }catch(error){
+    if(String(error?.message||error)!=='request_failed'||!navigator.onLine)return false;
+    await new Promise(resolve=>setTimeout(resolve,Math.min(2400,400*(2**attempt))));
+   }
+  }
+  return false;
+ })().finally(()=>NOTIFICATION_READ_IN_FLIGHT.delete(id));
+ NOTIFICATION_READ_IN_FLIGHT.set(id,task);return task;
+}
+async function persistNotificationReads(ids,token){return Promise.allSettled([...new Set(ids)].map(id=>persistNotificationRead(id,token)));}
 async function markConversationRead(requestId,role=activeAuthKind()){
  const request=requestByAnyId(requestId);if(!request)return;
  const ids=conversationUnreadIds(request,role),token=role==='provider'?AUTH.providerToken:AUTH.userToken;
- ids.forEach(id=>{const item=(S.notifications||[]).find(n=>n.id===id);if(item)item.read=true;});
- save();syncVisibleNotificationCounters();
- if(token&&ids.length)await Promise.allSettled(ids.map(id=>api('/api/notifications/action',{id,action:'read'},token,{silentLoading:true,skipQueue:true})));
+ if(markNotificationIdsReadLocally(ids))save();syncVisibleNotificationCounters();
+ if(token&&ids.length)await persistNotificationReads(ids,token);
 }
 function notificationExcerpt(value,max=86){const text=String(value||'').replace(/\s+/g,' ').trim();return text.length>max?`${text.slice(0,max-1)}…`:text;}
+const NOTIFICATION_TITLE_EN=Object.freeze({
+ 'بطاقتك متاحة للعملاء':['Your profile is visible to customers','Your profile is visible again and can receive matching requests.'],
+ 'تم إيقاف بطاقتك مؤقتاً':['Your profile was paused','Customers will not see your profile until you set your status to available.'],
+ 'تم اعتماد حسابك':['Your account was approved','Your account is ready and can receive matching service requests.'],
+ 'طلب ترقية باقة':['Plan upgrade request','A provider submitted a plan upgrade request for review.'],
+ 'تم تفعيل الاشتراك':['Subscription activated','The plan entitlements are now available for this account.'],
+ 'تم تمديد الاشتراك':['Subscription extended','The subscription end date was updated.'],
+ 'تم إيقاف الاشتراك':['Subscription suspended','Listing and new requests are paused until reactivation.'],
+ 'تحديث حالة الاشتراك':['Subscription status update','Open the subscription to review its current status.'],
+ 'طلب استعادة رمز':['Access-code recovery request','An account requested secure access-code recovery.'],
+ 'طلب خدمة جديد':['New service request','A new matching service request was created.'],
+ 'طلب طارئ جديد':['New urgent request','An urgent service request needs attention.'],
+ 'طلب مناسب لخدمتك':['Matching service request','A request matches your services and coverage area.'],
+ 'طلب طارئ مناسب لخدماتك':['Matching urgent request','An urgent request matches your services and coverage area.'],
+ 'تم قبول طلبك':['Your request was accepted','A provider accepted your service request.'],
+ 'تم إرسال طلبك':['Request sent','Your request was sent to matching providers.'],
+ 'تم استلام طلبك':['Request received','Your request is saved while a matching provider is found.'],
+ 'طلب خدمة غير متاحة':['Service currently unavailable','Review the request and its service area.'],
+ 'وصل عرض جديد لطلبك':['New offer received','Open your request to compare the latest offer.'],
+ 'اختار العميل عرضك':['Your offer was selected','Open the job to review the booking and next step.'],
+ 'اكتمل الطلب':['Request completed','Open the request to review its final status.'],
+ 'اكتملت المهمة':['Job completed','Open the job to review its final status.'],
+ 'بدأ تنفيذ الطلب':['Work started','The request moved to the in-progress stage.'],
+ 'انتهت صلاحية التحقق':['Verification expired','Update verification documents before receiving new requests.'],
+ 'انتهت صلاحية تحقق مزود':['Provider verification expired','Open the trust center to review the provider.'],
+ 'شركة تنتظر الموافقة':['Company awaiting approval','Open the application to review it.'],
+ 'مزود ينتظر الموافقة':['Provider awaiting approval','Open the application to review it.'],
+ 'ملف مزود يحتاج مراجعة':['Provider profile needs review','Open the provider profile to review missing or expired information.'],
+ 'مزود غير متاح منذ مدة':['Provider unavailable for an extended period','Open the provider profile to review availability.'],
+ 'خدمة مطلوبة دون مزود كافٍ':['Service needs more providers','Open unavailable requests to review the demand gap.'],
+ 'إعلانك في المجتمع أوشك على الانتهاء':['Community listing expiring soon','Open the listing to review or renew it.'],
+ 'انتهى إعلانك في المجتمع':['Community listing expired','Open the listing to review its status.'],
+ 'بحث بلا نتائج':['Search with no results','Review the search term and service catalog.']
+});
+const NOTIFICATION_ACTION_EN=Object.freeze({
+ 'إدارة الاشتراك':'Manage subscription','تجديد الباقة':'Renew plan','تحديث التحقق':'Update verification','عرض الاتفاق':'View agreement','عرض الترشيح':'View recommendation','عرض التفاصيل':'View details','عرض الطلب':'View request','عرض المحادثة':'View chat','فتح الاشتراك':'Open subscription','فتح الاشتراكات':'Open subscriptions','فتح الإعلان':'Open listing','فتح البلاغ':'Open report','فتح الحجز':'Open booking','فتح الحساب':'Open account','فتح الإعدادات':'Open settings','فتح الأداء':'Open performance','فتح التواريخ':'Open expiry dates','فتح الرسالة':'Open message','فتح الطلب':'Open request','فتح الطلبات':'Open requests','فتح الطلبات غير المتاحة':'Open unavailable requests','فتح العقود':'Open contracts','فتح المحادثة':'Open chat','فتح المزود':'Open provider','فتح المزودين':'Open providers','فتح المستخدم':'Open user','فتح الملف':'Open file','فتح المهمة':'Open job','فتح الشكاوى':'Open complaints','فتح الشكاوى والجودة':'Open complaints and quality','فتح حالة التحقق':'Open verification status','فتح مركز التحقق':'Open verification center','فتح مركز الثقة':'Open trust center','فتح ملف الشكوى':'Open complaint case','متابعة الحالة':'Track status','متابعة الشكوى':'Track complaint','متابعة الوصول':'Track access','مراجعة الاتفاق':'Review agreement','مراجعة الاسترجاع':'Review recovery','مراجعة الإعلان':'Review listing','مراجعة الإنجاز':'Review completion','مراجعة التجديد':'Review renewal','مراجعة التعديل':'Review change','مراجعة الحساب':'Review account','مراجعة الدليل':'Review evidence','مراجعة الطلب':'Review request','مقارنة العروض':'Compare offers'
+});
+const NOTIFICATION_ACTION_KIND_EN=Object.freeze({
+ booking_confirmed:['Booking confirmed','Open the booking to review its details.'],change_order_result:['Change request updated','Open the request to review the decision.'],compare_offers:['Offers ready to compare','Open the request and compare available offers.'],completion_auto_closed:['Request completed','The review window ended and the request was closed.'],open_booking:['Booking update','Open the booking to review the next step.'],review_change_order:['Change request needs review','Open the full comparison before deciding.'],review_completion:['Completion needs your review','Open the request to confirm completion or ask for help.'],work_started:['Work started','Open the request to follow progress.']
+});
 function localizedNotificationCopy(n){
  if(S.lang!=='en')return {title:n.title||'',message:n.message||'',actionText:n.actionText||''};
- const exact={
-  'بطاقتك متاحة للعملاء':['Your profile is visible to customers','Your profile is visible again and can receive matching requests.'],
-  'تم إيقاف بطاقتك مؤقتاً':['Your profile was paused','Customers will not see your profile until you set your status to available.'],
-  'تم اعتماد حسابك':['Your account was approved','Your account is ready. You can sign in and receive matching service requests.'],
-  'طلب ترقية باقة':['Plan upgrade request','A provider submitted a plan upgrade request for management review.'],
-  'تم تفعيل الاشتراك':['Subscription activated','The plan entitlements are now available for this account.'],
-  'تم تمديد الاشتراك':['Subscription extended','The subscription end date has been updated.'],
-  'تم إيقاف الاشتراك':['Subscription suspended','Listing and new requests are paused until reactivation.'],
-  'طلب استعادة رمز':['Access-code recovery request','An account requested secure access-code recovery.'],
-  'طلب خدمة جديد':['New service request','A new matching service request was created.'],
-  'تم قبول طلبك':['Your request was accepted','A provider accepted your service request.']
- };
- const pair=exact[String(n.title||'').trim()];
- const actionMap={'فتح الحساب':'Open account','فتح الاشتراك':'Open subscription','مراجعة الطلب':'Review request','فتح الطلب':'Open request','عرض الطلب':'View request','فتح الإعدادات':'Open settings','فتح المزود':'Open provider','فتح الاشتراكات':'Open subscriptions'};
- if(pair)return {title:pair[0],message:pair[1],actionText:actionMap[n.actionText]||n.actionText||''};
- return {title:n.title||'',message:n.message||'',actionText:actionMap[n.actionText]||n.actionText||''};
+ const rawTitle=String(n.title||'').trim(),rawMessage=String(n.message||'').trim(),rawAction=String(n.actionText||'').trim(),hasArabic=value=>/[\u0600-\u06ff]/.test(value),kindPair=NOTIFICATION_ACTION_KIND_EN[n.actionKind]||null,pair=NOTIFICATION_TITLE_EN[rawTitle]||kindPair;
+ const typeFallback={request:['Request update','Open the related request to review the latest details.'],provider:['Provider update','Open the provider record to review the latest details.'],provider_request:['Provider application update','Open the application to review the latest details.'],subscription:['Subscription update','Open the subscription to review its current status.'],expiry:['Expiry alert','Open the related record to review the expiry date.'],verification:['Verification update','Open the verification record to review its status.'],complaint:['Complaint update','Open the case to review the latest update.'],quality:['Quality update','Open the case to review the latest update.'],community:['Community update','Open the listing to review its status.'],security:['Security update','Open account security to review this update.'],advertisement:['Advertisement update','Open the advertisement to review its status.'],general:['Khadamati update','Open the app to review the latest update.']}[n.type]||['Khadamati update','Open the app to review the latest update.'];
+ let title=pair?.[0]||(!hasArabic(rawTitle)?rawTitle:typeFallback[0]),message=pair?.[1]||(!hasArabic(rawMessage)?rawMessage:typeFallback[1]),actionText=NOTIFICATION_ACTION_EN[rawAction]||(!hasArabic(rawAction)?rawAction:'Open');
+ if(!pair&&/قريب الانتهاء/.test(rawTitle)){title='Expiry approaching';message=typeFallback[1];}
+ else if(!pair&&/انتهت صلاحية/.test(rawTitle)){title='Item expired';message=typeFallback[1];}
+ return {title,message,actionText};
 }
 function syncVisibleNotificationCounters(){
  const target=S.admin?'admin':S.view==='provider'?'provider':'user',targetId=target==='provider'?S.currentProviderId:target==='user'?(S.session?.userId||''):'';
@@ -2401,8 +2597,9 @@ function syncVisibleNotificationCounters(){
 }
 function markNotificationPreviewRead(rawIds,summary){
  const ids=String(rawIds||'').split(',').filter(Boolean),changed=[];
- ids.forEach(notificationId=>{const item=(S.notifications||[]).find(notification=>notification.id===notificationId);if(item&&!item.read){item.read=true;changed.push(notificationId);}});
+ ids.forEach(notificationId=>{const item=(S.notifications||[]).find(notification=>notification.id===notificationId);if(item&&!item.read)changed.push(notificationId);});
  if(!changed.length)return;
+ markNotificationIdsReadLocally(changed);
  save();
  const disclosure=summary?.closest('.notification-disclosure');
  disclosure?.classList.remove('unread');
@@ -2410,7 +2607,7 @@ function markNotificationPreviewRead(rawIds,summary){
  summary?.querySelector('.notification-count')?.remove();
  syncVisibleNotificationCounters();
  const token=activeAuthToken();
- if(token)Promise.allSettled(changed.map(notificationId=>api('/api/notifications/action',{id:notificationId,action:'read'},token,{silentLoading:true,skipQueue:true})));
+ if(token)void persistNotificationReads(changed,token);
 }
 function notificationMayBeRemoved(notification){const expires=serverDate(notification?.expiresAt||notification?.expires_at).getTime();return !notification?.requiresAction||!!(notification.actedAt||notification.acted_at||notification.supersededAt||notification.superseded_at||(expires&&expires<=Date.now()));}
 function notificationCard(n,admin=false){
@@ -3477,9 +3674,11 @@ async function openNotificationChat(n){
  let request=requestByAnyId(requestId);
  if(!request&&activeAuthToken()){try{mergeRemote(await api('/api/bootstrap',null,activeAuthToken()));save();request=requestByAnyId(requestId);}catch(err){if(String(err?.message||err)!=='request_failed'){showError(err);return;}}}
  if(!request){toast(L('لم تعد هذه المحادثة متاحة على هذا الجهاز.','This chat is no longer available on this device.'));return;}
- notificationIds(n).forEach(id=>{const item=(S.notifications||[]).find(x=>x.id===id);if(item)item.read=true;});n.read=true;
+ const readIds=new Set(notificationIds(n));
  const target=n.target==='provider'?'provider':'user',targetId=target==='provider'?(n.targetId||S.currentProviderId):(S.session?.userId||n.targetId||'');
- (S.notifications||[]).forEach(item=>{if(notificationIsChat(item)&&notificationTargetMatch(item,target,targetId)){const itemRequest=notificationChatRequestId(item);if(itemRequest===request.id||itemRequest===request.serverId)item.read=true;}});
+ (S.notifications||[]).forEach(item=>{if(notificationIsChat(item)&&notificationTargetMatch(item,target,targetId)){const itemRequest=notificationChatRequestId(item);if(itemRequest===request.id||itemRequest===request.serverId)readIds.add(item.id);}});
+ markNotificationIdsReadLocally([...readIds]);n.read=true;n.readAt=n.readAt||nowISO();
+ const readToken=target==='provider'?AUTH.providerToken:AUTH.userToken;if(readToken&&readIds.size)void persistNotificationReads([...readIds],readToken);
  closeModal();
  if(target==='provider'){if(n.targetId&&getProvider(n.targetId))S.currentProviderId=n.targetId;S.view='provider';S.providerTab=request.acceptedProviderId===S.currentProviderId?'tasks':'leads';}else S.view='tasks';
  save();render();setTimeout(()=>openRequestChat(request.id,target),80);
@@ -3525,7 +3724,7 @@ function chatRequestSummarySheet(requestId,role=''){
  const resolvedRole=['provider','user'].includes(role)?role:(S.view==='provider'?'provider':'user');
  openModal(`<div class="modal sheet"><div class="modal-head"><div class="modal-title">${L('ملخص الطلب','Request summary')}</div><button class="close-btn" data-action="closeModalSoft">×</button></div><div class="modal-body"><div class="preview-grid"><div><small>${L('الخدمة','Service')}</small><b>${esc(request.serviceName)}</b></div><div><small>${L('الحالة','Status')}</small><b>${requestLabel(request.status)}</b></div><div><small>${L('الموقع','Location')}</small><b>${esc([request.gov,request.wilayah].filter(Boolean).join('، '))}</b></div><div><small>${L('الموعد','Appointment')}</small><b>${esc(requestScheduleText(request))}</b></div></div>${requestAgreementHtml(request,resolvedRole)}${requestServiceAssetHtml(request)}${request.note?`<p class="muted">${esc(request.note)}</p>`:''}</div></div>`,{stack:true});
 }
-function stopRequestChatPolling(){clearInterval(window.__khadamatiChatPoll);window.__khadamatiChatPoll=null;window.__khadamatiChatPollBusy=false;}
+function stopRequestChatPolling(){clearInterval(window.__khadamatiChatPoll);window.__khadamatiChatPoll=null;}
 function chatMessagesSignature(messages=[]){return messages.map(message=>`${message.id||''}:${message.createdAt||''}:${message.text||''}:${message.image?'i':''}:${message.audio?'a':''}:${message.location?.lat??''}:${message.location?.lng??''}`).join('|');}
 async function shareChatLocation(requestId){
  const request=requestByAnyId(requestId),role=document.querySelector('.chat-sheet')?.dataset.chatRole||(S.view==='provider'?'provider':'user');if(!request)return;
@@ -3544,25 +3743,11 @@ async function shareChatLocation(requestId){
  finally{if(button?.isConnected){button.disabled=false;button.innerHTML=previous;}}
 }
 async function refreshOpenRequestChat(requestId,role){
-  const token=role==='provider'?AUTH.providerToken:AUTH.userToken;
-  if(!token||document.hidden||window.__khadamatiChatPollBusy||!document.querySelector('.chat-sheet'))return;
-  window.__khadamatiChatPollBusy=true;
-  try{
-    const before=chatMessagesSignature(requestByAnyId(requestId)?.messages||[]);
-    mergeRemote(await api('/api/bootstrap',null,token));
-    const request=requestByAnyId(requestId),after=chatMessagesSignature(request?.messages||[]),thread=document.getElementById('chatThread');
-    if(request&&thread&&before!==after){
-      thread.innerHTML=(request.messages||[]).map(message=>chatMessageHtml(message,role)).join('')||`<div class="empty">${L('ابدأ المحادثة بتأكيد التفاصيل أو الموعد.','Start by confirming the details or appointment.')}</div>`;
-      bindVoicePlayers(thread);
-      thread.scrollTop=thread.scrollHeight;
-      const target=role==='provider'?'provider':'user',targetId=role==='provider'?S.currentProviderId:(S.session?.userId||'');
-      (S.notifications||[]).forEach(item=>{if(notificationIsChat(item)&&notificationTargetMatch(item,target,targetId)&&[request.id,request.serverId].includes(notificationChatRequestId(item)))item.read=true;});
-      save();
-    }
-  }catch(err){if(String(err?.message||err)!=='request_failed')console.warn('Chat refresh failed');}
-  finally{window.__khadamatiChatPollBusy=false;}
+ const token=role==='provider'?AUTH.providerToken:AUTH.userToken,sheet=document.querySelector('.chat-sheet');
+ if(!token||document.hidden||!sheet||sheet.dataset.requestId!==String(requestId))return;
+ return coordinatedAccountSync({token,reason:'chat'});
 }
-function startRequestChatPolling(requestId,role){stopRequestChatPolling();if(!(role==='provider'?AUTH.providerToken:AUTH.userToken))return;window.__khadamatiChatPoll=setInterval(()=>refreshOpenRequestChat(requestId,role),5000);}
+function startRequestChatPolling(requestId,role){stopRequestChatPolling();if(!(role==='provider'?AUTH.providerToken:AUTH.userToken))return;window.__khadamatiChatPoll=setInterval(()=>refreshOpenRequestChat(requestId,role),CHAT_REFRESH_INTERVAL_MS);}
 function replaceLocalRequest(updated){
  if(!updated?.id)return null;const normalized=normalizeRequestExtras(updated);S.customerRequests=(S.customerRequests||[]).map(r=>r.id===normalized.id||r.serverId===normalized.id?{...r,...normalized}:r);return normalized;
 }
@@ -3872,10 +4057,26 @@ function renderUserTasks(){
  const all=ownCustomerRequests().sort((a,b)=>String(b.updatedAt||b.createdAt||'').localeCompare(String(a.updatedAt||a.createdAt||''))),active=all.filter(r=>!r.archived&&!['archived','cancelled','closed','deleted'].includes(r.status)),history=all.filter(r=>r.archived||['archived','cancelled','closed'].includes(r.status)),waiting=active.filter(r=>['matching','viewed'].includes(r.status)).length,working=active.filter(r=>['accepted','appointmentConfirmed','inProgress'].includes(r.status)).length,review=active.filter(r=>['awaitingConfirmation','qualityReview'].includes(r.status)).length;
  return `<section class="page-intro task-page-intro task-page-intro-compact"><span>${icon('briefcase')}</span><div><small>${L('طلباتك','Your requests')}</small><h1>${L('متابعة الطلبات','Track requests')}</h1></div><div class="task-page-actions"><button class="pill-btn primary" data-action="quickRequestForm">${icon('plus')} ${L('طلب جديد','New request')}</button></div></section><div class="task-overview task-overview-compact"><div><small>${L('بانتظار عرض','Waiting')}</small><b>${waiting}</b></div><div><small>${L('قيد العمل','In progress')}</small><b>${working}</b></div><div><small>${L('للمراجعة','Review')}</small><b>${review}</b></div></div><section class="task-list-section"><div class="section-head task-list-head"><div><h2>${L('الطلبات الحالية','Current requests')}</h2><p>${active.length?L(`${active.length} نشطة`,`${active.length} active`):L('لا يوجد طلب نشط','No active request')}</p></div></div><div class="task-page-list request-disclosure-list">${active.length?active.map(r=>requestDisclosure(r,true)).join(''):`<div class="empty task-empty compact-task-empty">${icon('briefcase')}<b>${L('لا يوجد طلب حالي','No current request')}</b><button class="pill-btn primary" data-action="quickRequestForm">${L('ابدأ طلباً','Start request')}</button></div>`}</div></section>${history.length?`<details class="task-history-disclosure"><summary>${icon('clock')}<span><b>${L('السجل','History')}</b><small>${history.length} ${L('طلباً','requests')}</small></span><i>⌄</i></summary><div class="task-page-list request-disclosure-list">${history.slice(0,12).map(r=>requestDisclosure(r,true)).join('')}</div></details>`:''}`;
 }
+function requestTaskDetailHtml(request){
+ const offers=requestOffers(request),accepted=getProvider(request.acceptedProviderId),consent=requestContactConsent(request),order=request.workOrderSummary||request.workOrder||null,selectedOffer=offers.find(offer=>offer.providerId===request.acceptedProviderId),price=Number(order?workOrderValue(order,'priceAmount'):selectedOffer?.price||0),place=[request.wilayah,request.gov].filter(Boolean).join('، ')||L('غير محدد','Not specified'),date=requestDateTimeLabel(request)||L('غير محدد','Not specified'),note=String(request.note||''),images=(request.images||[]).slice(0,3),locked=['accepted','appointmentConfirmed','inProgress','awaitingConfirmation','qualityReview','closed','archived','cancelled'].includes(request.status),canInvite=!locked&&!accepted;
+ return `<section class="request-detail-center status-${esc(request.status||'matching')}">
+  <header class="request-detail-hero"><div><small>${L('الطلب','Request')} #${esc(String(request.id||'').slice(-8))}</small><h2>${esc(request.serviceName||L('طلب خدمة','Service request'))}</h2></div><span class="request-status">${requestLabel(request.status)}</span></header>
+  ${requestVisibleSteps(request)}
+  ${requestNextActionHtml(request,'user')}
+  <div class="request-detail-facts"><span>${icon('map')}<small>${L('الموقع','Location')}</small><b>${esc(place)}</b></span><span>${icon('clock')}<small>${L('الموعد','Appointment')}</small><b>${esc(date)}</b></span><span>${icon('wallet')}<small>${L('السعر','Price')}</small><b>${price?`${money(price)} ${L('ر.ع','OMR')}`:L('حسب العرض','Per offer')}</b></span></div>
+  ${accepted?`<button class="accepted-provider request-detail-provider" data-action="providerDetails" data-id="${esc(accepted.id)}">${avatarHtml(accepted,'avatar')}<span><small>${L('المزود المختار','Selected provider')}</small><b>${esc(accepted.name)}</b><em>${esc(accepted.wilayah||accepted.gov||'')} • ⭐ ${Number(accepted.rating||0).toFixed(1)}</em></span><i>${dirFor(S.lang)==='rtl'?'←':'→'}</i></button>`:''}
+  ${requestCompletionHtml(request,'user')}
+  ${requestWorkOrderHtml(request,'user')}
+  <details class="request-detail-section" ${offers.length&&!accepted?'open':''}><summary>${icon('wallet')}<span><b>${L('العروض والمزود','Offers and provider')}</b><small>${accepted?L('تم اختيار المزود','Provider selected'):offers.length?L(`${offers.length} عروض وصلت`,`${offers.length} offers received`):L('لم يصل عرض بعد','No offer yet')}</small></span><i>⌄</i></summary><div>${offers.length&&!accepted?`<button class="pill-btn primary full-action" data-action="compareRequestOffers" data-id="${esc(request.id)}">${icon('wallet')} ${L('مقارنة العروض','Compare offers')}</button>`:''}${accepted?`<div class="contact-privacy-note">${icon('check')} ${L('تم اعتماد العرض المختار، ويمكنك متابعة التنفيذ من أعلى الصفحة.','The selected offer is confirmed. Continue from the next action above.')}</div>`:''}${canInvite?`<button class="known-provider-invite" data-action="inviteKnownProvider" data-id="${esc(request.id)}"><span>${icon('user')}</span><div><b>${L('ابحث عن مزود تعرفه','Find a provider you know')}</b><small>${L('ابحث داخل خدماتي أولاً، أو أدخل رقم هاتفه للدعوة.','Search Khadamati first, or enter a phone number to invite them.')}</small></div><i>${dirFor(S.lang)==='rtl'?'←':'→'}</i></button>`:''}</div></details>
+  <details class="request-detail-section"><summary>${icon('file')}<span><b>${L('وصف الخدمة والمرفقات','Description and attachments')}</b><small>${L('التفاصيل التي أرسلتها مع الطلب','Details submitted with the request')}</small></span><i>⌄</i></summary><div>${requestServiceAssetHtml(request)}${requestDateTimeMeta(request)}${note?`<p class="request-detail-note">${esc(note)}</p>`:''}${images.length?`<div class="request-images">${images.map(src=>`<button data-action="openMediaPreview" data-src="${esc(src)}"><img src="${esc(src)}" alt="${L('صورة الطلب','Request image')}"></button>`).join('')}</div>`:''}</div></details>
+  <details class="request-detail-section"><summary>${icon('clock')}<span><b>${L('سجل الطلب','Request timeline')}</b><small>${L('آخر التحديثات بالترتيب','Updates in order')}</small></span><i>⌄</i></summary><div>${requestTimelineHtml(request)}</div></details>
+  <details class="request-detail-section request-detail-options"><summary>${icon('more')}<span><b>${L('خيارات أخرى','More options')}</b><small>${L('التعديل أو الإلغاء أو التواصل','Edit, cancel, or contact')}</small></span><i>⌄</i></summary><div class="row-actions request-card-actions">${!locked?`<button class="ghost-btn" data-action="editRequest" data-id="${esc(request.id)}">${tr('edit')}</button><button class="ghost-btn danger-outline" data-action="cancelRequest" data-id="${esc(request.id)}">${L('إلغاء الطلب','Cancel request')}</button>`:''}${accepted?`<button class="ghost-btn" data-action="openRequestChat" data-id="${esc(request.id)}">${icon('chat')} ${L('المحادثة','Chat')}</button><button class="ghost-btn" data-action="manageRequestContact" data-id="${esc(request.id)}">${icon('shield')} ${L('التواصل والخصوصية','Contact & privacy')}</button>${consent.whatsapp?`<button class="ghost-btn" data-action="requestWhatsapp" data-id="${esc(request.id)}">${icon('chat')} ${L('واتساب','WhatsApp')}</button>`:''}${consent.call?`<button class="ghost-btn" data-action="requestCall" data-id="${esc(request.id)}">${icon('phone')} ${L('اتصال','Call')}</button>`:''}<button class="ghost-btn" data-action="addRequestCalendar" data-id="${esc(request.id)}">${icon('clock')} ${L('إضافة الموعد للتقويم','Add appointment to calendar')}</button>${!requestUsesBookingV2(request)?`<button class="ghost-btn" data-action="editRequestAgreement" data-id="${esc(request.id)}">${icon('edit')} ${L('مراجعة اتفاق التنفيذ','Review work agreement')}</button>`:''}`:''}</div></details>
+ </section>`;
+}
 function requestTaskDetailsSheet(requestId,role=activeAuthKind()){
  const request=requestByAnyId(requestId);if(!request)return toast(L('لم يعد هذا الطلب متاحاً.','This request is no longer available.'));
  if(role==='provider'){S.providerTab='tasks';save();render();setTimeout(()=>document.querySelector(`[data-action="providerOpenRequest"][data-id="${CSS.escape(String(request.id))}"]`)?.click(),70);return;}
- openModal(`<div class="modal sheet task-detail-sheet"><div class="modal-head"><div class="modal-title">${icon('briefcase')} ${L('تفاصيل المهمة','Task details')}</div><button class="close-btn" data-action="closeModal">${icon('x')}</button></div><div class="modal-body">${requestCard(request,false)}</div></div>`);
+ openModal(`<div class="modal sheet task-detail-sheet"><div class="modal-head"><div class="modal-title">${icon('briefcase')} ${L('مركز الطلب','Request center')}</div><button class="close-btn" data-action="closeModal">${icon('x')}</button></div><div class="modal-body">${requestTaskDetailHtml(request)}</div></div>`);
 }
 function rewardCampaignName(c){return L(c?.nameAr||'',c?.nameEn||c?.nameAr||'');}
 function rewardCampaignDescription(c){return L(c?.descriptionAr||'',c?.descriptionEn||c?.descriptionAr||'');}
@@ -3926,7 +4127,12 @@ function loyaltyCard(){
 }
 function inviteKnownProviderSheet(requestId){
  const request=requestByAnyId(requestId);if(!request)return toast(L('لم يعد الطلب متاحًا.','This request is no longer available.'));
- openModal(`<div class="modal sheet"><div class="modal-head"><div class="modal-title">${icon('user')} ${L('دعوة مزود تعرفه','Invite a provider you know')}</div><button class="close-btn" data-action="closeModal">×</button></div><div class="modal-body"><div class="trust-callout"><b>${esc(request.serviceName||L('طلب خدمة','Service request'))}</b><span>${L('لن نكشف رقمك أو موقعك الدقيق. يجب أن يسجل المزود ويجتاز مراجعة الإدارة ويطابق هذه الخدمة.','Your phone and exact location stay private. The provider must register, pass review, and match this service.')}</span></div><div class="field"><label>${L('رقم هاتف المزود','Provider phone number')}</label><input class="input ltr" id="knownProviderPhone" type="tel" inputmode="tel" autocomplete="tel" placeholder="91234567" dir="ltr"></div><button class="pill-btn primary" data-action="sendKnownProviderInvitation" data-id="${esc(request.id)}">${icon('chat')} ${L('إنشاء رابط الدعوة','Create invitation link')}</button></div></div>`);
+ openModal(`<div class="modal sheet known-provider-sheet"><div class="modal-head"><div class="modal-title">${icon('user')} ${L('اختر مزوداً تعرفه','Choose a provider you know')}</div><button class="close-btn" data-action="closeModal">×</button></div><div class="modal-body"><div class="trust-callout"><b>${esc(request.serviceName||L('طلب خدمة','Service request'))}</b><span>${L('ابحث داخل خدماتي أولاً. لن نرسل الطلب إلا لمزود نشط ومؤهل للخدمة.','Search Khadamati first. The request is sent only to an active provider eligible for the service.')}</span></div><div class="known-provider-search"><input class="input" id="knownProviderQuery" maxlength="80" placeholder="${L('اسم المزود أو الولاية','Provider name or Wilayat')}"><button class="ghost-btn" data-action="filterKnownProviders" data-id="${esc(request.id)}">${icon('search')} ${L('بحث','Search')}</button></div><div id="knownProviderResults">${knownProviderResultsHtml(request,'')}</div><div class="known-provider-divider"><span>${L('أو أدخل رقمه','Or enter their number')}</span></div><div class="field"><label>${L('رقم هاتف المزود','Provider phone number')}</label><input class="input ltr" id="knownProviderPhone" type="tel" inputmode="tel" autocomplete="tel" placeholder="91234567" dir="ltr"></div><button class="pill-btn primary full-action" data-action="sendKnownProviderInvitation" data-id="${esc(request.id)}">${icon('chat')} ${L('إرسال الطلب أو إنشاء دعوة','Send request or create invitation')}</button></div></div>`);
+}
+function knownProviderResultsHtml(request,query=''){
+ const q=normalizeSearchText(query),items=(S.providers||[]).map(provider=>({provider,score:providerMatchScore(request,provider)})).filter(({provider})=>provider.active!==false&&provider.status!=='unavailable'&&(!q||normalizeSearchText([provider.name,provider.companyName,provider.gov,provider.wilayah].filter(Boolean).join(' ')).includes(q))).sort((a,b)=>b.score-a.score||Number(b.provider.rating||0)-Number(a.provider.rating||0)).slice(0,6);
+ if(!items.length)return `<div class="empty compact-empty">${L('لا يوجد مزود مسجل مطابق لهذا البحث. يمكنك استخدام رقم الهاتف أدناه.','No registered provider matches this search. You can use the phone field below.')}</div>`;
+ return `<div class="known-provider-results">${items.map(({provider,score})=>{const eligible=score>0;return `<button class="known-provider-result ${eligible?'eligible':'ineligible'}" ${eligible?`data-action="selectKnownProvider" data-phone="${esc(provider.phone||'')}"`:'disabled'}><span>${avatarHtml(provider,'avatar')}</span><div><b>${esc(provider.name)}</b><small>${esc([provider.wilayah,provider.gov].filter(Boolean).join('، '))}</small></div><em>${eligible?L('مناسب','Eligible'):L('الخدمة غير مطابقة','Service mismatch')}</em></button>`;}).join('')}</div>`;
 }
 function showKnownProviderInvitation(result){
  const invitation=result.invitation||{};
@@ -4661,7 +4867,7 @@ function filterAdminNotificationItems(filter='all'){
 function renderAdminLegacy(){ scanExpiryNotifications();scanOperationalNotifications(); const tabs=['overview','notifications','leads','providers','companies','unavailable','subscriptions','expiries','ads','audience','credentials','assistant','providerRequests','complaints','categoryAdmin','finance','reports','quality','settings','backup']; const unread=unreadNotifications('admin'); return `<div class="topbar"><div class="container topbar-inner"><button class="brand" style="border:0;background:transparent">${logoMark()}<span>${tr('adminPanel')}</span></button><div class="top-actions"><button class="icon-btn" data-action="toggleLang">${icon('globe')}</button><button class="round-action app-back" data-action="adminLogout" aria-label="${tr('back')}">${dirFor(S.lang)==='rtl'?'→':'←'}</button></div></div></div><main class="container admin-shell"><div class="side-layout"><aside class="side-nav">${tabs.map(t=>`<button data-action="adminTab" data-tab="${t}" class="${S.adminTab===t?'active':''}">${adminIcon(t)} ${adminLabel(t)}${t==='notifications'&&unread?` <span class="badge off">${unread}</span>`:''}</button>`).join('')}</aside><section>${renderAdminTab()}</section></div></main>`; }
 function renderAdmin(){
  scanExpiryNotifications();scanOperationalNotifications();
- const primary=['overview','notifications','leads','trust','providers','companies'],all=['overview','notifications','leads','trust','providers','companies','platform','community','unavailable','subscriptions','campaigns','expiries','ads','audience','credentials','providerRequests','complaints','categoryAdmin','locations','finance','reports','quality','settings','backup'],unread=unreadNotifications('admin'),secondary=all.filter(t=>!primary.includes(t));
+ const primary=['overview','leads','providers','notifications'],all=['overview','leads','providers','notifications','trust','companies','platform','community','unavailable','subscriptions','campaigns','expiries','ads','audience','credentials','providerRequests','complaints','categoryAdmin','locations','finance','reports','quality','settings','backup'],unread=unreadNotifications('admin'),secondary=all.filter(t=>!primary.includes(t));
  const nav=all.map(t=>{const count=adminSectionUnread(t);return `<button data-action="adminTab" data-tab="${t}" class="admin-nav-tab ${secondary.includes(t)?'admin-nav-secondary':''} ${S.adminTab===t?'active':''}">${adminIcon(t)} <span>${adminLabel(t)}</span>${count?`<span class="badge off">${count>99?'99+':count}</span>`:''}</button>`;}).join(''),secondaryUnread=secondary.reduce((sum,tab)=>sum+adminSectionUnread(tab),0);
  return `<div class="topbar admin-topbar"><div class="container topbar-inner"><button class="brand">${logoMark()}<span>${tr('adminPanel')}</span></button><div class="top-actions"><button class="icon-btn" data-action="openAdminNotifications" title="${L('إشعارات الإدارة','Management notifications')}" aria-label="${L('إشعارات الإدارة','Management notifications')}">${icon('bell')}${unread?`<span class="notification-badge">${unread>99?'99+':unread}</span>`:''}</button><button class="icon-btn" data-action="toggleLang">${icon('globe')}</button><button class="round-action app-back" data-action="adminLogout" aria-label="${tr('back')}">${dirFor(S.lang)==='rtl'?'→':'←'}</button></div></div></div><main class="container admin-shell"><div class="side-layout"><aside class="side-nav admin-adaptive-nav">${nav}<button class="admin-nav-more ${secondary.includes(S.adminTab)?'active':''}" data-action="openAdminTools">${icon('more')} <span>${L('المزيد','More')}</span>${secondaryUnread?`<span class="badge off">${secondaryUnread>99?'99+':secondaryUnread}</span>`:''}</button></aside><section class="admin-workspace">${renderAdminTab()}</section></div></main>`;
 }
@@ -4837,10 +5043,14 @@ function adminCustomerRequestSheet(requestId){
  const agreementPanel=adminRequestAgreementHtml(r),commands=document.querySelector('.admin-request-sheet .admin-request-command-grid');
  if(agreementPanel&&commands)commands.insertAdjacentHTML('beforebegin',agreementPanel);
 }
-function adminRequestMatchesSheet(requestId){
+function matchingDiagnosticLabel(reason){return ({service_mismatch:L('الخدمة غير مطابقة','Service mismatch'),area_mismatch:L('المنطقة خارج التغطية','Area not covered'),provider_inactive:L('الحساب غير نشط','Inactive account'),provider_unverified:L('الحساب غير معتمد','Unverified account'),provider_unavailable:L('المزود غير متاح','Provider unavailable'),provider_suspended:L('المزود موقوف','Provider suspended'),provider_archived:L('المزود مؤرشف','Provider archived'),listing_disabled:L('الظهور متوقف','Listing disabled'),requests_disabled:L('استقبال الطلبات متوقف','Requests disabled'),subscription_inactive:L('الاشتراك لا يسمح','Subscription unavailable'),daily_capacity_reached:L('وصل إلى سعة اليوم','Daily capacity reached'),interaction_blocked:L('التواصل محظور','Interaction blocked'),provider_previously_declined:L('سبق أن رفض الطلب','Previously declined')})[reason]||String(reason||'');}
+async function adminRequestMatchesSheet(requestId){
  const r=requestByAnyId(requestId);if(!r)return;
- const ids=[...(r.matchingProviderIds||[]),...smartProviderSuggestions(r).map(provider=>provider.id)],providers=[...new Set(ids)].map(getProvider).filter(Boolean);
- openModal(`<div class="modal sheet"><div class="modal-head"><div class="modal-title">${icon('search')} ${L('المزودون المطابقون','Matching providers')} <span class="badge">${providers.length}</span></div><button class="close-btn" data-action="closeModalSoft">${icon('x')}</button></div><div class="modal-body"><div class="list admin-match-list">${providers.map(provider=>`<div class="list-item"><div>${avatarHtml(provider,'avatar')}<span><b>${esc(provider.name)}</b><small>${esc(matchedProviderServiceNames(provider,{cat:String(r.serviceValue||'').split('|')[0],service:String(r.serviceValue||'').split('|')[1]})[0]||'')} • ${esc(provider.wilayah||provider.gov||'')}</small></span></div><button class="ghost-btn tiny" data-action="adminEditProvider" data-id="${provider.id}">${L('الحساب','Account')}</button></div>`).join('')||`<div class="empty">${L('لا يوجد مزود مطابق حالياً.','No matching provider right now.')}</div>`}</div></div></div>`,{stack:true});
+ const scored=(S.providers||[]).filter(provider=>providerLifecycleState(provider)==='active').map(provider=>({provider,score:providerMatchScore(r,provider)})).filter(item=>item.score>0||(r.matchingProviderIds||[]).includes(item.provider.id)).sort((a,b)=>b.score-a.score).slice(0,30),ids=new Set([...(r.matchingProviderIds||[]),...smartProviderSuggestions(r).map(provider=>provider.id)]),rows=scored.sort((a,b)=>Number(ids.has(b.provider.id))-Number(ids.has(a.provider.id))||b.score-a.score);
+ let diagnostics=null;
+ try{if(AUTH.adminToken)diagnostics=(await api('/api/admin/request-provider-dispatch',{action:'diagnose',requestId},AUTH.adminToken,{silentLoading:true,skipQueue:true})).diagnostics||null;}catch(error){if(String(error?.message||error)!=='request_failed')showError(error);}
+ const reasonCounts=diagnostics?.reasonCounts||diagnostics?.reasons||{},reasonHtml=Object.entries(reasonCounts).filter(([,count])=>Number(count)>0).slice(0,5).map(([reason,count])=>`<span>${esc(matchingDiagnosticLabel(reason))}<b>${Number(count)}</b></span>`).join('');
+ openModal(`<div class="modal sheet admin-dispatch-sheet"><div class="modal-head"><div><small>${L('اختيار إداري دون قبول نيابة عن العميل','Management dispatch without accepting for the customer')}</small><div class="modal-title">${icon('search')} ${L('إرسال الطلب إلى مزود مناسب','Send request to a suitable provider')}</div></div><button class="close-btn" data-action="closeModalSoft">${icon('x')}</button></div><div class="modal-body">${reasonHtml?`<div class="admin-match-diagnostics">${reasonHtml}</div>`:''}<div class="contact-privacy-note">${icon('shield')} ${L('الخادم يعيد التحقق من الخدمة والمنطقة والحالة والسعة قبل الإرسال. لا يتم تعيين المزود ولا قبول عرضه تلقائياً.','The server rechecks service, area, status, and capacity before dispatch. It never assigns the provider or accepts an offer automatically.')}</div><div class="list admin-match-list">${rows.map(({provider,score})=>`<article class="list-item admin-match-row"><div>${avatarHtml(provider,'avatar')}<span><b>${esc(provider.name)}</b><small>${esc(matchedProviderServiceNames(provider,{cat:String(r.serviceValue||'').split('|')[0],service:String(r.serviceValue||'').split('|')[1]})[0]||L('خدمة ذات صلة','Related service'))} • ${esc(provider.wilayah||provider.gov||'')}</small><em>${Math.round(score)} ${L('نقطة مطابقة أولية','initial match score')}</em></span></div><div class="row-actions"><button class="ghost-btn tiny" data-action="adminEditProvider" data-id="${esc(provider.id)}">${L('الحساب','Account')}</button><button class="pill-btn primary tiny" data-action="adminDispatchRequestProvider" data-id="${esc(r.id)}" data-provider="${esc(provider.id)}">${L('تحقق وأرسل','Verify & send')}</button></div></article>`).join('')||`<div class="empty">${icon('search')}<b>${L('لا يوجد مزود مسجل قريب من شروط الطلب','No registered provider is close to the request criteria')}</b><small>${L('راجع الخدمة والمنطقة أو أضف مزوداً حقيقياً؛ لن تُعرض الحسابات التجريبية في الإنتاج.','Review service and area or add a real provider; demo accounts are not shown in production.')}</small></div>`}</div></div></div>`,{stack:true});
 }
 function adminLeads(){
  const leads=S.leads||[],customer=S.customerRequests||[];
@@ -4900,12 +5110,35 @@ function adminSubscriptionsPublic(){
  const planSection=(title,subtitle,plans,scope)=>`<section class="admin-plan-scope"><div class="section-head"><div><h2>${title}</h2><p>${subtitle}</p></div><button class="pill-btn" data-action="packageForm" data-scope="${scope}">${icon('plus')} ${L('إضافة باقة','Add plan')}</button></div><div class="package-admin-grid">${plans.map(adminPlanCard).join('')||`<div class="empty">${L('لا توجد باقات في هذا القسم.','No plans in this section.')}</div>`}</div></section>`;
  return `<section class="subscription-command"><div><h2>${L('الباقات والاشتراكات','Plans and subscriptions')}</h2><p>${L('صلاحيات الأفراد والشركات منفصلة، وكل تعديل يُطبق من الخادم.','Individual and company entitlements are separate and enforced by the server.')}</p></div><button class="subscription-switch" data-action="newSubscriptionForm">${icon('plus')} ${L('اشتراك جديد','New subscription')}</button></section>${planSection(L('باقات المزود الفردي','Individual provider plans'),L('الخدمات والمناطق والصور وسرعة ظهور الطلب.','Services, coverage, photos, and request visibility delay.'),individual,'individual')}${planSection(L('باقات الشركات','Company plans'),L('الأقسام والخدمات والمحافظات والفريق وباقات المجتمع.','Categories, services, governorates, teams, and community listings.'),companies,'company')}<section class="admin-plan-subscriptions"><div class="section-head"><div><h2>${L('دورة الاشتراكات','Subscription lifecycle')}</h2><p>${rows.length} ${L('سجلاً ضمن العرض الحالي','records in this view')}</p></div></div><div class="provider-lead-tabs">${[['all',L('الكل','All')],['pending',L('بانتظار الاعتماد','Pending')],['active',L('نشطة','Active')],['expired',L('منتهية','Expired')],['suspended',L('موقوفة','Suspended')]].map(([value,label])=>`<button class="${filter===value?'active':''}" data-action="subscriptionFilter" data-value="${value}">${label}<span>${all.filter(s=>value==='all'||(value==='pending'&&pendingStates.includes(s.status))||(value==='active'&&activeStates.includes(s.status))||s.status===value).length}</span></button>`).join('')}</div><div class="list">${rows.map(s=>{const provider=getProvider(s.providerId||s.provider_id),pkg=subscriptionPackage(s);return `<article class="list-item subscription-row"><div><b>${esc(provider?.name||L('حساب غير موجود','Missing account'))}</b><small>${esc(loc(pkg))} • ${subscriptionStatusLabel(s.status)} • ${esc(s.endDate||s.end_date||'')}</small></div><div class="row-actions"><button class="ghost-btn tiny" data-action="activateSubscription" data-id="${s.id}">${L('إدارة','Manage')}</button>${provider?`<button class="ghost-btn tiny" data-action="adminEditProvider" data-id="${provider.id}">${L('الحساب','Account')}</button>`:''}</div></article>`;}).join('')||`<div class="empty">${L('لا توجد اشتراكات هنا.','No subscriptions here.')}</div>`}</div></section>`;
 }
-function adminProviderRows(items){ return `<div class="list">${items.map(p=>{const sub=subscriptionState(p),issues=providerIssues(p);return `<div class="list-item ${Number(p.failedLoginCount||0)>=3?'account-alert':issues.length?'subscription-warning':''}"><div><b>${esc(p.name)} ${providerType(p)==='company'?'<span class="badge company-pill">شركة</span>':''}</b><div class="trust-row" style="margin-top:5px">${verificationBadgeHtml(p)}</div><div class="muted">${esc(p.phone)} • ${esc(p.wilayah)} • ${statusBadge(p.status)} • ${p.featured?'مميز':'غير مميز'} • ${esc(sub.label)}</div><div class="trust-row" style="margin-top:6px">${issues.map(x=>`<span class="badge ${x.includes('منتهي')||x.includes('ناقص')?'off':'warn'}">${esc(x)}</span>`).join('')}${!issues.length?'<span class="badge ok">الملف مكتمل</span>':''}</div></div><div class="admin-provider-tools"><button class="ghost-btn tiny" title="اشتراك" data-action="newSubscriptionForm" data-provider="${p.id}">${icon('wallet')}</button><button class="ghost-btn tiny" title="واتساب" data-action="adminProviderWhatsapp" data-id="${p.id}">${icon('chat')}</button><button class="ghost-btn tiny" title="اتصال" data-action="adminProviderCall" data-id="${p.id}">${icon('phone')}</button><button class="ghost-btn tiny" title="ملاحظة" data-action="adminProviderNote" data-id="${p.id}">${icon('bell')}</button><button class="ghost-btn tiny" data-action="adminEditProvider" data-id="${p.id}">${tr('edit')}</button><button class="ghost-btn tiny" data-action="adminToggleProvider" data-id="${p.id}">${p.active?tr('stop'):tr('activate')}</button><button class="ghost-btn tiny" data-action="openAdminVerification" data-id="${p.id}">${L('مراجعة التحقق','Review verification')}</button>${!p.active?`<button class="ghost-btn tiny danger" data-action="adminDeleteProvider" data-id="${p.id}">${L('حذف نهائي','Delete')}</button>`:''}</div></div>`}).join('')||`<div class="empty">${tr('noResults')}</div>`}</div>`; }
+function providerLifecycleState(p){return String(p?.lifecycleState||p?.lifecycle_state||(p?.active===false?'suspended':'active'));}
+function adminProviderRows(items){return `<div class="list admin-provider-list">${items.map(p=>{const sub=subscriptionState(p),issues=providerIssues(p),lifecycle=providerLifecycleState(p);return `<article class="list-item admin-provider-row ${Number(p.failedLoginCount||0)>=3?'account-alert':issues.length?'subscription-warning':''}"><div class="admin-provider-summary"><div class="admin-provider-name"><b>${esc(p.name)} ${providerType(p)==='company'?`<span class="badge company-pill">${L('شركة','Company')}</span>`:''}</b><span class="badge provider-lifecycle-${esc(lifecycle)}">${lifecycle==='archived'?L('مؤرشف','Archived'):lifecycle==='suspended'?L('موقوف','Suspended'):L('نشط','Active')}</span></div><div class="trust-row">${verificationBadgeHtml(p)}</div><div class="muted">${esc(p.wilayah||p.gov||'')} • ${statusBadge(p.status)} • ${esc(sub.label)}</div>${p.statusReason?`<div class="provider-status-reason">${icon('bell')} ${esc(p.statusReason)}</div>`:''}${issues.length?`<div class="trust-row">${issues.slice(0,2).map(x=>`<span class="badge ${x.includes('منتهي')||x.includes('ناقص')?'off':'warn'}">${esc(x)}</span>`).join('')}</div>`:''}</div><div class="admin-provider-primary-actions"><button class="pill-btn" data-action="adminEditProvider" data-id="${esc(p.id)}">${L('فتح','Open')}</button><button class="icon-btn" data-action="adminProviderActions" data-id="${esc(p.id)}" aria-label="${L('خيارات المزود','Provider options')}">${icon('more')}</button></div></article>`;}).join('')||`<div class="empty">${tr('noResults')}</div>`}</div>`;}
+function adminProviderActionsSheet(providerId){
+ const p=getProvider(providerId);if(!p)return;
+ const lifecycle=providerLifecycleState(p);
+ openModal(`<div class="modal sheet admin-provider-actions-sheet"><div class="modal-head"><div><small>${L('إدارة المزود','Manage provider')}</small><div class="modal-title">${esc(p.name)}</div></div><button class="close-btn" data-action="closeModal">${icon('x')}</button></div><div class="modal-body"><div class="workspace-tool-grid"><button class="workspace-tool-card" data-action="adminEditProvider" data-id="${esc(p.id)}"><span>${icon('user')}</span><div><b>${L('فتح الملف','Open profile')}</b><small>${L('البيانات والخدمات والتحقق','Details, services, and verification')}</small></div></button><button class="workspace-tool-card" data-action="openAdminVerification" data-id="${esc(p.id)}"><span>${icon('shield')}</span><div><b>${L('مراجعة التحقق','Review verification')}</b><small>${verificationStatusLabel(p.verificationStatus||p.verification_status)}</small></div></button><button class="workspace-tool-card" data-action="newSubscriptionForm" data-provider="${esc(p.id)}"><span>${icon('wallet')}</span><div><b>${L('الاشتراك','Subscription')}</b><small>${esc(subscriptionState(p).label)}</small></div></button><button class="workspace-tool-card" data-action="adminProviderNote" data-id="${esc(p.id)}"><span>${icon('bell')}</span><div><b>${L('إرسال ملاحظة','Send note')}</b><small>${L('تصل داخل مساحة المزود','Delivered in provider workspace')}</small></div></button><button class="workspace-tool-card" data-action="adminProviderWhatsapp" data-id="${esc(p.id)}"><span>${icon('chat')}</span><div><b>${L('واتساب','WhatsApp')}</b><small>${L('تواصل خارجي عند الحاجة','External contact when needed')}</small></div></button><button class="workspace-tool-card" data-action="adminProviderCall" data-id="${esc(p.id)}"><span>${icon('phone')}</span><div><b>${L('اتصال','Call')}</b><small>${L('فتح الاتصال الهاتفي','Open phone call')}</small></div></button></div><div class="admin-provider-lifecycle-actions"><button class="ghost-btn ${lifecycle==='active'?'danger-outline':''}" data-action="adminToggleProvider" data-id="${esc(p.id)}">${lifecycle==='active'?L('إيقاف مؤقت مع إشعار','Suspend and notify'):L('إعادة التنشيط','Reactivate')}</button>${lifecycle==='suspended'?`<button class="ghost-btn" data-action="adminArchiveProvider" data-id="${esc(p.id)}">${L('نقل إلى الأرشيف','Move to archive')}</button>`:''}${lifecycle==='archived'?`<button class="ghost-btn" data-action="adminRestoreProvider" data-id="${esc(p.id)}">${L('استعادة من الأرشيف','Restore from archive')}</button><button class="ghost-btn danger" data-action="adminDeleteProvider" data-id="${esc(p.id)}">${L('حذف نهائي مجهّل','Permanent anonymized deletion')}</button>`:''}</div></div></div>`);
+}
+function adminProviderLifecycleSheet(providerId,action){
+ const p=getProvider(providerId);if(!p)return;
+ const isArchive=action==='archive',title=isArchive?L('أرشفة المزود','Archive provider'):L('إيقاف المزود مؤقتاً','Suspend provider');
+ openModal(`<div class="modal sheet admin-provider-lifecycle-sheet"><div class="modal-head"><div><small>${L('قرار إداري موثق','Audited management action')}</small><div class="modal-title">${title}</div></div><button class="close-btn" data-action="closeModal">${icon('x')}</button></div><div class="modal-body"><div class="contact-privacy-note">${icon('bell')} ${isArchive?L('سينتقل الحساب إلى الأرشيف ولن يظهر أو يستقبل طلبات، ويمكن استعادته لاحقاً.','The account moves to archive, stops appearing and receiving requests, and can be restored later.'):L('سيُوقف الظهور واستقبال الطلبات والجلسات النشطة، وسيصل للمزود إشعار بالسبب.','Visibility, requests, and active sessions will stop, and the provider will be notified of the reason.')}</div><div class="field"><label>${L('سبب القرار','Reason')}</label><textarea class="textarea" id="adminProviderLifecycleReason" maxlength="500" placeholder="${L('اكتب سبباً واضحاً يمكن للمزود فهمه','Enter a clear reason the provider can understand')}"></textarea></div><button class="pill-btn ${isArchive?'warn':'danger'} full-action" data-action="confirmAdminProviderLifecycle" data-id="${esc(providerId)}" data-value="${esc(action)}">${isArchive?L('تأكيد الأرشفة','Confirm archive'):L('تأكيد الإيقاف وإرسال الإشعار','Suspend and notify')}</button></div></div>`);
+}
+function adminProviderPermanentDeleteSheet(providerId){
+ const p=getProvider(providerId);if(!p)return;
+ openModal(`<div class="modal sheet admin-provider-delete-sheet"><div class="modal-head"><div><small>${L('بعد الأرشفة فقط','Only after archiving')}</small><div class="modal-title">${L('حذف الحساب مع إخفاء هويته','Delete and anonymize account')}</div></div><button class="close-btn" data-action="closeModal">${icon('x')}</button></div><div class="modal-body"><div class="contact-privacy-note danger">${icon('shield')} ${L('لن تُحذف الطلبات والسجلات المحاسبية. سيزيل الخادم بيانات الهوية والاتصال فقط مع حفظ أثر القرار.','Requests and audit records remain. The server removes identity and contact data while preserving the decision trail.')}</div><div class="field"><label>${L('سبب الحذف','Deletion reason')}</label><textarea class="textarea" id="adminProviderDeleteReason" maxlength="500"></textarea></div><div class="field"><label>${L('رمز الإدارة للتأكيد','Admin code to confirm')}</label><input class="input" id="adminProviderDeleteCode" type="password" inputmode="numeric" autocomplete="current-password" dir="ltr"></div><button class="pill-btn danger full-action" data-action="confirmAdminProviderDelete" data-id="${esc(providerId)}">${L('تأكيد الحذف المجهّل','Confirm anonymized deletion')}</button></div></div>`);
+}
+async function refreshAdminProviderState(){if(!AUTH.adminToken)return;mergeRemote(await api('/api/admin/session',null,AUTH.adminToken,{silentLoading:true,skipQueue:true}));save();}
+async function applyAdminProviderLifecycle(providerId,action,reason=''){
+ const result=await api('/api/admin/provider-status',{id:providerId,action,reason},AUTH.adminToken,{skipQueue:true});
+ if(result.provider){const normalized=normalizeProvider(result.provider),index=(S.providers||[]).findIndex(item=>item.id===normalized.id);if(index>=0)S.providers[index]=normalized;else S.providers.push(normalized);}else await refreshAdminProviderState();
+ save();closeModal();render();toast(action==='restore'?L('تمت استعادة المزود.','Provider restored.'):action==='archive'?L('نُقل المزود إلى الأرشيف.','Provider moved to archive.'):L('تم إيقاف المزود وإشعاره.','Provider suspended and notified.'));
+}
 function adminProviders(){
  const f=S.adminProviderFilter||{};let items=[...S.providers],q=normalizeSearchText(f.q||'');
  if(q)items=items.filter(p=>normalizeSearchText([p.name,p.companyName,p.phone,p.gov,p.wilayah,p.bio,p.commercialNo].join(' ')).includes(q));
- if(f.type)items=items.filter(p=>providerType(p)===f.type);if(f.status)items=items.filter(p=>p.status===f.status);if(f.gov)items=items.filter(p=>p.gov===f.gov);if(f.featured==='yes')items=items.filter(p=>p.featured);if(f.package)items=items.filter(p=>p.packageId===f.package);if(f.service)items=items.filter(p=>(p.services||[]).some(s=>`${s.catId}|${s.serviceId}`===f.service));if(f.sub)items=items.filter(p=>subscriptionState(p).status===f.sub||(f.sub==='ending'&&subscriptionState(p).days<=30&&subscriptionState(p).status!=='expired'));
- return `<div class="section-head"><div><h2>${tr('manageProviders')}</h2><p>${items.length} ${L('مزودًا ضمن النتائج','providers in results')}</p></div></div><div class="admin-filter-wide"><input class="input" id="adminProviderQ" value="${esc(f.q||'')}" placeholder="${L('الاسم أو الهاتف أو رقم الترخيص','Name, phone, or licence number')}"><select class="select" id="adminProviderType"><option value="">${L('النوع','Type')}</option><option value="individual" ${f.type==='individual'?'selected':''}>${L('مزود فردي','Individual provider')}</option><option value="company" ${f.type==='company'?'selected':''}>${L('شركة','Company')}</option></select><select class="select" id="adminProviderStatus"><option value="">${L('الحالة','Status')}</option><option value="available" ${f.status==='available'?'selected':''}>${tr('available')}</option><option value="busy" ${f.status==='busy'?'selected':''}>${tr('busy')}</option><option value="unavailable" ${f.status==='unavailable'?'selected':''}>${tr('unavailable')}</option></select><select class="select" id="adminProviderSub"><option value="">${L('الاشتراك','Subscription')}</option><option value="active" ${f.sub==='active'?'selected':''}>${L('نشط','Active')}</option><option value="ending" ${f.sub==='ending'?'selected':''}>${L('قريب الانتهاء','Ending soon')}</option><option value="expired" ${f.sub==='expired'?'selected':''}>${L('منتهي','Expired')}</option><option value="free" ${f.sub==='free'?'selected':''}>${L('فترة تأسيس','Foundation')}</option></select><select class="select" id="adminProviderPackage"><option value="">${L('الباقة','Plan')}</option>${S.packages.map(pkg=>`<option value="${pkg.id}" ${f.package===pkg.id?'selected':''}>${esc(loc(pkg))}</option>`).join('')}</select><select class="select" id="adminProviderService"><option value="">${L('الخدمة','Service')}</option>${allServicesOptions('',f.service||'')}</select><select class="select" id="adminProviderFeatured"><option value="">${L('التمييز','Promotion')}</option><option value="yes" ${f.featured==='yes'?'selected':''}>${L('مزود مميز','Featured provider')}</option></select><select class="select" id="adminProviderGov"><option value="">${tr('all')}</option>${govOptions(f.gov||'')}</select><button class="pill-btn primary" data-action="adminProviderFilter">${tr('search')}</button></div>${adminProviderRows(items)}`;
+ if(f.type)items=items.filter(p=>providerType(p)===f.type);
+ if(f.status)items=items.filter(p=>['suspended','archived'].includes(f.status)?providerLifecycleState(p)===f.status:p.status===f.status);
+ if(f.gov)items=items.filter(p=>p.gov===f.gov);if(f.featured==='yes')items=items.filter(p=>p.featured);if(f.package)items=items.filter(p=>p.packageId===f.package);if(f.service)items=items.filter(p=>(p.services||[]).some(s=>`${s.catId}|${s.serviceId}`===f.service));if(f.sub)items=items.filter(p=>subscriptionState(p).status===f.sub||(f.sub==='ending'&&subscriptionState(p).days<=30&&subscriptionState(p).status!=='expired'));
+ return `<div class="section-head"><div><h2>${tr('manageProviders')}</h2><p>${items.length} ${L('مزودًا ضمن النتائج','providers in results')}</p></div></div><div class="admin-filter-wide"><input class="input" id="adminProviderQ" value="${esc(f.q||'')}" placeholder="${L('الاسم أو الهاتف أو رقم الترخيص','Name, phone, or licence number')}"><select class="select" id="adminProviderType"><option value="">${L('النوع','Type')}</option><option value="individual" ${f.type==='individual'?'selected':''}>${L('مزود فردي','Individual provider')}</option><option value="company" ${f.type==='company'?'selected':''}>${L('شركة','Company')}</option></select><select class="select" id="adminProviderStatus"><option value="">${L('الحالة','Status')}</option><option value="available" ${f.status==='available'?'selected':''}>${tr('available')}</option><option value="busy" ${f.status==='busy'?'selected':''}>${tr('busy')}</option><option value="unavailable" ${f.status==='unavailable'?'selected':''}>${tr('unavailable')}</option><option value="suspended" ${f.status==='suspended'?'selected':''}>${L('موقوف إدارياً','Suspended')}</option><option value="archived" ${f.status==='archived'?'selected':''}>${L('في الأرشيف','Archived')}</option></select><select class="select" id="adminProviderSub"><option value="">${L('الاشتراك','Subscription')}</option><option value="active" ${f.sub==='active'?'selected':''}>${L('نشط','Active')}</option><option value="ending" ${f.sub==='ending'?'selected':''}>${L('قريب الانتهاء','Ending soon')}</option><option value="expired" ${f.sub==='expired'?'selected':''}>${L('منتهي','Expired')}</option><option value="free" ${f.sub==='free'?'selected':''}>${L('فترة تأسيس','Foundation')}</option></select><select class="select" id="adminProviderPackage"><option value="">${L('الباقة','Plan')}</option>${S.packages.map(pkg=>`<option value="${pkg.id}" ${f.package===pkg.id?'selected':''}>${esc(loc(pkg))}</option>`).join('')}</select><select class="select" id="adminProviderService"><option value="">${L('الخدمة','Service')}</option>${allServicesOptions('',f.service||'')}</select><select class="select" id="adminProviderFeatured"><option value="">${L('التمييز','Promotion')}</option><option value="yes" ${f.featured==='yes'?'selected':''}>${L('مزود مميز','Featured provider')}</option></select><select class="select" id="adminProviderGov"><option value="">${tr('all')}</option>${govOptions(f.gov||'')}</select><button class="pill-btn primary" data-action="adminProviderFilter">${tr('search')}</button></div>${adminProviderRows(items)}`;
 }
 function adminCompanies(){const companies=S.providers.filter(p=>providerType(p)==='company');return `<div class="section-head"><div><h2>${L('الشركات','Companies')}</h2><p>${L('إدارة الشركات وفرقها وصلاحيات باقاتها.','Manage companies, teams, and plan permissions.')}</p></div></div>${adminProviderRows(companies)}`;}
 function providerRequestValidation(p){
@@ -4999,19 +5232,23 @@ function providerRichMediaEditorContent(p){
 }
 function reportSnapshot(){
  const funnel=conversionFunnel(),weekly=weeklyOperations(),governorates=demandByGovernorate(),requests=S.customerRequests||[],providers=S.providers||[],subscriptions=S.subscriptions||[],payments=S.payments||[],expenses=S.expenses||[];
- const activeProviders=providers.filter(p=>p.active!==false&&p.status!=='unavailable').length,companies=providers.filter(p=>providerType(p)==='company').length,completed=requests.filter(r=>['closed','archived','completed'].includes(r.status)).length,unavailable=requests.filter(r=>r.status==='unavailable'||r.waitlisted).length;
+ const serverRequests=S.reports?.customerRequests||{},requestMatching=S.reports?.requestMatching||{},offerPerformance=S.reports?.offerPerformance||{},serverTotal=Number(serverRequests.total),serverCompleted=Number(serverRequests.completed),serverUnavailable=Number(serverRequests.unavailable),serverAwaiting=Number(serverRequests.awaitingConfirmation);
+ const requestTotal=Number.isFinite(serverTotal)?serverTotal:requests.length,completed=Number.isFinite(serverCompleted)?serverCompleted:requests.filter(r=>['closed','archived','completed'].includes(r.status)).length,unavailable=Number.isFinite(serverUnavailable)?serverUnavailable:requests.filter(r=>r.status==='unavailable'||r.waitlisted).length,activeProviders=providers.filter(p=>p.active!==false&&providerLifecycleState(p)==='active'&&p.status!=='unavailable').length,companies=providers.filter(p=>providerType(p)==='company').length;
  const activeSubscriptions=subscriptions.filter(s=>s.status==='active').length,pendingSubscriptions=subscriptions.filter(s=>['pending','pending_payment','pending_approval'].includes(s.status)).length,ending=providers.filter(p=>{const state=subscriptionState(p);return Number.isFinite(state.days)&&state.days>=0&&state.days<=30;}).length,expired=providers.filter(p=>subscriptionState(p).status==='expired').length;
  const serverRevenue=Number(S.serverStats?.revenue),localRevenue=(S.finance||[]).reduce((sum,row)=>sum+Number(row.amount||0),0),revenue=Number.isFinite(serverRevenue)?serverRevenue:localRevenue,expenseTotal=expenses.reduce((sum,row)=>sum+Number(row.amount||0),0),ratings=providers.map(p=>Number(p.rating||0)).filter(Boolean),avgRating=ratings.length?ratings.reduce((a,b)=>a+b,0)/ratings.length:0,avgResponse=providers.length?providers.reduce((sum,p)=>sum+Number(p.responseMinutes||30),0)/providers.length:0;
  const topProviders=[...providers].sort((a,b)=>(b.completedJobs||0)-(a.completedJobs||0)||(b.rating||0)-(a.rating||0)).slice(0,10),qualityQueue=providers.filter(p=>(p.qualityScore||profileStrength(p))<65),topService=requestStats();
- return {generatedAt:nowISO(),funnel,weekly,governorates,requests:requests.length,completed,unavailable,users:(S.users||[]).length,guestVisits:(S.guestVisits||[]).length,providers:providers.length,activeProviders,companies,activeSubscriptions,pendingSubscriptions,ending,expired,revenue,expenses:expenseTotal,net:revenue-expenseTotal,avgRating,avgResponse,topProviders,qualityQueue,topService};
+ return {generatedAt:nowISO(),funnel,weekly,governorates,requests:requestTotal,completed,unavailable,awaitingConfirmation:Number.isFinite(serverAwaiting)?serverAwaiting:requests.filter(r=>r.status==='awaitingConfirmation').length,users:(S.users||[]).length,guestVisits:(S.guestVisits||[]).length,providers:providers.length,activeProviders,companies,activeSubscriptions,pendingSubscriptions,ending,expired,revenue,expenses:expenseTotal,net:revenue-expenseTotal,avgRating,avgResponse,topProviders,qualityQueue,topService,requestMatching,offerPerformance};
 }
 function adminReports(){
  const report=reportSnapshot(),maxGov=Math.max(1,...report.governorates.map(x=>x[1])),generated=new Date(report.generatedAt).toLocaleString(S.lang==='ar'?'ar-OM':'en-OM',{dateStyle:'medium',timeStyle:'short'}),completionRate=report.requests?Math.round(report.completed/report.requests*100):0;
+ const noMatchReasons=report.requestMatching.noMatchReasons||report.requestMatching.reasons||{},reasonRows=Object.entries(noMatchReasons).filter(([,count])=>Number(count)>0).sort((a,b)=>Number(b[1])-Number(a[1])).slice(0,6),firstOffer=Number(report.offerPerformance.averageTimeToFirstOfferMinutes),requestsWithOffer=Number(report.offerPerformance.requestsWithOffer||0),matchingPanel=`<div class="two-col report-section"><section class="panel"><h2>${L('لماذا لم يجد الطلب مزوداً؟','Why requests found no provider')}</h2><div class="list">${reasonRows.map(([reason,count])=>`<div class="list-item"><span>${esc(matchingDiagnosticLabel(reason))}</span><b>${Number(count)}</b></div>`).join('')||`<div class="empty">${L('لا توجد أسباب استبعاد مسجلة بعد.','No exclusion reasons recorded yet.')}</div>`}</div></section><section class="panel"><h2>${L('سرعة وصول العروض','Offer response speed')}</h2><div class="admin-grid grid"><div class="card mini-stat"><span>${L('طلبات وصلها عرض','Requests with an offer')}</span><b>${requestsWithOffer}</b></div><div class="card mini-stat"><span>${L('متوسط أول عرض','Average first offer')}</span><b>${Number.isFinite(firstOffer)?`${Math.round(firstOffer)} ${L('دقيقة','min')}`:L('لا توجد عينة','No sample')}</b></div><div class="card mini-stat"><span>${L('بانتظار رأي العميل','Awaiting customer')}</span><b>${report.awaitingConfirmation}</b></div><div class="card mini-stat"><span>${L('طلبات بلا مزود','Requests without provider')}</span><b>${report.unavailable}</b></div></div></section></div>`;
  const summaries=[
-  [L('طلبات العملاء','Customer requests'),report.requests,L(`${report.weekly.requests} هذا الأسبوع`,`${report.weekly.requests} this week`),'accent'],
-  [L('نسبة الإنجاز','Completion rate'),`${completionRate}%`,L(`${report.completed} طلباً مكتملًا`,`${report.completed} completed requests`),''],
-  [L('مزودون ظاهرون','Visible providers'),report.activeProviders,L(`${report.companies} شركات`,`${report.companies} companies`),''],
-  [L('صافي الإيراد المسجل','Recorded net revenue'),`${money(report.net)} ${L('ر.ع','OMR')}`,L(`${report.pendingSubscriptions} تحصيل معلق`,`${report.pendingSubscriptions} pending collections`),'accent']
+ [L('طلبات العملاء','Customer requests'),report.requests,L(`${report.weekly.requests} هذا الأسبوع`,`${report.weekly.requests} this week`),'accent'],
+ [L('نسبة الإنجاز','Completion rate'),`${completionRate}%`,L(`${report.completed} طلباً مكتملًا`,`${report.completed} completed requests`),''],
+ [L('مزودون ظاهرون','Visible providers'),report.activeProviders,L(`${report.companies} شركات`,`${report.companies} companies`),''],
+ [L('الإيراد المسجل','Recorded revenue'),`${money(report.revenue)} ${L('ر.ع','OMR')}`,L(`${report.pendingSubscriptions} تحصيل معلق`,`${report.pendingSubscriptions} pending collections`),'accent'],
+ [L('طلبات وصلها عرض','Requests with offers'),requestsWithOffer,L(`${report.unavailable} بلا مزود`,`${report.unavailable} without a provider`),''],
+ [L('متوسط أول عرض','Average first offer'),Number.isFinite(firstOffer)?`${Math.round(firstOffer)} ${L('دقيقة','min')}`:L('لا توجد عينة','No sample'),reasonRows.length?L(`الأكثر: ${matchingDiagnosticLabel(reasonRows[0][0])}`,`Top exclusion: ${matchingDiagnosticLabel(reasonRows[0][0])}`):L('لا توجد أسباب استبعاد','No exclusions'),'']
  ];
  return `<section class="report-command-bar"><div><h2>${L('التقارير والقرارات','Reports and decisions')}</h2><p>${L('قراءة موحّدة للتشغيل والجودة والاشتراكات والمال.','One consistent view of operations, quality, subscriptions, and finance.')}</p><span class="report-period">${icon('clock')} ${L('آخر تحديث','Last updated')}: ${esc(generated)}</span></div><div class="row-actions"><button class="pill-btn" data-action="exportReportsCsv">${icon('download')} <span>CSV</span></button><button class="pill-btn" data-action="exportReportsWord">${icon('file')} <span>Word</span></button><button class="pill-btn primary" data-action="printReports">${icon('printer')} <span>${L('طباعة / PDF','Print / PDF')}</span></button></div></section><div class="report-summary-grid">${summaries.map(([label,value,note,tone])=>`<article class="report-summary-card ${tone}"><span>${label}</span><b>${value}</b><small>${note}</small></article>`).join('')}</div><div class="funnel-grid report-section">${[[L('بحث','Searches'),report.funnel.searches],[L('مشاهدة مزود','Provider views'),report.funnel.views],[L('طلبات','Requests'),report.funnel.requests],[L('تواصل','Contacts'),report.funnel.contacts],[L('مكتملة','Completed'),report.funnel.completed]].map(([label,value],i)=>`<div class="funnel-step"><small>${i+1}</small><b>${value}</b><span>${label}</span></div>`).join('')}</div><div class="two-col report-section"><section class="panel"><h2>${L('الطلب حسب المحافظة','Demand by governorate')}</h2><div class="demand-bars">${report.governorates.map(([name,count])=>`<div><span>${esc(name)}</span><i style="--value:${Math.round(count/maxGov*100)}%"></i><b>${count}</b></div>`).join('')||`<div class="empty">${L('لا توجد طلبات بعد','No requests yet')}</div>`}</div></section><section class="panel"><h2>${L('أفضل المزودين تشغيلياً','Top operating providers')}</h2><div class="list">${report.topProviders.map(p=>`<div class="list-item"><div><b>${esc(p.name)}</b><div class="muted">${p.completedJobs||0} ${L('مكتملة','completed')} • ${Number(p.rating||0).toFixed(1)} / 5 • ${p.responseMinutes||30} ${L('د للرد','min response')}</div></div><button class="ghost-btn tiny" data-action="adminEditProvider" data-id="${p.id}">${L('فتح','Open')}</button></div>`).join('')||`<div class="empty">${L('لا توجد بيانات مزودين بعد','No provider data yet')}</div>`}</div></section></div><div class="two-col report-section"><section class="panel"><h2>${L('تشغيل الاشتراكات','Subscription operations')}</h2><div class="admin-grid grid"><div class="card mini-stat"><span>${L('نشطة','Active')}</span><b>${report.activeSubscriptions}</b></div><div class="card mini-stat"><span>${L('بانتظار الإجراء','Pending action')}</span><b>${report.pendingSubscriptions}</b></div><div class="card mini-stat"><span>${L('قريبة الانتهاء','Ending soon')}</span><b>${report.ending}</b></div><div class="card mini-stat"><span>${L('منتهية','Expired')}</span><b>${report.expired}</b></div></div></section><section class="panel"><h2>${L('قائمة تحسين الجودة','Quality improvement queue')}</h2><div class="list">${report.qualityQueue.slice(0,10).map(p=>`<div class="list-item"><div><b>${esc(p.name)}</b><div class="muted">${L('جودة','Quality')} ${p.qualityScore||profileStrength(p)}%</div></div><button class="ghost-btn tiny" data-action="adminEditProvider" data-id="${p.id}">${tr('edit')}</button></div>`).join('')||`<div class="empty">${L('لا توجد مشاكل جودة واضحة','No clear quality issues')}</div>`}</div></section></div><div class="report-export-note">${icon('shield')}<span>${L('تتضمن الملفات المصدّرة مؤشرات تشغيلية فقط، ولا تعرض كلمات مرور أو وثائق تحقق أو مواقع دقيقة.','Exports contain operational indicators only and never include passwords, verification documents, or precise locations.')}</span></div>`;
 }
@@ -5879,6 +6116,29 @@ async function onClick(e){ const el=e.target.closest('[data-action]'); if(!el)re
  if(a==='closeModal'){closeModal();return;}
  if(a==='closeModalSoft'){closeModalLayer();return;}
  if(a==='contextHelp'){contextualHelpSheet(el.dataset.topic||'provider_tasks');return;}
+ if(a==='adminProviderActions'){adminProviderActionsSheet(id);return;}
+ if(a==='adminToggleProvider'){
+  const provider=getProvider(id);if(!provider)return;
+  if(providerLifecycleState(provider)==='active')adminProviderLifecycleSheet(id,'suspend');else await applyAdminProviderLifecycle(id,'restore');
+  return;
+ }
+ if(a==='adminArchiveProvider'){adminProviderLifecycleSheet(id,'archive');return;}
+ if(a==='adminRestoreProvider'){await applyAdminProviderLifecycle(id,'restore');return;}
+ if(a==='confirmAdminProviderLifecycle'){
+  const reason=val('adminProviderLifecycleReason').trim();if(reason.length<3){markInvalid('adminProviderLifecycleReason',L('اكتب سبباً واضحاً لا يقل عن 3 أحرف.','Enter a clear reason of at least 3 characters.'));return;}
+  await applyAdminProviderLifecycle(id,el.dataset.value||'suspend',reason);return;
+ }
+ if(a==='adminDeleteProvider'){adminProviderPermanentDeleteSheet(id);return;}
+ if(a==='confirmAdminProviderDelete'){
+  const reason=val('adminProviderDeleteReason').trim(),adminCode=val('adminProviderDeleteCode');if(reason.length<3){markInvalid('adminProviderDeleteReason',L('اكتب سبب الحذف.','Enter the deletion reason.'));return;}if(!adminCode){markInvalid('adminProviderDeleteCode',L('أدخل رمز الإدارة.','Enter the admin code.'));return;}
+  const result=await api('/api/admin/provider-delete',{id,reason,adminCode,permanent:true},AUTH.adminToken,{skipQueue:true});await refreshAdminProviderState();closeModal();render();toast(result.deleted?L('تم حذف بيانات هوية المزود مع حفظ السجل.','Provider identity data was removed while preserving history.'):L('نُقل المزود إلى الأرشيف أولاً.','Provider moved to archive first.'));return;
+ }
+ if(a==='searchProvidersForUnavailable'){
+  const [cat,service]=String(el.dataset.value||'').split('|');
+  S.admin=true;S.adminTab='providers';S.adminProviderFilter={...(S.adminProviderFilter||{}),q:'',service:[cat,service].filter(Boolean).join('|')};
+  save();render();toast(L('تم فتح المزودين داخل الإدارة مع فلتر الخدمة.','Providers opened inside management with the service filter.'));
+  return;
+ }
  if(a==='openActionPrompt'){const notification=(S.notifications||[]).find(item=>item.id===id);if(notification)await openNotificationTarget(notification,{fromPrompt:true});return;}
  if(a==='snoozeActionPrompt'){const notification=(S.notifications||[]).find(item=>item.id===id);if(!notification)return;hideActionPromptForSession(notification);notification.snoozedUntil=new Date(Date.now()+20*60000).toISOString();save();syncNotificationUiAction(notification,'snooze',{snoozeMinutes:20});trackEvent('action_prompt_snoozed',{notificationId:notification.id,actionKind:inferredNotificationActionKind(notification)});renderActionPrompt();return;}
  if(a==='openInstantBooking'){await instantBookingSheet(el.dataset.value||'',el.dataset.provider||'');return;}
@@ -5974,6 +6234,15 @@ async function onClick(e){ const el=e.target.closest('[data-action]'); if(!el)re
   const role=el.dataset.role||'user',value=el.dataset.value==='reopen'?'reopen':'end';try{const result=await platformAction({action:`conversation:${value}`,requestId:id,reason:value==='end'?val('conversationEndReason').trim():''},role);const request=requestByAnyId(id);if(request)request.conversationControl=result;closeModal();openRequestChat(id,role);toast(value==='end'?L('انتهت المحادثة مع بقاء السجل محفوظاً.','Conversation ended and history preserved.'):L('تمت إعادة فتح المحادثة.','Conversation reopened.'));}catch(error){showError(error);}return;
  }
  if(a==='inviteKnownProvider'){inviteKnownProviderSheet(id);return;}
+ if(a==='filterKnownProviders'){
+  const request=requestByAnyId(id),root=document.getElementById('knownProviderResults');
+  if(request&&root)root.innerHTML=knownProviderResultsHtml(request,val('knownProviderQuery'));
+  return;
+ }
+ if(a==='selectKnownProvider'){
+  const input=document.getElementById('knownProviderPhone');if(input){input.value=phoneClean(el.dataset.phone||'');input.focus();}
+  return;
+ }
  if(a==='sendKnownProviderInvitation'){
   try{
    const result=await api('/api/user/provider-invitations',{action:'create',requestId:id,phone:val('knownProviderPhone')},AUTH.userToken);
@@ -6093,13 +6362,19 @@ async function onClick(e){ const el=e.target.closest('[data-action]'); if(!el)re
   return;
  }
  if(a==='openProviderTools'){openProviderTools();return;}
- if(a==='providerToolTab'){const tab=el.dataset.tab||'home';S.providerTab=tab;save();closeModal();render();window.scrollTo({top:0,behavior:'auto'});setTimeout(()=>showProviderSectionGuide(tab),120);return;}
+ if(a==='providerToolTab'){const tab=el.dataset.tab||'home';S.providerTab=tab;save();closeModal();render();window.scrollTo({top:0,behavior:'auto'});requestAnimationFrame(()=>window.scrollTo({top:0,left:0,behavior:'auto'}));setTimeout(()=>showProviderSectionGuide(tab),120);return;}
  if(a==='openAdminTools'){openAdminTools();return;}
- if(a==='adminToolTab'){S.adminTab=el.dataset.tab||'overview';save();closeModal();render();window.scrollTo({top:0,behavior:'auto'});return;}
- if(a==='openAdminNotifications'){S.adminTab='notifications';save();closeModal();render();window.scrollTo({top:0,behavior:'auto'});return;}
+ if(a==='adminToolTab'){S.adminTab=el.dataset.tab||'overview';save();closeModal();render();window.scrollTo({top:0,behavior:'auto'});requestAnimationFrame(()=>window.scrollTo({top:0,left:0,behavior:'auto'}));return;}
+ if(a==='openAdminNotifications'){S.adminTab='notifications';save();closeModal();render();window.scrollTo({top:0,behavior:'auto'});requestAnimationFrame(()=>window.scrollTo({top:0,left:0,behavior:'auto'}));return;}
  if(a==='adminFocusRequest'){S.adminTab='leads';save();render();setTimeout(()=>adminCustomerRequestSheet(id),60);return;}
  if(a==='adminOpenCustomerRequest'){adminCustomerRequestSheet(id);return;}
- if(a==='adminRequestMatches'){adminRequestMatchesSheet(id);return;}
+ if(a==='adminRequestMatches'){await adminRequestMatchesSheet(id);return;}
+ if(a==='adminDispatchRequestProvider'){
+  const providerId=el.dataset.provider;if(!providerId)return;
+  try{const result=await api('/api/admin/request-provider-dispatch',{action:'dispatch',requestId:id,providerId},AUTH.adminToken,{skipQueue:true});if(result.request)replaceLocalRequest(result.request);save();toast(result.alreadyDispatched?L('سبق إرسال الطلب لهذا المزود.','This request was already sent to the provider.'):L('تم إرسال الطلب للمزود، ويمكنه الآن تقديم عرضه.','Request sent; the provider can now submit an offer.'));await adminRequestMatchesSheet(id);}
+  catch(error){const reasons=error?.payload?.diagnostic?.reasons||error?.diagnostic?.reasons||[];toast(reasons.length?reasons.map(matchingDiagnosticLabel).join(' • '):niceError(error));}
+  return;
+ }
  if(a==='adminCustomerRequestAction'){
   const action=el.dataset.value||'';
   try{
@@ -6844,7 +7119,7 @@ else if(a==='saveProviderProfile'){
  try{const result=await api('/api/provider/profile',payload,AUTH.providerToken);if(result?.provider)Object.assign(p,normalizeProvider(result.provider));}catch(err){showError(err);return;}save();closeModal();toast(tr('save'));render();
 }
 else if(a==='setProviderStatus'){const p=getProvider(S.currentProviderId); p.status=el.dataset.status;p.lastStatusAt=nowISO(); try{await api('/api/provider/profile',{...p,status:p.status},AUTH.providerToken);}catch(err){showError(err);return;} save();render();} else if(a==='saveProviderHours'){const p=getProvider(S.currentProviderId);p.hours=availabilityText('pa');p.availability=availabilityPayload('pa');if(!p.hours){toast(L('اختر يوماً واحداً على الأقل للتوفر.','Choose at least one availability day.'));return;}try{await api('/api/provider/profile',{...p,hours:p.hours,availability:p.availability},AUTH.providerToken);}catch(err){showError(err);return;} save();toast(tr('save'));render();} else if(a==='providerServiceForm')providerServiceForm(id); else if(a==='saveProviderService'){const p=getProvider(S.currentProviderId); const [catId,serviceId]=val('prsService').split('|'); if(!catId||!serviceId){markInvalid('prsService','اختر الخدمة.');return;} const limits=providerEffectiveProfileLimits(p),otherServices=(p.services||[]).filter(service=>service.id!==id),newCategory=!otherServices.some(service=>service.catId===catId); if(!id&&(p.services||[]).length>=limits.maxServices){toast(L('وصلت إلى حد الخدمات في باقتك. يمكنك الترقية لإضافة المزيد.','You reached your plan service limit. Upgrade to add more.'));return;} if(newCategory&&new Set(otherServices.map(service=>service.catId)).size>=limits.maxCategories){toast(L('وصلت إلى حد الأقسام في باقتك.','You reached your plan category limit.'));return;} if(!providerMainCatId(p))p.primaryCatId=catId; if(id){const s=p.services.find(x=>x.id===id); Object.assign(s,{catId,serviceId,priceFrom:Number(val('prsPrice')||0),areas:val('prsAreas').split(/[،,]/).map(x=>x.trim()).filter(Boolean)});} else p.services.push({id:uid('ps'),catId,serviceId,priceFrom:Number(val('prsPrice')||0),active:true,areas:val('prsAreas').split(/[،,]/).map(x=>x.trim()).filter(Boolean)}); try{await api('/api/provider/profile',{...p,primaryCatId:p.primaryCatId||providerMainCatId(p),services:p.services},AUTH.providerToken);}catch(err){showError(err);return;} save(); closeModal(); render();} else if(a==='toggleProviderService'){const p=getProvider(S.currentProviderId); const s=p.services.find(x=>x.id===id); s.active=!s.active;try{await api('/api/provider/profile',{...p,services:p.services},AUTH.providerToken);}catch(err){showError(err);return;} save();render();} else if(a==='deleteProviderService'){const p=getProvider(S.currentProviderId); p.services=p.services.filter(x=>x.id!==id);try{await api('/api/provider/profile',{...p,services:p.services},AUTH.providerToken);}catch(err){showError(err);return;} save();render();} else if(a==='requestPackage'){try{await api('/api/provider/subscription-request',{packageId:id,note:'طلب ترقية من بوابة المزود'},AUTH.providerToken);}catch(err){if(String(err?.message||err)!=='request_failed'){showError(err);return;}} S.subscriptions=S.subscriptions||[]; const sub={id:uid('sub'),providerId:S.currentProviderId,packageId:id,amount:providerPackage({packageId:id}).price||0,status:'pending',startDate:'',endDate:'',note:'طلب ترقية ينتظر الإدارة'};S.subscriptions.unshift(sub); const p=getProvider(S.currentProviderId);addNotification({type:'subscription',title:'طلب ترقية باقة',message:`${p?.name||'مزود'} طلب باقة ${loc(providerPackage({packageId:id}))}.`,target:'admin',relatedId:sub.id,priority:'normal',actionText:'فتح الاشتراكات',actionRoute:'subscriptions',dedupeKey:`subscription-request:${sub.id}`}); S.supportNotes.push({id:uid('n'),providerId:S.currentProviderId,date:nowISO(),note:'طلب باقة '+id});save();toast('تم إرسال طلب الترقية للإدارة');render();} else if(a==='providerUpgradeRequest'||a==='providerFeaturedRequest'||a==='sendProviderSupport'){S.supportNotes.push({id:uid('n'),providerId:S.currentProviderId,date:nowISO(),note:a==='sendProviderSupport'?val('supportNote'):tr(a==='providerUpgradeRequest'?'requestUpgrade':'requestFeatured')});save();toast(tr('sent'));}
-else if(a==='adminLogin'){try{const res=await api('/api/admin/login',{code:val('adminCode'),deviceId:DEVICE_ID});applySessionResponse('admin',res,true);mergeRemote(await api('/api/admin/session',null,AUTH.adminToken));S.admin=true;S.view='admin';save();closeModal();render();}catch(err){toast(String(err?.message||err)==='request_failed'?L('يتطلب دخول الإدارة اتصالًا بالخادم.','Admin sign-in requires a server connection.'):niceError(err));}} else if(a==='adminLogout'){await revokeAuthToken(AUTH.adminToken,'admin');AUTH.adminToken='';AUTH.adminExpiresAt='';AUTH.activeRole=AUTH.userToken?'user':AUTH.providerToken?'provider':'';saveAuth();S.admin=false;restoreStoredAccountContext(S,AUTH.activeRole);S.view=AUTH.activeRole==='provider'?'provider':AUTH.activeRole==='user'?'home':'entry';save();render();window.scrollTo(0,0);} else if(a==='adminTab'){const nav=el.closest('.side-nav');S.adminNavScroll=nav?nav.scrollLeft:S.adminNavScroll;S.adminTab=el.dataset.tab;save();render();} else if(a==='adminFocusRequest'){S.adminTab='leads';save();render();setTimeout(()=>{const target=document.querySelector(`[data-id="${CSS.escape(id)}"]`)?.closest('.request-card');if(target){target.classList.add('focus-pulse');target.scrollIntoView({behavior:'smooth',block:'center'});}},80);} else if(a==='filterAdminNotifications'){S.adminNotificationFilter=el.dataset.value||'all';save();render();} else if(a==='markAllNotificationsRead'){targetNotifications('admin').forEach(n=>n.read=true);save();render();} else if(a==='openExpiryOwner'){S.adminTab=el.dataset.route||'providers';save();render();setTimeout(()=>{const p=getProvider(id);if(p)adminEditProvider(p.id);},20);} else if(a==='searchProvidersForUnavailable'){const [cat,service]=String(el.dataset.value||'').split('|');S.admin=false;S.search={cat,service,sort:'rating'};S.view='search';save();render();} else if(a==='saveAdSlides'){const remaining=Math.max(0,10-(S.adSlides||[]).length),images=await readImageFiles('adImages',remaining);if(!images.length){markInvalid('adImages',remaining?L('اختر صورة إعلانية واحدة على الأقل.','Choose at least one ad image.'):L('وصلت إلى الحد الأقصى وهو 10 إعلانات.','The 10-ad limit has been reached.'));return;}images.forEach(image=>S.adSlides.push({id:uid('ad'),image,title:val('adTitle'),text:val('adText'),endDate:val('adEnd'),active:true,createdAt:nowISO()}));S.platform.adIntervalSeconds=Number(val('adInterval')||3);addNotification({type:'ad',title:'تمت إضافة إعلان',message:`${L('تمت إضافة','Added')} ${images.length} ${L('صورة إعلانية.','advertisement images.')}`,target:'admin',priority:'low',actionText:L('فتح الإعلانات','Open advertisements'),actionRoute:'ads',dedupeKey:`ad-added:${Date.now()}`});save();toast(L('تمت إضافة الإعلان.','Ad added.'));render();} else if(a==='toggleAd'){const ad=(S.adSlides||[]).find(x=>x.id===id);if(ad)ad.active=!ad.active;save();render();} else if(a==='deleteAd'){S.adSlides=(S.adSlides||[]).filter(x=>x.id!==id);S.adIndex=0;save();render();}
+ else if(a==='adminLogin'){try{const res=await api('/api/admin/login',{code:val('adminCode'),deviceId:DEVICE_ID});applySessionResponse('admin',res,true);mergeRemote(await api('/api/admin/session',null,AUTH.adminToken));S.admin=true;S.view='admin';save();closeModal();render();}catch(err){toast(String(err?.message||err)==='request_failed'?L('يتطلب دخول الإدارة اتصالًا بالخادم.','Admin sign-in requires a server connection.'):niceError(err));}} else if(a==='adminLogout'){await revokeAuthToken(AUTH.adminToken,'admin');AUTH.adminToken='';AUTH.adminExpiresAt='';AUTH.activeRole=AUTH.userToken?'user':AUTH.providerToken?'provider':'';saveAuth();S.admin=false;restoreStoredAccountContext(S,AUTH.activeRole);S.view=AUTH.activeRole==='provider'?'provider':AUTH.activeRole==='user'?'home':'entry';save();render();window.scrollTo(0,0);} else if(a==='adminTab'){const nav=el.closest('.side-nav');S.adminNavScroll=nav?nav.scrollLeft:S.adminNavScroll;S.adminTab=el.dataset.tab;save();render();window.scrollTo({top:0,left:0,behavior:'auto'});requestAnimationFrame(()=>window.scrollTo({top:0,left:0,behavior:'auto'}));} else if(a==='adminFocusRequest'){S.adminTab='leads';save();render();setTimeout(()=>{const target=document.querySelector(`[data-id="${CSS.escape(id)}"]`)?.closest('.request-card');if(target){target.classList.add('focus-pulse');target.scrollIntoView({behavior:'smooth',block:'center'});}},80);} else if(a==='filterAdminNotifications'){S.adminNotificationFilter=el.dataset.value||'all';save();render();} else if(a==='markAllNotificationsRead'){targetNotifications('admin').forEach(n=>n.read=true);save();render();} else if(a==='openExpiryOwner'){S.adminTab=el.dataset.route||'providers';save();render();setTimeout(()=>{const p=getProvider(id);if(p)adminEditProvider(p.id);},20);} else if(a==='searchProvidersForUnavailable'){const [cat,service]=String(el.dataset.value||'').split('|');S.admin=false;S.search={cat,service,sort:'rating'};S.view='search';save();render();} else if(a==='saveAdSlides'){const remaining=Math.max(0,10-(S.adSlides||[]).length),images=await readImageFiles('adImages',remaining);if(!images.length){markInvalid('adImages',remaining?L('اختر صورة إعلانية واحدة على الأقل.','Choose at least one ad image.'):L('وصلت إلى الحد الأقصى وهو 10 إعلانات.','The 10-ad limit has been reached.'));return;}images.forEach(image=>S.adSlides.push({id:uid('ad'),image,title:val('adTitle'),text:val('adText'),endDate:val('adEnd'),active:true,createdAt:nowISO()}));S.platform.adIntervalSeconds=Number(val('adInterval')||3);addNotification({type:'ad',title:'تمت إضافة إعلان',message:`${L('تمت إضافة','Added')} ${images.length} ${L('صورة إعلانية.','advertisement images.')}`,target:'admin',priority:'low',actionText:L('فتح الإعلانات','Open advertisements'),actionRoute:'ads',dedupeKey:`ad-added:${Date.now()}`});save();toast(L('تمت إضافة الإعلان.','Ad added.'));render();} else if(a==='toggleAd'){const ad=(S.adSlides||[]).find(x=>x.id===id);if(ad)ad.active=!ad.active;save();render();} else if(a==='deleteAd'){S.adSlides=(S.adSlides||[]).filter(x=>x.id!==id);S.adIndex=0;save();render();}
  else if(a==='adminProviderFilter'){S.adminProviderFilter={q:val('adminProviderQ'),type:val('adminProviderType'),status:val('adminProviderStatus'),sub:val('adminProviderSub'),package:val('adminProviderPackage'),service:val('adminProviderService'),featured:val('adminProviderFeatured'),gov:val('adminProviderGov')};save();render();}
  else if(a==='adminProviderWhatsapp'){const p=getProvider(id); if(p)window.open(waUrl(p.phone,`مرحبًا ${p.name}\nمعك إدارة خدماتي.`),'_blank');}
  else if(a==='adminProviderCall'){const p=getProvider(id); if(p)location.href=callUrl(p.phone);}
@@ -6989,8 +7264,8 @@ document.addEventListener('change', e=>{
  if(e.target.id==='ppWorkImages'){const max=Number(e.target.dataset.max||5); if(e.target.files.length>max) toast(`سيتم حفظ أول ${max} صور فقط.`);}
 });
 window.addEventListener('resize',()=>positionTopSearchDropdown(document.querySelector('.global-search')),{passive:true});
-window.addEventListener('online',()=>{flushOfflineQueue().finally(render);});
-document.addEventListener('visibilitychange',()=>{if(!document.hidden)refreshActiveAccountData();});
+window.addEventListener('online',()=>{flushOfflineQueue().finally(()=>refreshActiveAccountData({reason:'online',force:true}));});
+document.addEventListener('visibilitychange',()=>{if(!document.hidden)refreshActiveAccountData({reason:'foreground',force:true});});
 if('serviceWorker' in navigator && /^https?:$/.test(location.protocol)){
  const refreshKey=`${APP_BUILD}:reloaded`;
  const freshRequested=new URLSearchParams(location.search).has('fresh');
@@ -7012,7 +7287,7 @@ navigator.serviceWorker.register(`./service-worker.js?v=${encodeURIComponent(APP
   if(event.data?.type!=='KHADAMATI_NOTIFICATION')return;
   const route=event.data.route||location.href,foregroundBusy=foregroundInteractionInProgress(),match=String(route).match(/notification=([^&]+)/),notificationId=event.data.notificationId||(match?decodeURIComponent(match[1]):'');
   if(foregroundBusy&&notificationId)rememberPendingNotification(notificationId);
-  refreshActiveAccountData().finally(()=>{if(foregroundBusy){renderActionPrompt();return;}if(!openAppDeepLink(route))renderActionPrompt();});
+  refreshActiveAccountData({reason:'push',force:true}).finally(()=>{if(foregroundBusy){renderActionPrompt();return;}if(!openAppDeepLink(route))renderActionPrompt();});
  });
 }
 boot();

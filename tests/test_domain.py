@@ -29,6 +29,7 @@ from khadamati_domain import (  # noqa: E402
     PLAN_IDS,
     PlanCatalog,
     PaymentAdapter,
+    RankingService,
     RequestMarketplace,
     SubscriptionService,
 )
@@ -316,6 +317,226 @@ class KhadamatiDomainTests(unittest.TestCase):
             self.con, now=now + timedelta(minutes=21), expansion_minutes=20, min_offers=2
         ).release_due(request_id)
         self.assertEqual(5, len(expanded))
+
+    def test_technical_support_family_matches_but_design_stays_exact_only(self):
+        request = {
+            "service_value": "tech|tech_support",
+            "gov": "مسقط",
+            "wilayah": "السيب",
+        }
+
+        def provider(service_id, *, category_id="tech", gov="مسقط", wilayah="السيب"):
+            return {
+                "services": [
+                    {
+                        "catId": category_id,
+                        "serviceId": service_id,
+                        "active": True,
+                    }
+                ],
+                "areas": [gov, wilayah],
+                "gov": gov,
+                "wilayah": wilayah,
+            }
+
+        self.assertEqual(
+            "exact",
+            RankingService.service_match_details(request, provider("tech_support"))["kind"],
+        )
+        for related_service in ("networks", "pc", "printer"):
+            self.assertEqual(
+                "related",
+                RankingService.service_match_details(request, provider(related_service))["kind"],
+            )
+        self.assertFalse(RankingService.service_match(request, provider("design")))
+        self.assertTrue(
+            RankingService.exact_service_match(
+                {**request, "service_value": "tech|design"}, provider("design")
+            )
+        )
+        self.assertFalse(
+            RankingService.service_match(
+                request, provider("networks", category_id="other-tech")
+            )
+        )
+        self.assertEqual(
+            "area_mismatch",
+            RankingService.exclusion_reason(
+                request, provider("networks", gov="الداخلية", wilayah="نزوى")
+            ),
+        )
+
+    def test_marketplace_prefers_exact_before_related_service_family(self):
+        now = datetime(2026, 8, 1, 8, tzinfo=UTC)
+        exact_id = self.provider("302", cat="tech", service="tech_support")
+        related_id = self.provider("303", cat="tech", service="networks")
+        design_id = self.provider("304", cat="tech", service="design")
+        for provider_id in (exact_id, related_id, design_id):
+            self.activate(provider_id, "individual_gold_6m", now)
+        self.con.execute(
+            "UPDATE providers SET quality_score=20 WHERE id=?", (exact_id,)
+        )
+        self.con.execute(
+            "UPDATE providers SET quality_score=100 WHERE id=?", (related_id,)
+        )
+        user_id = self.user("302")
+        request_id = "domain-request-tech-family"
+        self.con.execute(
+            """INSERT INTO customer_requests(
+            id,user_id,customer_name,phone,service_value,service_name,gov,wilayah,
+            status,requested_at)
+            VALUES(?,?,?,?,?,?,?,?, 'matching',?)""",
+            (
+                request_id,
+                user_id,
+                "مستخدم الدعم التقني",
+                "96895550302",
+                "tech|tech_support",
+                "دعم تقني",
+                "مسقط",
+                "السيب",
+                now.isoformat(),
+            ),
+        )
+        ranked = RequestMarketplace(self.con, now=now).schedule(request_id)
+        ranked_ids = [item["providerId"] for item in ranked]
+        self.assertIn(exact_id, ranked_ids)
+        self.assertIn(related_id, ranked_ids)
+        self.assertNotIn(design_id, ranked_ids)
+        self.assertLess(ranked_ids.index(exact_id), ranked_ids.index(related_id))
+        by_id = {item["providerId"]: item for item in ranked}
+        self.assertEqual("exact", by_id[exact_id]["matchType"])
+        self.assertEqual("related", by_id[related_id]["matchType"])
+        self.assertGreater(
+            by_id[exact_id]["breakdown"]["match"],
+            by_id[related_id]["breakdown"]["match"],
+        )
+
+    def test_subscription_switch_bypasses_only_subscription_gate(self):
+        now = datetime(2026, 8, 1, 8, tzinfo=UTC)
+        provider_id = self.provider("305", cat="tech", service="tech_support")
+        # Deliberately leave the provider without a subscription, while keeping
+        # management approval, availability, listing, and request intake on.
+        self.con.execute(
+            """UPDATE providers SET active=1,verified=1,status='available',
+            listing_enabled=1,request_enabled=1 WHERE id=?""",
+            (provider_id,),
+        )
+        settings_row = self.con.execute(
+            "SELECT value FROM settings WHERE key='platform'"
+        ).fetchone()
+        settings = json.loads(settings_row["value"])
+        settings["subscriptionsEnabled"] = False
+        self.con.execute(
+            "UPDATE settings SET value=? WHERE key='platform'",
+            (json.dumps(settings, ensure_ascii=False),),
+        )
+        user_id = self.user("305")
+        request_id = "domain-request-open-access"
+        self.con.execute(
+            """INSERT INTO customer_requests(
+            id,user_id,customer_name,phone,service_value,service_name,gov,wilayah,
+            status,requested_at)
+            VALUES(?,?,?,?,?,?,?,?, 'matching',?)""",
+            (
+                request_id,
+                user_id,
+                "مستخدم الوصول المفتوح",
+                "96895550305",
+                "tech|tech_support",
+                "دعم تقني",
+                "مسقط",
+                "السيب",
+                now.isoformat(),
+            ),
+        )
+        marketplace = RequestMarketplace(self.con, now=now)
+        ranked = marketplace.schedule(request_id)
+        self.assertIn(provider_id, [item["providerId"] for item in ranked])
+        allowed, reason, grants = EntitlementService(self.con, now=now).can_receive(
+            provider_id, enforce_subscription=False
+        )
+        self.assertTrue(allowed)
+        self.assertEqual("", reason)
+        self.assertFalse(grants["subscriptionEnforced"])
+
+        for column, value, expected_reason in (
+            ("verified", 0, "provider_not_approved"),
+            ("listing_enabled", 0, "provider_not_approved"),
+            ("status", "unavailable", "provider_unavailable"),
+            ("request_enabled", 0, "provider_unavailable"),
+            ("active", 0, "provider_inactive"),
+        ):
+            self.con.execute(
+                """UPDATE providers SET active=1,verified=1,status='available',
+                listing_enabled=1,request_enabled=1 WHERE id=?""",
+                (provider_id,),
+            )
+            self.con.execute(
+                f"UPDATE providers SET {column}=? WHERE id=?", (value, provider_id)
+            )
+            allowed, reason, _ = EntitlementService(self.con, now=now).can_receive(
+                provider_id, enforce_subscription=False
+            )
+            self.assertFalse(allowed)
+            self.assertEqual(expected_reason, reason)
+
+        self.con.execute(
+            """UPDATE providers SET active=1,verified=1,status='available',
+            listing_enabled=1,request_enabled=1 WHERE id=?""",
+            (provider_id,),
+        )
+        settings["subscriptionsEnabled"] = True
+        self.con.execute(
+            "UPDATE settings SET value=? WHERE key='platform'",
+            (json.dumps(settings, ensure_ascii=False),),
+        )
+        allowed, reason, _ = EntitlementService(self.con, now=now).can_receive(provider_id)
+        self.assertFalse(allowed)
+        self.assertEqual("subscription_inactive", reason)
+
+    def test_marketplace_diagnostics_are_aggregate_and_privacy_safe(self):
+        now = datetime(2026, 8, 1, 8, tzinfo=UTC)
+        eligible_id = self.provider("306", cat="tech", service="networks")
+        mismatch_id = self.provider("307", cat="tech", service="design")
+        wrong_area_id = self.provider(
+            "308", cat="tech", service="pc", gov="الداخلية", wilayah="نزوى"
+        )
+        for provider_id in (eligible_id, mismatch_id, wrong_area_id):
+            self.activate(provider_id, "individual_gold_6m", now)
+        user_id = self.user("306")
+        request_id = "domain-request-private-diagnostics"
+        self.con.execute(
+            """INSERT INTO customer_requests(
+            id,user_id,customer_name,phone,service_value,service_name,gov,wilayah,
+            status,requested_at)
+            VALUES(?,?,?,?,?,?,?,?, 'matching',?)""",
+            (
+                request_id,
+                user_id,
+                "مستخدم التشخيص",
+                "96895550306",
+                "tech|tech_support",
+                "دعم تقني",
+                "مسقط",
+                "السيب",
+                now.isoformat(),
+            ),
+        )
+        diagnostics = RequestMarketplace(self.con, now=now).diagnostics(request_id)
+        self.assertTrue(diagnostics["privacySafe"])
+        self.assertGreaterEqual(diagnostics["eligibleProviders"], 1)
+        self.assertGreaterEqual(diagnostics["reasons"].get("service_mismatch", 0), 1)
+        self.assertGreaterEqual(diagnostics["reasons"].get("area_mismatch", 0), 1)
+        serialized = json.dumps(diagnostics, ensure_ascii=False)
+        for private_value in (
+            eligible_id,
+            mismatch_id,
+            wrong_area_id,
+            "مستخدم التشخيص",
+            "96895550306",
+        ):
+            self.assertNotIn(private_value, serialized)
 
     def test_plan_delay_starts_only_when_subscriptions_are_enabled(self):
         now = datetime(2026, 7, 18, 12, tzinfo=UTC)

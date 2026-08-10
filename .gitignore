@@ -26,6 +26,7 @@ tests/__*.out
 tests/__*.err
 tests/__screens-*/
 tests/__debug*.png
+tmp/**/*.sqlite3
 __screenshots-*/
 .pip-audit-cache*/
 .pip-audit-tool/
