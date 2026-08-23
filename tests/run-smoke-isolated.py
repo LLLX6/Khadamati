@@ -13,6 +13,8 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
+from runtime_test_env import add_windows_crypto_shim
+
 
 ROOT = Path(__file__).resolve().parents[1]
 ADMIN_CODE = "Smoke-Admin-6200"
@@ -53,6 +55,7 @@ def main() -> None:
                 "KHADAMATI_MEDIA_SIGNING_KEY": "smoke-media-signing-key-6200",
             }
         )
+        add_windows_crypto_shim(env, temp)
         process = subprocess.Popen(
             [sys.executable, "server.py"],
             cwd=ROOT,

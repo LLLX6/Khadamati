@@ -17,6 +17,9 @@ MIRRORED_FILES = (
     "index.html",
     "service-worker.js",
     "manifest.webmanifest",
+    "assets/styles/khadamati-v1.css",
+    "assets/scripts/khadamati-visuals.js",
+    "assets/scripts/khadamati-ui-state.js",
     "app-icon-192.png",
     "app-icon-512.png",
 )

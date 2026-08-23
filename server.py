@@ -34,6 +34,7 @@ from khadamati_domain import (
     PLAN_IDS,
     POLICY_VERSION,
     SUPPORT_EMAIL,
+    CommercialRecordService,
     ContactConsentService,
     DomainError,
     EntitlementService,
@@ -43,6 +44,7 @@ from khadamati_domain import (
     RankingService,
     RequestMarketplace,
     SubscriptionService,
+    parse_marketplace_datetime,
     run_subscription_migration_v1,
 )
 from khadamati_workflow import (
@@ -84,6 +86,8 @@ from khadamati_trust import (
     ComplaintCaseService,
     InteractionBlockService,
     ProviderVerificationService,
+    assert_provider_verification_evidence,
+    assert_verification_evidence,
     install_trust_schema,
     trust_statistics,
 )
@@ -148,10 +152,18 @@ def environment_flag(name, default=False):
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
-APP_RELEASE = os.environ.get("KHADAMATI_RELEASE", "v1.0.0").strip() or "v1.0.0"
+SERVER_VERSION = (
+    os.environ.get("KHADAMATI_SERVER_VERSION")
+    or os.environ.get("KHADAMATI_RELEASE")
+    or "1.2.0"
+).strip().removeprefix("v") or "1.2.0"
+# Keep the historic release field as an alias while exposing one version
+# contract to health, readiness, bootstrap, and structured logs.
+APP_RELEASE = SERVER_VERSION
 TRUST_MIGRATION_KEY = "TRUST_SCHEMA_V1"
 QUALITY_MIGRATION_KEY = "QUALITY_SCHEMA_V1"
 PLATFORM_MIGRATION_KEY = "PLATFORM_SCHEMA_V1"
+MATCHING_MIGRATION_KEY = "MATCHING_SCHEMA_V2"
 SAMPLE_DATA_ENABLED = environment_flag(
     "KHADAMATI_SEED_SAMPLE_DATA",
     environment_flag("KHADAMATI_SEED_DEMO_DATA", APP_ENV in {"development", "test"}),
@@ -178,6 +190,20 @@ ACCESS_TOKEN_MINUTES = max(
     5, int(os.environ.get("KHADAMATI_ACCESS_TOKEN_MINUTES", "480"))
 )
 PUBLIC_APP_URL = os.environ.get("KHADAMATI_PUBLIC_URL", "https://lllx6.github.io/Khadamati/").rstrip("/") + "/"
+
+
+def safe_public_app_url(value=None):
+    candidate = str(value or PUBLIC_APP_URL).strip()
+    parsed = urlparse(candidate)
+    if (
+        parsed.scheme == "https"
+        and parsed.hostname
+        and not parsed.username
+        and not parsed.password
+        and not parsed.fragment
+    ):
+        return candidate.rstrip("/") + "/"
+    return "https://lllx6.github.io/Khadamati/"
 LOGIN_MAX_ATTEMPTS = max(3, int(os.environ.get("KHADAMATI_LOGIN_MAX_ATTEMPTS", "5")))
 LOGIN_LOCK_MINUTES = max(1, int(os.environ.get("KHADAMATI_LOGIN_LOCK_MINUTES", "15")))
 MEDIA_URL_TTL_SECONDS = max(60, int(os.environ.get("KHADAMATI_MEDIA_URL_TTL_SECONDS", "21600")))
@@ -272,6 +298,125 @@ CHAT_MIMES = {
 VIDEO_MIMES = {"video/mp4": "mp4", "video/webm": "webm", "video/quicktime": "mov"}
 
 
+class _DeferredJsonResponse:
+    """A JSON response that may only reach the socket after DB commit."""
+
+    def __init__(self, handler, raw, status, extra_headers):
+        self.handler = handler
+        self.raw = raw
+        self.status = status
+        self.extra_headers = tuple(extra_headers or ())
+
+    def flush(self):
+        if getattr(self.handler, "_deferred_json_response", None) is not self:
+            return
+        self.handler._deferred_json_response = None
+        self.handler._write_json_response(
+            self.raw, self.status, self.extra_headers
+        )
+
+    def discard(self):
+        if getattr(self.handler, "_deferred_json_response", None) is self:
+            self.handler._deferred_json_response = None
+
+
+class _DatabaseResponseScope:
+    def __init__(self):
+        self.responses = []
+        self.after_commit = []
+        self.after_rollback = []
+
+    def add(self, response):
+        self.responses.append(response)
+
+    def add_after_commit(self, callback):
+        self.after_commit.append(callback)
+
+    def add_after_rollback(self, callback):
+        self.after_rollback.append(callback)
+
+    def merge_into(self, parent):
+        parent.responses.extend(self.responses)
+        parent.after_commit.extend(self.after_commit)
+        parent.after_rollback.extend(self.after_rollback)
+        self.responses = []
+        self.after_commit = []
+        self.after_rollback = []
+
+    def flush(self):
+        # The owning transaction committed, so rollback cleanup must never run.
+        self.after_rollback = []
+        callbacks, self.after_commit = self.after_commit, []
+        for callback in callbacks:
+            try:
+                callback()
+            except Exception as err:
+                log_event(
+                    "database.after_commit_failed",
+                    level="error",
+                    errorType=type(err).__name__,
+                )
+        responses, self.responses = self.responses, []
+        for response in responses:
+            response.flush()
+
+    def discard(self):
+        self.after_commit = []
+        callbacks, self.after_rollback = self.after_rollback, []
+        for callback in reversed(callbacks):
+            try:
+                callback()
+            except Exception as err:
+                log_event(
+                    "database.after_rollback_failed",
+                    level="error",
+                    errorType=type(err).__name__,
+                )
+        responses, self.responses = self.responses, []
+        for response in responses:
+            response.discard()
+
+
+_DATABASE_RESPONSE_STATE = threading.local()
+
+
+def _database_response_stack():
+    stack = getattr(_DATABASE_RESPONSE_STATE, "stack", None)
+    if stack is None:
+        stack = []
+        _DATABASE_RESPONSE_STATE.stack = stack
+    return stack
+
+
+def _defer_json_response(response):
+    stack = getattr(_DATABASE_RESPONSE_STATE, "stack", None)
+    if not stack:
+        return False
+    stack[-1].add(response)
+    return True
+
+
+def _after_database_commit(callback):
+    """Run a filesystem/network side effect only after the owning commit."""
+
+    stack = getattr(_DATABASE_RESPONSE_STATE, "stack", None)
+    if not stack:
+        callback()
+        return False
+    stack[-1].add_after_commit(callback)
+    return True
+
+
+def _after_database_rollback(callback):
+    """Undo a newly-created filesystem side effect if the DB rolls back."""
+
+    stack = getattr(_DATABASE_RESPONSE_STATE, "stack", None)
+    if not stack:
+        return False
+    stack[-1].add_after_rollback(callback)
+    return True
+
+
 @contextmanager
 def db():
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -279,11 +424,312 @@ def db():
     con.row_factory = sqlite3.Row
     con.execute("PRAGMA busy_timeout=12000")
     con.execute("PRAGMA foreign_keys=ON")
+    response_scope = _DatabaseResponseScope()
+    response_stack = _database_response_stack()
+    response_stack.append(response_scope)
+    committed = False
     try:
         with con:
             yield con
+        committed = True
     finally:
-        con.close()
+        if response_stack and response_stack[-1] is response_scope:
+            response_stack.pop()
+        else:
+            # Defensive cleanup if a caller corrupts nesting; never flush an
+            # acknowledgement whose owning transaction cannot be identified.
+            committed = False
+            try:
+                response_stack.remove(response_scope)
+            except ValueError:
+                pass
+        parent_response_scope = response_stack[-1] if response_stack else None
+        if not response_stack:
+            try:
+                del _DATABASE_RESPONSE_STATE.stack
+            except AttributeError:
+                pass
+        try:
+            con.close()
+        finally:
+            if committed:
+                if parent_response_scope:
+                    response_scope.merge_into(parent_response_scope)
+                else:
+                    response_scope.flush()
+            else:
+                response_scope.discard()
+
+
+def _directory_write_probe(path):
+    """Prove directory writability without retaining a readiness artifact."""
+    target = Path(path)
+    if not target.exists() or not target.is_dir():
+        return False
+    probe = target / f".khadamati-ready-{secrets.token_hex(8)}"
+    try:
+        with probe.open("x", encoding="utf-8") as stream:
+            stream.write(SERVER_VERSION)
+            stream.flush()
+            os.fsync(stream.fileno())
+        return probe.read_text(encoding="utf-8") == SERVER_VERSION
+    except OSError:
+        return False
+    finally:
+        try:
+            probe.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _database_write_rollback_probe(path):
+    """Prove the real SQLite file is writable without retaining any mutation."""
+    target = Path(path)
+    if not target.exists() or not target.is_file():
+        return False
+    connection = None
+    probe_key = f"__khadamati_readiness_{secrets.token_hex(8)}"
+    try:
+        uri = f"file:{target.resolve().as_posix()}?mode=rw"
+        connection = sqlite3.connect(
+            uri, uri=True, timeout=5, isolation_level=None
+        )
+        connection.execute("PRAGMA busy_timeout=5000")
+        connection.execute("BEGIN IMMEDIATE")
+        connection.execute(
+            "INSERT INTO settings(key,value) VALUES(?,?)",
+            (probe_key, SERVER_VERSION),
+        )
+        inserted = connection.execute(
+            "SELECT value FROM settings WHERE key=?", (probe_key,)
+        ).fetchone()
+        if not inserted or inserted[0] != SERVER_VERSION:
+            connection.execute("ROLLBACK")
+            return False
+        connection.execute("ROLLBACK")
+        retained = connection.execute(
+            "SELECT 1 FROM settings WHERE key=?", (probe_key,)
+        ).fetchone()
+        return retained is None
+    except (OSError, sqlite3.Error):
+        if connection is not None and connection.in_transaction:
+            try:
+                connection.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+        return False
+    finally:
+        if connection is not None:
+            connection.close()
+
+
+def storage_readiness(
+    *, environment=None, db_path=None, upload_dir=None, backup_dir=None
+):
+    """Return privacy-safe, evidence-based persistence readiness details."""
+    environment = environment or os.environ
+    db_path = Path(db_path or DB_PATH)
+    upload_dir = Path(upload_dir or UPLOAD_DIR)
+    backup_dir = Path(backup_dir or BACKUP_DIR)
+    production = str(environment.get("KHADAMATI_ENV", APP_ENV)).strip().lower() == "production"
+    issues = []
+    if production:
+        for variable, code in (
+            ("KHADAMATI_DB_PATH", "database_path_not_configured"),
+            ("KHADAMATI_UPLOAD_DIR", "upload_path_not_configured"),
+            ("KHADAMATI_BACKUP_DIR", "backup_path_not_configured"),
+        ):
+            if not str(environment.get(variable, "")).strip():
+                issues.append(code)
+
+    checks = {
+        "databaseParentWritable": _directory_write_probe(db_path.parent),
+        "uploadWritable": _directory_write_probe(upload_dir),
+        "backupWritable": _directory_write_probe(backup_dir),
+        "databaseReadable": False,
+        "databaseWritable": False,
+        "backupOperational": False,
+    }
+    if not checks["databaseParentWritable"]:
+        issues.append("database_parent_not_writable")
+    if not checks["uploadWritable"]:
+        issues.append("upload_path_not_writable")
+    if not checks["backupWritable"]:
+        issues.append("backup_path_not_writable")
+    if not db_path.exists() or not db_path.is_file():
+        issues.append("database_missing")
+    else:
+        try:
+            uri = f"file:{db_path.resolve().as_posix()}?mode=ro"
+            connection = sqlite3.connect(uri, uri=True, timeout=5)
+            try:
+                check = connection.execute("PRAGMA quick_check").fetchone()
+                checks["databaseReadable"] = bool(check and check[0] == "ok")
+            finally:
+                connection.close()
+        except sqlite3.Error:
+            checks["databaseReadable"] = False
+        if not checks["databaseReadable"]:
+            issues.append("database_unavailable")
+        else:
+            checks["databaseWritable"] = _database_write_rollback_probe(db_path)
+            if not checks["databaseWritable"]:
+                issues.append("database_not_writable")
+
+    if checks["backupWritable"]:
+        backup_probe = backup_dir / f".khadamati-backup-{secrets.token_hex(8)}.sqlite3"
+        source = destination = None
+        try:
+            source = sqlite3.connect(":memory:")
+            source.execute("CREATE TABLE readiness_probe(value TEXT NOT NULL)")
+            source.execute("INSERT INTO readiness_probe(value) VALUES(?)", (SERVER_VERSION,))
+            source.commit()
+            destination = sqlite3.connect(backup_probe)
+            source.backup(destination)
+            destination.close()
+            destination = sqlite3.connect(f"file:{backup_probe.resolve().as_posix()}?mode=ro", uri=True)
+            row = destination.execute("SELECT value FROM readiness_probe").fetchone()
+            checks["backupOperational"] = bool(row and row[0] == SERVER_VERSION)
+        except (OSError, sqlite3.Error):
+            checks["backupOperational"] = False
+        finally:
+            if destination is not None:
+                destination.close()
+            if source is not None:
+                source.close()
+            try:
+                backup_probe.unlink(missing_ok=True)
+            except OSError:
+                pass
+    if not checks["backupOperational"]:
+        issues.append("backup_not_operational")
+    return {"ok": not issues, "issues": list(dict.fromkeys(issues)), "checks": checks}
+
+
+class BackupService:
+    """Create verified, bounded SQLite snapshots without exposing database files."""
+
+    PREFIX = "khadamati-manual-"
+    SUFFIX = ".sqlite3"
+
+    def __init__(self, *, db_path=None, backup_dir=None, retention=None):
+        self.db_path = Path(db_path or DB_PATH)
+        self.backup_dir = Path(backup_dir or BACKUP_DIR)
+        if retention is None:
+            configured = os.environ.get("KHADAMATI_BACKUP_RETENTION", "").strip()
+            try:
+                retention = int(configured) if configured else 0
+            except (TypeError, ValueError):
+                retention = 0
+        try:
+            requested_retention = int(retention)
+        except (TypeError, ValueError):
+            requested_retention = 0
+        # Safety default: never delete a verified backup unless the owner has
+        # explicitly configured retention.  Positive policies remain bounded.
+        self.retention = (
+            max(2, min(requested_retention, 30))
+            if requested_retention > 0 else 0
+        )
+
+    def _managed_files(self):
+        if not self.backup_dir.exists() or not self.backup_dir.is_dir():
+            return []
+        return sorted(
+            (
+                path for path in self.backup_dir.iterdir()
+                if path.is_file()
+                and path.name.startswith(self.PREFIX)
+                and path.name.endswith(self.SUFFIX)
+                and re.fullmatch(r"[A-Za-z0-9_.-]+", path.name)
+            ),
+            key=lambda path: (path.stat().st_mtime_ns, path.name),
+            reverse=True,
+        )
+
+    @staticmethod
+    def _verified(path):
+        connection = None
+        try:
+            uri = f"file:{Path(path).resolve().as_posix()}?mode=ro"
+            connection = sqlite3.connect(uri, uri=True, timeout=8)
+            row = connection.execute("PRAGMA quick_check").fetchone()
+            return bool(row and row[0] == "ok")
+        except (OSError, sqlite3.Error):
+            return False
+        finally:
+            if connection is not None:
+                connection.close()
+
+    def _metadata(self, path, *, verified=None):
+        stat = path.stat()
+        return {
+            "id": path.name,
+            "filename": path.name,
+            "sizeBytes": int(stat.st_size),
+            "createdAt": datetime.fromtimestamp(stat.st_mtime, UTC).isoformat(),
+            "verified": self._verified(path) if verified is None else bool(verified),
+        }
+
+    def list(self):
+        return [self._metadata(path) for path in self._managed_files()]
+
+    def create(self, label="manual"):
+        if not self.db_path.exists() or not self.db_path.is_file():
+            raise DomainError("database_missing", 503)
+        self.backup_dir.mkdir(parents=True, exist_ok=True)
+        if not _directory_write_probe(self.backup_dir):
+            raise DomainError("backup_path_not_writable", 503)
+        safe_label = re.sub(
+            r"[^a-z0-9_-]+", "-", str(label or "manual").strip().lower()
+        ).strip("-")[:32] or "manual"
+        stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
+        filename = (
+            f"{self.PREFIX}{stamp}-{safe_label}-{secrets.token_hex(4)}{self.SUFFIX}"
+        )
+        target = self.backup_dir / filename
+        source = destination = None
+        try:
+            descriptor = os.open(target, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            os.close(descriptor)
+            source = sqlite3.connect(self.db_path, timeout=12)
+            source.execute("PRAGMA busy_timeout=12000")
+            destination = sqlite3.connect(target, timeout=12)
+            source.backup(destination)
+            destination.commit()
+            destination.close()
+            destination = None
+            with target.open("rb+") as stream:
+                os.fsync(stream.fileno())
+            if not self._verified(target):
+                raise DomainError("backup_verification_failed", 503)
+            metadata = self._metadata(target, verified=True)
+        except DomainError:
+            try:
+                target.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise
+        except (OSError, sqlite3.Error) as exc:
+            try:
+                target.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise DomainError("backup_creation_failed", 503) from exc
+        finally:
+            if destination is not None:
+                destination.close()
+            if source is not None:
+                source.close()
+        if self.retention:
+            for expired in self._managed_files()[self.retention:]:
+                try:
+                    expired.unlink()
+                except OSError:
+                    # The verified new snapshot remains valid; a later run can
+                    # retry retention without turning success into data loss.
+                    pass
+        return metadata
 
 
 def slug(prefix):
@@ -449,21 +895,92 @@ def normalized_availability(value, fallback=None):
     }
 
 
+def _normalized_coverage_values(value, *, error_code):
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise DomainError(error_code, 400)
+    return list(
+        dict.fromkeys(
+            safe_text(item, 80) for item in value if safe_text(item, 80)
+        )
+    )
+
+
+def _provider_coverage_catalog(con):
+    """Return alias indexes used only to prove a service area is in scope."""
+    governorate_aliases = {}
+    wilayah_aliases = {}
+    for governorate in location_snapshot(con, include_inactive=True):
+        governorate_id = safe_text(governorate.get("id"), 120)
+        for alias in (
+            governorate_id,
+            governorate.get("ar"),
+            governorate.get("en"),
+        ):
+            normalized = safe_text(alias, 120).strip().casefold()
+            if normalized:
+                governorate_aliases[normalized] = governorate_id
+        for wilayah in governorate.get("w", []):
+            wilayah_id = safe_text(wilayah.get("id"), 120)
+            for alias in (wilayah_id, wilayah.get("ar"), wilayah.get("en")):
+                normalized = safe_text(alias, 120).strip().casefold()
+                if normalized:
+                    wilayah_aliases[normalized] = (wilayah_id, governorate_id)
+    return governorate_aliases, wilayah_aliases
+
+
 def normalized_provider_services(
-    con, value, *, limit, category_limit=1, fallback_price=0, default_areas=None
+    con,
+    value,
+    *,
+    limit,
+    category_limit=1,
+    fallback_price=0,
+    default_areas=None,
+    provider_type="individual",
+    coverage_areas=None,
+    coverage_governorates=None,
+    wilayah_limit=None,
 ):
     if not isinstance(value, list):
         raise DomainError("services_must_be_list", 400)
+    default_areas = _normalized_coverage_values(
+        default_areas, error_code="areas_must_be_list"
+    )
+    account_areas = _normalized_coverage_values(
+        default_areas if coverage_areas is None else coverage_areas,
+        error_code="areas_must_be_list",
+    )
+    account_governorates = _normalized_coverage_values(
+        coverage_governorates, error_code="governorates_must_be_list"
+    )
+    governorate_aliases, wilayah_aliases = _provider_coverage_catalog(con)
+
+    def area_key(area):
+        normalized = safe_text(area, 80).strip().casefold()
+        catalog_area = wilayah_aliases.get(normalized)
+        return catalog_area[0] if catalog_area else f"raw:{normalized}"
+
+    allowed_area_keys = {area_key(area) for area in account_areas}
+    allowed_governorate_ids = {
+        governorate_aliases.get(item.strip().casefold(), f"raw:{item.strip().casefold()}")
+        for item in account_governorates
+    }
+    company_governorate_scope = (
+        provider_type == "company" and not account_areas and account_governorates
+    )
     services = []
     seen = set()
     categories = set()
+    service_area_keys = set()
     for item in value:
         if not isinstance(item, dict):
             continue
         cat_id = safe_text(item.get("catId"), 80)
         service_id = safe_text(item.get("serviceId"), 80)
-        key = (cat_id, service_id)
-        if not cat_id or not service_id or key in seen:
+        service_key = (cat_id, service_id)
+        if not cat_id or not service_id or service_key in seen:
             continue
         exists = con.execute(
             """SELECT s.id FROM services s JOIN categories c ON c.id=s.category_id
@@ -473,10 +990,32 @@ def normalized_provider_services(
         ).fetchone()
         if not exists:
             raise DomainError("service_not_found", 400, f"{cat_id}|{service_id}")
-        item_areas = item.get("areas", default_areas or [])
+        item_areas = item.get("areas", default_areas)
         if not isinstance(item_areas, list):
-            item_areas = default_areas or []
-        areas = list(dict.fromkeys(safe_text(area, 80) for area in item_areas if safe_text(area, 80)))[:50]
+            item_areas = default_areas
+        areas = list(
+            dict.fromkeys(
+                safe_text(area, 80) for area in item_areas if safe_text(area, 80)
+            )
+        )[:50]
+        for area in areas:
+            area_scope_key = area_key(area)
+            if account_areas:
+                in_scope = area_scope_key in allowed_area_keys
+            elif company_governorate_scope:
+                catalog_area = wilayah_aliases.get(area.strip().casefold())
+                in_scope = bool(
+                    catalog_area and catalog_area[1] in allowed_governorate_ids
+                )
+            else:
+                in_scope = False
+            if not in_scope:
+                raise DomainError("service_area_outside_coverage", 409, area)
+            service_area_keys.add(area_scope_key)
+        if not areas and account_areas:
+            # An empty service list inherits the account wilayahs at match time,
+            # so those effective areas must count against the same plan limit.
+            service_area_keys.update(allowed_area_keys)
         services.append(
             {
                 "id": safe_text(item.get("id"), 100) or slug("ps"),
@@ -489,12 +1028,22 @@ def normalized_provider_services(
                 "areas": areas,
             }
         )
-        seen.add(key)
+        seen.add(service_key)
         categories.add(cat_id)
     if len(services) > max(1, int(limit)):
         raise DomainError("service_limit_exceeded", 409)
     if len(categories) > max(1, int(category_limit)):
         raise DomainError("provider_category_limit", 409)
+    if wilayah_limit is not None:
+        try:
+            effective_wilayah_limit = int(wilayah_limit)
+        except (TypeError, ValueError) as exc:
+            raise DomainError("invalid_wilayah_limit", 500) from exc
+        if (
+            effective_wilayah_limit > 0
+            and len(service_area_keys) > effective_wilayah_limit
+        ):
+            raise DomainError("wilayah_limit_exceeded", 409)
     return services
 
 
@@ -952,7 +1501,7 @@ def ensure_column(con, table, column, definition):
 
 
 def create_pre_migration_backup(migration_key=MIGRATION_KEY):
-    """Create one SQLite snapshot immediately before an additive migration."""
+    """Create and fsync a verified snapshot or abort before migration."""
     if not DB_PATH.exists() or DB_PATH.stat().st_size == 0:
         return None
     source = sqlite3.connect(DB_PATH, timeout=12)
@@ -967,28 +1516,62 @@ def create_pre_migration_backup(migration_key=MIGRATION_KEY):
         if migrated:
             return None
         BACKUP_DIR.mkdir(parents=True, exist_ok=True)
-        stamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
+        if not _directory_write_probe(BACKUP_DIR):
+            raise RuntimeError("pre_migration_backup_path_not_writable")
+        stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
         safe_key = re.sub(r"[^a-z0-9_-]+", "-", migration_key.lower()).strip("-")
-        target = BACKUP_DIR / f"khadamati-pre-{safe_key}-{stamp}.sqlite3"
-        destination = sqlite3.connect(target)
+        target = BACKUP_DIR / (
+            f"khadamati-pre-{safe_key}-{stamp}-{secrets.token_hex(4)}.sqlite3"
+        )
+        destination = None
         try:
+            descriptor = os.open(target, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            os.close(descriptor)
+            destination = sqlite3.connect(target, timeout=12)
             source.backup(destination)
-        finally:
+            destination.commit()
             destination.close()
-        return target
+            destination = None
+            with target.open("rb+") as stream:
+                os.fsync(stream.fileno())
+            if not BackupService._verified(target):
+                raise RuntimeError("pre_migration_backup_verification_failed")
+            return target
+        except (OSError, sqlite3.Error, RuntimeError) as exc:
+            try:
+                target.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise RuntimeError(
+                f"pre_migration_backup_failed:{safe_key or 'migration'}"
+            ) from exc
+        finally:
+            if destination is not None:
+                destination.close()
     finally:
         source.close()
 
 
 def init_db():
-    backup_paths = [
-        create_pre_migration_backup(MIGRATION_KEY),
-        create_pre_migration_backup(TRUST_MIGRATION_KEY),
-        create_pre_migration_backup(QUALITY_MIGRATION_KEY),
-        create_pre_migration_backup(PLATFORM_MIGRATION_KEY),
-    ]
-    for backup_path in dict.fromkeys(path for path in backup_paths if path):
-        log_event("database.pre_migration_backup", file=backup_path.name)
+    # One verified snapshot taken before the first pending migration covers the
+    # whole additive batch and avoids writing several identical database copies.
+    for migration_key in (
+        MIGRATION_KEY,
+        TRUST_MIGRATION_KEY,
+        QUALITY_MIGRATION_KEY,
+        PLATFORM_MIGRATION_KEY,
+        CommercialRecordService.LEGACY_MIGRATION_KEY,
+        CommercialRecordService.SCHEMA_MIGRATION_KEY,
+        MATCHING_MIGRATION_KEY,
+    ):
+        backup_path = create_pre_migration_backup(migration_key)
+        if backup_path:
+            log_event(
+                "database.pre_migration_backup",
+                file=backup_path.name,
+                migration=migration_key,
+            )
+            break
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
     BACKUP_DIR.mkdir(parents=True, exist_ok=True)
     with db() as con:
@@ -1027,7 +1610,8 @@ def init_db():
             );
             CREATE TABLE IF NOT EXISTS leads(
               id TEXT PRIMARY KEY, provider_id TEXT, kind TEXT, customer_name TEXT, phone TEXT, note TEXT,
-              service_value TEXT DEFAULT '', service_name TEXT DEFAULT '', gov TEXT DEFAULT '', status TEXT DEFAULT 'open',
+              service_value TEXT DEFAULT '', service_name TEXT DEFAULT '', gov TEXT DEFAULT '',
+              wilayah TEXT DEFAULT '', status TEXT DEFAULT 'open',
               created_at TEXT DEFAULT CURRENT_TIMESTAMP
             );
             CREATE TABLE IF NOT EXISTS finance(
@@ -1039,7 +1623,8 @@ def init_db():
             CREATE TABLE IF NOT EXISTS reviews(
               id TEXT PRIMARY KEY, provider_id TEXT NOT NULL, rating INTEGER NOT NULL, customer_name TEXT,
               phone TEXT, comment TEXT, dimensions TEXT DEFAULT '{}', tags TEXT DEFAULT '[]',
-              approved INTEGER NOT NULL DEFAULT 1, created_at TEXT DEFAULT CURRENT_TIMESTAMP
+              approved INTEGER NOT NULL DEFAULT 1, provider_reply TEXT DEFAULT '',
+              provider_reply_at TEXT DEFAULT '', created_at TEXT DEFAULT CURRENT_TIMESTAMP
             );
             CREATE TABLE IF NOT EXISTS complaints(
               id TEXT PRIMARY KEY, provider_id TEXT, customer_name TEXT, phone TEXT, reason TEXT, detail TEXT,
@@ -1282,6 +1867,7 @@ def init_db():
               ON admin_email_challenges(admin_id,expires_at,used_at);
             """
         )
+        CommercialRecordService.install_schema(con)
         ensure_column(con, "providers", "image_path", "TEXT DEFAULT ''")
         ensure_column(con, "providers", "card_image", "TEXT DEFAULT ''")
         ensure_column(con, "providers", "pin_hash", "TEXT DEFAULT ''")
@@ -1422,13 +2008,49 @@ def init_db():
         ensure_column(con, "leads", "service_value", "TEXT DEFAULT ''")
         ensure_column(con, "leads", "service_name", "TEXT DEFAULT ''")
         ensure_column(con, "leads", "gov", "TEXT DEFAULT ''")
+        ensure_column(con, "leads", "wilayah", "TEXT DEFAULT ''")
         ensure_column(con, "leads", "status", "TEXT DEFAULT 'open'")
+        con.execute(
+            """CREATE INDEX IF NOT EXISTS idx_leads_matching
+            ON leads(status,kind,service_value,gov,wilayah)"""
+        )
+        if not con.execute(
+            "SELECT 1 FROM settings WHERE key=?", (MATCHING_MIGRATION_KEY,)
+        ).fetchone():
+            con.execute(
+                """UPDATE leads
+                SET wilayah=COALESCE((
+                  SELECT u.wilayah FROM app_users u
+                  WHERE u.phone=leads.phone AND TRIM(COALESCE(u.wilayah,''))!=''
+                  LIMIT 1
+                ),'')
+                WHERE TRIM(COALESCE(wilayah,''))=''
+                AND TRIM(COALESCE(leads.phone,''))!=''
+                AND EXISTS(
+                  SELECT 1 FROM app_users u
+                  WHERE u.phone=leads.phone AND TRIM(COALESCE(u.wilayah,''))!=''
+                )"""
+            )
+            backfilled_leads = con.execute("SELECT changes()").fetchone()[0]
+            con.execute(
+                "INSERT INTO settings(key,value) VALUES(?,?)",
+                (
+                    MATCHING_MIGRATION_KEY,
+                    jdump({
+                        "version": 2,
+                        "installedAt": datetime.now(UTC).isoformat(),
+                        "leadWilayahBackfilled": int(backfilled_leads or 0),
+                    }),
+                ),
+            )
         ensure_column(con, "reviews", "request_id", "TEXT DEFAULT ''")
         ensure_column(con, "reviews", "user_id", "TEXT DEFAULT ''")
         ensure_column(con, "reviews", "dimensions", "TEXT DEFAULT '{}'")
         ensure_column(con, "reviews", "tags", "TEXT DEFAULT '[]'")
         ensure_column(con, "reviews", "deleted_at", "TEXT DEFAULT ''")
         ensure_column(con, "reviews", "moderation_reason", "TEXT DEFAULT ''")
+        ensure_column(con, "reviews", "provider_reply", "TEXT DEFAULT ''")
+        ensure_column(con, "reviews", "provider_reply_at", "TEXT DEFAULT ''")
         ensure_column(con, "complaints", "request_id", "TEXT DEFAULT ''")
         ensure_column(con, "complaints", "user_id", "TEXT DEFAULT ''")
         ensure_column(con, "categories", "deleted_at", "TEXT DEFAULT ''")
@@ -1753,8 +2375,6 @@ def row_provider(r, private=False, sign_private=False):
     d = dict(r)
     d["areas"] = jload(d["areas"], [])
     d["governorates"] = jload(d.pop("governorates", "[]"), [])
-    if not d["governorates"] and d.get("gov"):
-        d["governorates"] = [d["gov"]]
     d["services"] = jload(d["services"], [])
     d["stats"] = jload(d["stats"], {"views": 0, "whatsapp": 0, "calls": 0})
     d["workImages"] = jload(d.pop("work_images", "[]"), [])
@@ -1915,6 +2535,8 @@ def row_review(r, private=False):
         d["tags"] = normalize_review_tags(d.get("tags"))
     except DomainError:
         d["tags"] = []
+    d["providerReply"] = d.pop("provider_reply", "") or ""
+    d["providerReplyAt"] = d.pop("provider_reply_at", "") or ""
     if not private:
         for key in ("phone", "user_id", "request_id", "deleted_at", "moderation_reason"):
             d.pop(key, None)
@@ -2017,28 +2639,20 @@ def row_lead(r):
     return dict(r)
 
 
-def lead_matches_provider(lead, provider):
+def lead_matches_provider(con, lead, provider):
+    """Apply the canonical marketplace contract to legacy open leads."""
     if lead.get("kind") != "request" or lead.get("status") in ("cancelled", "deleted", "closed"):
         return False
-    service_value = (lead.get("service_value") or "").strip()
-    requested_cat = ""
-    requested_service = ""
-    if "|" in service_value:
-        requested_cat, requested_service = service_value.split("|", 1)
-    elif service_value:
-        requested_service = service_value
-    provider_services = provider.get("services") or []
-    service_ok = not requested_service or any(
-        svc.get("active", True)
-        and svc.get("serviceId") == requested_service
-        and (not requested_cat or svc.get("catId") == requested_cat)
-        for svc in provider_services
-    )
-    gov = (lead.get("gov") or "").strip()
-    areas = set(provider.get("areas") or [])
-    areas.update([provider.get("gov"), provider.get("wilayah")])
-    area_ok = not gov or gov in areas
-    return bool(service_ok and area_ok)
+    request = {
+        "id": safe_text(lead.get("id"), 120),
+        "service_value": safe_text(lead.get("service_value"), 180),
+        "gov": safe_text(lead.get("gov"), 80),
+        "wilayah": safe_text(lead.get("wilayah"), 80),
+        "requested_at": datetime.now(UTC).isoformat(),
+        "user_id": safe_text(lead.get("user_id"), 120),
+        "declined_provider_ids": "[]",
+    }
+    return bool(provider_request_diagnostic(con, request, provider)["eligible"])
 
 
 def log_audit(con, session, action, target="", detail=""):
@@ -2264,12 +2878,15 @@ REFRESH_COOKIE_NAMES = {
 }
 
 
-def issue_session_tokens(session, *, device_id=""):
+def issue_session_tokens(session, *, device_id="", con=None):
     access_token = secrets.token_urlsafe(32)
     refresh_token = secrets.token_urlsafe(48)
     session_id = slug("ses")
-    with db() as con:
-        con.execute(
+    access_expires_at = iso_datetime(minutes=ACCESS_TOKEN_MINUTES)
+    refresh_expires_at = iso_datetime(days=SESSION_DAYS)
+
+    def insert_session(connection):
+        connection.execute(
             """INSERT INTO auth_sessions(
             id,token_hash,refresh_hash,session_json,expires_at,
             access_expires_at,device_id,last_used_at,refreshed_at)
@@ -2279,18 +2896,24 @@ def issue_session_tokens(session, *, device_id=""):
                 hash_secret(access_token),
                 hash_secret(refresh_token),
                 jdump(session),
-                iso_datetime(days=SESSION_DAYS),
-                iso_datetime(minutes=ACCESS_TOKEN_MINUTES),
+                refresh_expires_at,
+                access_expires_at,
                 safe_text(device_id, 120),
             ),
         )
+
+    if con is None:
+        with db() as session_con:
+            insert_session(session_con)
+    else:
+        insert_session(con)
     return {
         "token": access_token,
         "refreshToken": refresh_token,
         "sessionId": session_id,
         "kind": session.get("kind", ""),
-        "accessExpiresAt": iso_datetime(minutes=ACCESS_TOKEN_MINUTES),
-        "refreshExpiresAt": iso_datetime(days=SESSION_DAYS),
+        "accessExpiresAt": access_expires_at,
+        "refreshExpiresAt": refresh_expires_at,
     }
 
 
@@ -3589,13 +4212,20 @@ def provider_lifecycle_transition(
 
 
 def service_availability_snapshot(con):
-    """Return privacy-safe provider counts used by the direct-request UI."""
+    """Return privacy-safe counts of providers accepting work at this moment."""
     services = {}
     exact_services = {}
     categories = {}
+    snapshot_time = datetime.now(UTC)
+    marketplace = RequestMarketplace(con, now=snapshot_time)
     for row in con.execute("SELECT * FROM providers"):
         eligible, _ = provider_eligibility(con, row, receive_requests=True)
         if not eligible:
+            continue
+        provider = dict(row)
+        if not RankingService.availability_match(provider, snapshot_time):
+            continue
+        if not marketplace.provider_has_capacity(provider, snapshot_time, ""):
             continue
         provider_services = jload(row["services"], [])
         provider_categories = set()
@@ -3623,11 +4253,11 @@ def service_availability_snapshot(con):
         "services": services,
         "exactServices": exact_services,
         "categories": categories,
-        "contractVersion": "matching_v2",
+        "contractVersion": "matching_v3",
         "providerSource": "server",
         "demoProvidersAllowed": bool(SAMPLE_DATA_ENABLED),
         "subscriptionsEnforced": RequestMarketplace(con).subscription_delays_enabled(),
-        "generatedAt": datetime.now(UTC).isoformat(),
+        "generatedAt": snapshot_time.isoformat(),
     }
 
 
@@ -3641,11 +4271,20 @@ def provider_request_diagnostic(con, request_row, provider_row):
     )
     if not eligible and eligibility_reason:
         reasons.append(eligibility_reason)
+    entitled, entitlement_reason, grants = provider_receive_entitlement(
+        con, provider.get("id", "")
+    )
+    if not entitled and entitlement_reason:
+        reasons.append(entitlement_reason)
     match = RankingService.service_match_details(request, provider)
     if not match["matched"]:
         reasons.append("service_mismatch")
     if not RankingService.area_match(request, provider):
         reasons.append("area_mismatch")
+    marketplace = RequestMarketplace(con)
+    requested_at = parse_marketplace_datetime(request.get("requested_at")) or marketplace.now
+    if not RankingService.availability_match(provider, requested_at):
+        reasons.append("outside_availability")
     declined = jload(request.get("declined_provider_ids", "[]"), [])
     if provider.get("id") in declined:
         reasons.append("provider_previously_declined")
@@ -3653,8 +4292,6 @@ def provider_request_diagnostic(con, request_row, provider_row):
         request["user_id"], provider.get("id", "")
     ):
         reasons.append("interaction_blocked")
-    marketplace = RequestMarketplace(con)
-    requested_at = parse_iso(request.get("requested_at")) or marketplace.now
     if not marketplace.provider_has_capacity(
         provider, requested_at, request.get("id", "")
     ):
@@ -3662,7 +4299,6 @@ def provider_request_diagnostic(con, request_row, provider_row):
     reasons = list(dict.fromkeys(reasons))
     score = 0.0
     if not reasons:
-        _, _, grants = provider_receive_entitlement(con, provider.get("id", ""))
         score, _ = RankingService.score(
             request, provider, grants.get("planId", ""), requested_at
         )
@@ -3674,6 +4310,91 @@ def provider_request_diagnostic(con, request_row, provider_row):
         "matchedServiceId": match.get("matchedServiceId", ""),
         "score": score,
         "privacySafe": True,
+    }
+
+
+def require_provider_acceptance_eligibility(con, request_row, provider_id):
+    """Recheck every canonical intake gate immediately before selection.
+
+    Callers must hold the same write transaction that will set
+    ``accepted_provider_id``. This makes the daily-capacity decision and the
+    acceptance write one serialized operation instead of trusting an earlier
+    dispatch or offer snapshot.
+    """
+    provider_row = con.execute(
+        "SELECT * FROM providers WHERE id=?", (safe_text(provider_id, 120),)
+    ).fetchone()
+    if not provider_row:
+        raise DomainError("provider_no_longer_available", 409, "provider_not_found")
+    diagnostic = provider_request_diagnostic(con, request_row, provider_row)
+    if diagnostic["eligible"]:
+        return diagnostic
+    reasons = diagnostic.get("reasons") or []
+    primary_reason = str(reasons[0]) if reasons else "provider_not_eligible"
+    if "interaction_blocked" in reasons:
+        raise DomainError("interaction_blocked", 403, "interaction_blocked")
+    raise DomainError("provider_no_longer_available", 409, primary_reason)
+
+
+def redispatch_waitlisted_requests(con, provider_id, *, limit=100):
+    """Re-evaluate durable zero-match requests after provider activation."""
+    provider_id = safe_text(provider_id, 120)
+    provider = con.execute("SELECT * FROM providers WHERE id=?", (provider_id,)).fetchone()
+    if not provider:
+        return {"considered": 0, "matched": 0, "released": 0}
+    eligible, _ = provider_eligibility(con, provider, receive_requests=True)
+    if not eligible:
+        return {"considered": 0, "matched": 0, "released": 0}
+    rows = con.execute(
+        """SELECT * FROM customer_requests WHERE waitlisted=1
+        AND COALESCE(accepted_provider_id,'')='' AND COALESCE(offers_open,1)=1
+        AND status IN ('unavailable','matching')
+        ORDER BY created_at LIMIT ?""",
+        (max(1, min(int(limit), 500)),),
+    ).fetchall()
+    matched = released_count = 0
+    for request in rows:
+        diagnostic = provider_request_diagnostic(con, request, provider)
+        if not diagnostic["eligible"]:
+            continue
+        marketplace = RequestMarketplace(con)
+        ranked = marketplace.schedule(request["id"])
+        if not ranked:
+            continue
+        matched += 1
+        released = marketplace.release_due(request["id"])
+        released_count += len(released)
+        create_marketplace_notifications(con, released)
+        # A ranking snapshot can become stale during the canonical release
+        # recheck (for example an expired plan or exhausted daily capacity).
+        # Never tell the customer that providers are available unless at least
+        # one dispatch was actually released and can notify its provider.
+        if request["user_id"] and released:
+            dedupe_key = (
+                f"request:{request['id']}:providers_available:{provider_id}"
+            )
+            already_notified = con.execute(
+                "SELECT 1 FROM app_notifications WHERE dedupe_key=?",
+                (dedupe_key,),
+            ).fetchone()
+            if not already_notified:
+                create_notification(
+                    con,
+                    "user",
+                    request["user_id"],
+                    "توفر مزودون مناسبون لطلبك",
+                    "يمكن للمزودين المطابقين الآن الاطلاع على الطلب وإرسال عروضهم. لم يتم تأكيد حجز بعد.",
+                    type_="request",
+                    related_id=request["id"],
+                    priority="high",
+                    action_text="فتح الطلب",
+                    action_route=f"user:request:{request['id']}",
+                    dedupe_key=dedupe_key,
+                )
+    return {
+        "considered": len(rows),
+        "matched": matched,
+        "released": released_count,
     }
 
 
@@ -4586,7 +5307,10 @@ def get_bootstrap(session=None):
             current_provider = next((p for p in providers if p["id"] == pid), None)
             if current_provider:
                 open_requests = [row_lead(r) for r in con.execute("SELECT * FROM leads WHERE kind='request' AND COALESCE(provider_id,'')='' AND status NOT IN ('cancelled','deleted','closed') ORDER BY created_at DESC LIMIT 120")]
-                matched = [lead for lead in open_requests if lead_matches_provider(lead, current_provider)]
+                matched = [
+                    lead for lead in open_requests
+                    if lead_matches_provider(con, lead, current_provider)
+                ]
                 leads = leads + matched[:40]
             audits = []
         else:
@@ -4830,9 +5554,14 @@ def get_bootstrap(session=None):
                 """SELECT COALESCE(SUM(amount),0) n FROM payments
                 WHERE kind IN ('revenue','subscription','promotion') AND status='paid'"""
             ).fetchone()["n"]
-            finance_revenue = con.execute(
-                "SELECT COALESCE(SUM(amount),0) n FROM finance WHERE kind='revenue'"
+            finance_revenue_milli = con.execute(
+                """SELECT COALESCE(SUM(CASE
+                WHEN kind='revenue' THEN amount_milli
+                WHEN kind='refund' THEN -amount_milli
+                ELSE 0 END),0) n
+                FROM finance_entries WHERE status='posted'"""
             ).fetchone()["n"]
+            finance_revenue = round(int(finance_revenue_milli or 0) / 1000, 3)
         if is_admin:
             stats = {
                 "unreadNotifications": len(
@@ -4867,7 +5596,10 @@ def get_bootstrap(session=None):
                     ).fetchone()["n"],
                 })
             if can_view_reports or can_manage_finance:
-                stats["revenue"] = payment_revenue + finance_revenue
+                # Canonical commercial KPI: posted revenue less posted refunds.
+                # Payment analytics remain separate in reports to avoid
+                # double-counting a payment and its ledger entry.
+                stats["revenue"] = finance_revenue
             if can_view_reports or can_manage_quality:
                 stats.update({
                     "reviews": con.execute(
@@ -5135,6 +5867,16 @@ def get_bootstrap(session=None):
                 key: value for key, value in platform.items()
                 if key in allowed_platform_keys
             }
+        commercial_records = CommercialRecordService(con)
+        finance_entries = commercial_records.list_finance() if (
+            is_admin and can_manage_finance
+        ) else []
+        sponsorships = commercial_records.list_sponsorships() if (
+            is_admin and can_manage_finance
+        ) else []
+        coupons = commercial_records.list_coupons() if (
+            is_admin and can_manage_subscriptions
+        ) else []
         data = {
             "categories": categories,
             "bookingV2Enabled": booking_v2_enabled,
@@ -5145,6 +5887,12 @@ def get_bootstrap(session=None):
             "packages": packages,
             "subscriptions": subscriptions,
             "payments": payments,
+            "financeEntries": finance_entries,
+            "finance": [item for item in finance_entries if item["kind"] != "expense"],
+            "expenses": [item for item in finance_entries if item["kind"] == "expense"],
+            "sponsorships": sponsorships,
+            "sponsors": sponsorships,
+            "coupons": coupons,
             "leads": leads,
             "auditLogs": audits,
             "customerRequests": customer_requests,
@@ -5171,9 +5919,11 @@ def get_bootstrap(session=None):
             "interactionBlocks": interaction_blocks,
             "platform": platform,
             "serverTime": datetime.now(UTC).isoformat(),
+            "serverVersion": SERVER_VERSION,
             "serviceAvailability": service_availability_snapshot(con),
             "marketplaceContract": {
-                "version": "matching_v2",
+                "version": "matching_v3",
+                "serverVersion": SERVER_VERSION,
                 "providerSource": "server",
                 "demoProvidersAllowed": bool(SAMPLE_DATA_ENABLED),
                 "subscriptionsEnforced": RequestMarketplace(
@@ -5195,6 +5945,7 @@ def get_bootstrap(session=None):
                 "supportWhatsapp": SUPPORT_WHATSAPP,
                 "policyVersion": POLICY_VERSION,
                 "currency": OMR,
+                "serverVersion": SERVER_VERSION,
             },
             "stats": stats,
             "reports": reports,
@@ -5246,24 +5997,85 @@ def get_bootstrap(session=None):
         return data
 
 
+CLASSIC_UI_STRING_FIELDS = frozenset({
+    "lang", "theme", "userUiMode", "adminTab",
+    "adminCommunityView", "providerTab", "communityTab",
+    "communityCategory", "communitySort", "requestBoardFilter",
+})
+CLASSIC_UI_BOOLEAN_FIELDS = frozenset({
+    "entrySeen", "splashSeen", "filtersOpen", "communityFiltersOpen",
+})
+CLASSIC_UI_INTEGER_FIELDS = {
+    "version": (0, 10_000),
+    "adminNavScroll": (0, 10_000_000),
+    "providerNavScroll": (0, 10_000_000),
+    "providerRegistrationStep": (1, 20),
+    "adIndex": (0, 100_000),
+    "featuredPackageIndex": (0, 100_000),
+}
+
+
+def _classic_ui_preferences(state):
+    """Return only bounded, non-account UI preferences from legacy state."""
+    if not isinstance(state, dict):
+        return {}
+    result = {}
+    for key in CLASSIC_UI_STRING_FIELDS:
+        value = state.get(key)
+        if isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9_-]{0,80}", value):
+            result[key] = value
+    for key in CLASSIC_UI_BOOLEAN_FIELDS:
+        value = state.get(key)
+        if isinstance(value, bool):
+            result[key] = value
+    for key, (minimum, maximum) in CLASSIC_UI_INTEGER_FIELDS.items():
+        value = state.get(key)
+        if isinstance(value, int) and not isinstance(value, bool):
+            result[key] = max(minimum, min(value, maximum))
+    map_filters = state.get("mapFilters")
+    if isinstance(map_filters, dict):
+        result["mapFilters"] = {
+            key: re.sub(r"[<>&\"']", "", str(map_filters.get(key) or ""))[:80]
+            for key in ("service", "gov")
+        }
+    return result
+
+
 def get_classic_state():
     with db() as con:
         row = con.execute("SELECT value FROM settings WHERE key='classicState'").fetchone()
         if not row:
             return None
-        return jload(row["value"], None)
+        state = jload(row["value"], None)
+        if not isinstance(state, dict):
+            return None
+        result = _classic_ui_preferences(state)
+        if isinstance(state.get("serverSavedAt"), str):
+            result["serverSavedAt"] = state["serverSavedAt"][:40]
+        return result
 
 
 def save_classic_state(data):
     if not isinstance(data, dict):
         raise ValueError("state_must_be_object")
-    data["serverSavedAt"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    saved_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     with db() as con:
+        current = con.execute(
+            "SELECT value FROM settings WHERE key='classicState'"
+        ).fetchone()
+        current_state = jload(current["value"], {}) if current else {}
+        if not isinstance(current_state, dict):
+            current_state = {}
+        # Preserve all legacy values for rollback, but accept mutations only
+        # for the explicit bounded UI allowlist above.
+        sanitized = dict(current_state)
+        sanitized.update(_classic_ui_preferences(data))
+        sanitized["serverSavedAt"] = saved_at
         con.execute(
             "INSERT INTO settings(key,value) VALUES('classicState', ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-            (jdump(data),),
+            (jdump(sanitized),),
         )
-    return data["serverSavedAt"]
+    return saved_at
 
 
 def whatsapp_configured():
@@ -5476,7 +6288,20 @@ def save_upload_data(owner_id, data_url, slot, allowed_mimes, max_bytes):
     safe_slot = "".join(ch for ch in str(slot) if ch.isalnum() or ch in ("_", "-"))[:40] or secrets.token_hex(4)
     filename = f"{safe_owner}-{safe_slot}-{secrets.token_hex(12)}.{ext}"
     rel = f"uploads/{filename}"
-    (UPLOAD_DIR / filename).write_bytes(blob)
+    target = UPLOAD_DIR / filename
+    target.write_bytes(blob)
+
+    def remove_uncommitted_upload(path=target):
+        try:
+            path.unlink(missing_ok=True)
+        except OSError as err:
+            log_event(
+                "upload.rollback_cleanup_failed",
+                level="error",
+                errorType=type(err).__name__,
+            )
+
+    _after_database_rollback(remove_uncommitted_upload)
     return rel
 
 
@@ -5500,6 +6325,91 @@ def save_many_documents(owner_id, docs, prefix="doc", limit=3):
     return paths
 
 
+def _local_upload_target(value):
+    """Resolve only files owned by the configured upload directory."""
+
+    if isinstance(value, Path):
+        target = value.resolve()
+        try:
+            target.relative_to(UPLOAD_DIR.resolve())
+        except ValueError:
+            return None
+        return target
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    parsed = urlparse(raw)
+    if parsed.path.rstrip("/") == "/api/media/private":
+        raw = (parse_qs(parsed.query).get("path") or [""])[0]
+    else:
+        raw = parsed.path or raw
+    normalized = raw.replace("\\", "/").lstrip("/")
+    if not normalized.startswith("uploads/"):
+        return None
+    target = (UPLOAD_DIR / Path(normalized).name).resolve()
+    try:
+        target.relative_to(UPLOAD_DIR.resolve())
+    except ValueError:
+        return None
+    return target
+
+
+def _schedule_upload_deletions(values, *, event_name="upload.replaced_cleanup_failed"):
+    targets = {
+        target for target in (_local_upload_target(value) for value in values or [])
+        if target is not None
+    }
+    if not targets:
+        return
+
+    def delete_after_commit(paths=tuple(targets)):
+        for path in paths:
+            try:
+                path.unlink(missing_ok=True)
+            except OSError as err:
+                log_event(
+                    event_name,
+                    level="error",
+                    errorType=type(err).__name__,
+                )
+
+    _after_database_commit(delete_after_commit)
+
+
+def _provider_media_paths(provider):
+    item = provider or {}
+    values = [
+        item.get("imagePath", ""),
+        item.get("cardImage", ""),
+        item.get("introVideoUrl", ""),
+        *(item.get("workImages") or []),
+        *(item.get("documents") or []),
+    ]
+    for pair in item.get("beforeAfter") or []:
+        if isinstance(pair, dict):
+            values.extend((pair.get("before", ""), pair.get("after", "")))
+    return {
+        target for target in (_local_upload_target(value) for value in values)
+        if target is not None
+    }
+
+
+def provider_verification_material(provider):
+    """Return only fields whose change invalidates a verification decision."""
+
+    item = dict(provider) if provider else {}
+    documents = jload(item.get("documents", "[]"), [])
+    if not isinstance(documents, list):
+        documents = []
+    return (
+        safe_text(item.get("provider_type"), 30),
+        safe_text(item.get("commercial_no"), 120),
+        safe_text(item.get("commercial_expiry"), 80),
+        safe_text(item.get("license_expiry"), 80),
+        tuple(safe_text(path, 2000) for path in documents if safe_text(path, 2000)),
+    )
+
+
 def upsert_provider(con, data):
     p = data | {"id": data.get("id") or slug("p")}
     p["id"] = safe_text(p["id"], 120)
@@ -5517,6 +6427,9 @@ def upsert_provider(con, data):
     )
     if p["providerType"] not in {"individual", "company"}:
         raise DomainError("invalid_provider_type", 400)
+    p["availability"] = normalized_availability(
+        data.get("availability"), existing_provider.get("availability", {})
+    )
     image_path = data.get("imagePath") or ""
     if data.get("imageData"):
         image_path = save_data_url(p["id"], data["imageData"])
@@ -5537,8 +6450,7 @@ def upsert_provider(con, data):
     account_limits = PlanCatalog.account_limits(package, p["providerType"])
     raw_governorates = data.get(
         "governorates",
-        existing_provider.get("governorates")
-        or [data.get("gov") or existing_provider.get("gov", "")],
+        existing_provider.get("governorates", []),
     )
     if not isinstance(raw_governorates, list):
         raise DomainError("governorates_must_be_list", 400)
@@ -5547,11 +6459,6 @@ def upsert_provider(con, data):
             safe_text(item, 80) for item in raw_governorates if safe_text(item, 80)
         )
     )
-    primary_governorate = safe_text(
-        data.get("gov", existing_provider.get("gov", "")), 80
-    )
-    if primary_governorate and primary_governorate not in p["governorates"]:
-        p["governorates"].insert(0, primary_governorate)
     existing_governorate_count = len(existing_provider.get("governorates") or [])
     governorate_limit = max(
         1,
@@ -5560,6 +6467,18 @@ def upsert_provider(con, data):
     )
     if len(p["governorates"]) > governorate_limit:
         raise DomainError("governorate_limit_exceeded", 409)
+    if "areas" in data:
+        raw_areas = data.get("areas")
+    elif existing:
+        raw_areas = existing_provider.get("areas", [])
+    elif p["providerType"] == "company" and p["governorates"]:
+        # For companies an empty wilayah list means governorate-wide coverage.
+        raw_areas = []
+    else:
+        raw_areas = [data.get("wilayah", "")] if data.get("wilayah") else []
+    p["areas"] = _normalized_coverage_values(
+        raw_areas, error_code="areas_must_be_list"
+    )
     existing_services = existing_provider.get("services", [])
     existing_categories = {
         item.get("catId")
@@ -5576,6 +6495,19 @@ def upsert_provider(con, data):
         int(account_limits.get("maxCategories") or 1),
         len(existing_categories) if existing else 0,
     )
+    plan_wilayah_limit = int(account_limits.get("maxWilayats") or 0)
+    existing_area_count = len(
+        {
+            safe_text(area, 80).strip().casefold()
+            for area in existing_provider.get("areas", [])
+            if safe_text(area, 80).strip()
+        }
+    )
+    effective_wilayah_limit = (
+        0
+        if plan_wilayah_limit == 0
+        else max(plan_wilayah_limit, existing_area_count if existing else 0)
+    )
     raw_services = data.get("services", existing_services)
     p["services"] = normalized_provider_services(
         con,
@@ -5583,9 +6515,11 @@ def upsert_provider(con, data):
         limit=service_limit,
         category_limit=category_limit,
         fallback_price=data.get("priceFrom", existing_provider.get("priceFrom", 0)),
-        default_areas=data.get("areas")
-        or existing_provider.get("areas")
-        or [data.get("wilayah") or existing_provider.get("wilayah", "")],
+        default_areas=p["areas"],
+        provider_type=p["providerType"],
+        coverage_areas=p["areas"],
+        coverage_governorates=p["governorates"],
+        wilayah_limit=effective_wilayah_limit,
     )
     image_limit = max(1, int(account_limits.get("maxImages") or 5))
     work_images = data.get("workImages") or existing_provider.get("workImages", [])
@@ -5737,6 +6671,11 @@ def upsert_provider(con, data):
     p["beforeAfter"] = before_after
     p["introVideoUrl"] = image_url(intro_video_url)
     p["governorates"] = p.get("governorates", [])
+    if existing_provider:
+        removed_media = _provider_media_paths(existing_provider) - _provider_media_paths(p)
+        _schedule_upload_deletions(
+            removed_media, event_name="provider.profile_media_cleanup_failed"
+        )
     recompute_provider_quality(con, p["id"])
     return p
 
@@ -5745,11 +6684,15 @@ class Handler(SimpleHTTPRequestHandler):
     def __init__(self, *args, **kwargs):
         self.request_id = secrets.token_hex(12)
         self.request_started = time.monotonic()
+        self._response_sent = False
+        self._deferred_json_response = None
         super().__init__(*args, directory=str(PUBLIC_DIR), **kwargs)
 
     def handle_one_request(self):
         self.request_id = secrets.token_hex(12)
         self.request_started = time.monotonic()
+        self._response_sent = False
+        self._deferred_json_response = None
         return super().handle_one_request()
 
     def log_request(self, code="-", size="-"):
@@ -5828,6 +6771,20 @@ class Handler(SimpleHTTPRequestHandler):
 
     def send_json(self, data, status=200, extra_headers=None):
         raw = jdump(data).encode("utf-8")
+        if getattr(self, "_response_sent", False):
+            return None
+        if getattr(self, "_deferred_json_response", None) is not None:
+            return None
+        response = _DeferredJsonResponse(self, raw, status, extra_headers)
+        if _defer_json_response(response):
+            self._deferred_json_response = response
+            return None
+        return self._write_json_response(raw, status, extra_headers)
+
+    def _write_json_response(self, raw, status=200, extra_headers=None):
+        if getattr(self, "_response_sent", False):
+            return None
+        self._response_sent = True
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(raw)))
@@ -5923,6 +6880,40 @@ class Handler(SimpleHTTPRequestHandler):
             return None
         return session
 
+    def require_admin_platform_action(self, action):
+        """Authorize each platform mutation in the domain that owns it."""
+        session = self.session()
+        risk_permissions = ("manage_audit", "manage_quality")
+        if action == "legal:review":
+            allowed = has_permission(session, "manage_providers")
+            required = "manage_providers"
+        elif action in {"risk:record", "risk:resolve"}:
+            allowed = any(
+                has_permission(session, permission)
+                for permission in risk_permissions
+            )
+            required = "manage_audit_or_manage_quality"
+        elif action == "scenario:save":
+            allowed = has_permission(session, "manage_finance")
+            required = "manage_finance"
+        else:
+            allowed = has_permission(session, "manage_settings")
+            required = "manage_settings"
+        if not allowed:
+            self.send_json(
+                {"error": "permission_denied", "permission": required}, 403
+            )
+            return None
+        if action in {"enterprise:create", "enterprise:revoke"} and str(
+            session.get("role") or ""
+        ) not in {"owner", "super_admin"}:
+            self.send_json(
+                {"error": "permission_denied", "permission": "super_admin"},
+                403,
+            )
+            return None
+        return session
+
     def require_provider(self, permission=""):
         session = self.session()
         if not session or session.get("kind") != "provider":
@@ -5966,17 +6957,17 @@ class Handler(SimpleHTTPRequestHandler):
         path = parsed.path
         if path == "/healthz":
             return self.send_json(
-                {"ok": True, "service": "khadamati-api", "release": APP_RELEASE}
+                {
+                    "ok": True,
+                    "service": "khadamati-api",
+                    "release": SERVER_VERSION,
+                    "version": SERVER_VERSION,
+                }
             )
         if path == "/readyz":
-            issues = []
+            persistence = storage_readiness()
+            issues = list(persistence["issues"])
             if APP_ENV == "production":
-                if not os.environ.get("KHADAMATI_DB_PATH"):
-                    issues.append("database_path_not_configured")
-                if not os.environ.get("KHADAMATI_UPLOAD_DIR"):
-                    issues.append("upload_path_not_configured")
-                if not os.environ.get("KHADAMATI_BACKUP_DIR"):
-                    issues.append("backup_path_not_configured")
                 if not (
                     os.environ.get("KHADAMATI_MEDIA_SIGNING_KEY")
                     or os.environ.get("KHADAMATI_OTP_PEPPER")
@@ -5984,36 +6975,37 @@ class Handler(SimpleHTTPRequestHandler):
                     issues.append("media_signing_key_not_configured")
                 if REQUIRE_ADMIN_2FA and not os.environ.get("KHADAMATI_ADMIN_2FA_KEY"):
                     issues.append("admin_2fa_key_not_configured")
-            try:
-                with db() as con:
-                    con.execute("SELECT 1").fetchone()
-                    if REQUIRE_ADMIN_2FA:
+            if persistence["checks"]["databaseReadable"] and REQUIRE_ADMIN_2FA:
+                try:
+                    with db() as con:
                         enabled_admins = con.execute(
                             """SELECT COUNT(*) n FROM admin_users
                             WHERE active=1 AND two_factor_enabled=1"""
                         ).fetchone()["n"]
                         if not int(enabled_admins or 0):
                             issues.append("admin_2fa_not_configured")
-            except sqlite3.Error:
-                issues.append("database_unavailable")
-            storage_writable = (
-                os.access(DB_PATH.parent, os.W_OK)
-                and os.access(UPLOAD_DIR, os.W_OK)
-                and os.access(BACKUP_DIR, os.W_OK)
-            )
-            if not storage_writable:
-                issues.append("storage_not_writable")
+                except sqlite3.Error:
+                    issues.append("database_unavailable")
             ready = not issues
             return self.send_json(
                 {
                     "ok": ready,
                     "service": "khadamati-api",
-                    "release": APP_RELEASE,
+                    "release": SERVER_VERSION,
+                    "version": SERVER_VERSION,
                     "database": "sqlite",
-                    "issues": issues,
+                    "issues": list(dict.fromkeys(issues)),
+                    "persistence": persistence["checks"],
                 },
                 200 if ready else 503,
             )
+        if path in {"/", "/index.html"} and APP_ENV == "production":
+            target = safe_public_app_url()
+            self.send_response(302)
+            self.send_header("Location", target)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
         if path.startswith("/media/"):
             filename = path.removeprefix("/media/")
             query = parse_qs(parsed.query)
@@ -6109,9 +7101,13 @@ class Handler(SimpleHTTPRequestHandler):
                 "policyVersion": POLICY_VERSION,
                 "currency": OMR,
                 "publicUrl": PUBLIC_APP_URL,
+                "serverVersion": SERVER_VERSION,
             })
         if path == "/api/push/public-key":
-            return self.send_json({"publicKey": os.environ.get("VAPID_PUBLIC_KEY", "")})
+            return self.send_json({
+                "publicKey": os.environ.get("VAPID_PUBLIC_KEY", ""),
+                "deliveryReady": push_ready(),
+            })
         if path == "/api/admin/session":
             session = self.require_admin()
             if not session:
@@ -6130,7 +7126,7 @@ class Handler(SimpleHTTPRequestHandler):
             session = self.require_admin("backup")
             if not session:
                 return
-            return self.send_json(get_bootstrap(session))
+            return self.send_json({"ok": True, "backups": BackupService().list()})
         if path == "/api/enterprise/v1/summary":
             api_key = self.headers.get("X-Khadamati-API-Key", "")
             try:
@@ -6347,6 +7343,25 @@ class Handler(SimpleHTTPRequestHandler):
             return self.send_domain_error(err)
         except (json.JSONDecodeError, UnicodeDecodeError, ValueError):
             return self.send_json({"error": "invalid_request_data"}, 400)
+        if path == "/api/backup":
+            session = self.require_admin("backup")
+            if not session:
+                return
+            if str(data.get("action") or "create") != "create":
+                return self.send_json({"error": "invalid_backup_action"}, 400)
+            try:
+                backup = BackupService().create(data.get("label", "manual"))
+            except DomainError as err:
+                return self.send_domain_error(err)
+            with db() as con:
+                log_audit(
+                    con,
+                    session,
+                    "backup.created",
+                    backup["id"],
+                    f"sizeBytes={backup['sizeBytes']};verified=1",
+                )
+            return self.send_json({"ok": True, "backup": backup}, 201)
         if path == "/api/location/reverse":
             try:
                 latitude = finite_number(
@@ -6481,15 +7496,20 @@ class Handler(SimpleHTTPRequestHandler):
             challenge_id = safe_text(data.get("emailChallengeId", ""), 160)
             email_code = safe_text(data.get("emailCode", ""), 12)
             supplied_code = safe_text(data.get("code", ""), 128)
+            using_email_challenge = bool(challenge_id or email_code)
             lock_key = f"ip:{self.client_key()}"
             with db() as con:
+                if using_email_challenge and not con.in_transaction:
+                    # A one-time email challenge must be claimed by at most one
+                    # login transaction, including concurrent valid retries.
+                    con.execute("BEGIN IMMEDIATE")
                 lock_state = login_failure_state(con, "admin", lock_key)
                 if lock_state["locked"]:
                     return self.send_json(
                         {"error": "login_temporarily_locked", "retryAfter": lock_state["retryAfter"]},
                         429,
                     )
-                if challenge_id or email_code:
+                if using_email_challenge:
                     challenge = con.execute(
                         """SELECT * FROM admin_email_challenges
                         WHERE id=? AND COALESCE(used_at,'')=''""",
@@ -6520,10 +7540,6 @@ class Handler(SimpleHTTPRequestHandler):
                     ).fetchone()
                     if not row:
                         return self.send_json({"error": "admin_account_not_found"}, 404)
-                    con.execute(
-                        "UPDATE admin_email_challenges SET used_at=CURRENT_TIMESTAMP WHERE id=?",
-                        (challenge_id,),
-                    )
                 else:
                     row = next(
                         (
@@ -6540,18 +7556,31 @@ class Handler(SimpleHTTPRequestHandler):
                     if not row:
                         attempts = record_login_failure(con, "admin", lock_key)
                         return self.send_json({"error": "invalid_code", "attempts": attempts}, 403)
-                    two_factor = AdminTwoFactorService(con, ADMIN_2FA_KEY)
-                    if bool(row["two_factor_enabled"]):
-                        if not data.get("twoFactorCode"):
-                            return self.send_json(
-                                {"ok": True, "twoFactorRequired": True, "message": "admin_2fa_required"}
-                            )
-                        if not two_factor.verify_admin(row, data.get("twoFactorCode")):
-                            attempts = record_login_failure(con, "admin", lock_key)
-                            return self.send_json({"error": "admin_2fa_invalid", "attempts": attempts}, 403)
-                    elif REQUIRE_ADMIN_2FA:
-                        setup = two_factor.begin(row["id"], row["name"])
-                        return self.send_json({"ok": True, "twoFactorSetupRequired": True, **setup})
+                # Email OTP is an alternative first factor, not a bypass for the
+                # administrator's configured TOTP. Apply the same second-factor
+                # policy after either first-factor branch resolves the account.
+                two_factor = AdminTwoFactorService(con, ADMIN_2FA_KEY)
+                if bool(row["two_factor_enabled"]):
+                    if not data.get("twoFactorCode"):
+                        return self.send_json(
+                            {"ok": True, "twoFactorRequired": True, "message": "admin_2fa_required"}
+                        )
+                    if not two_factor.verify_admin(row, data.get("twoFactorCode")):
+                        attempts = record_login_failure(con, "admin", lock_key)
+                        return self.send_json({"error": "admin_2fa_invalid", "attempts": attempts}, 403)
+                elif REQUIRE_ADMIN_2FA:
+                    setup = two_factor.begin(row["id"], row["name"])
+                    if using_email_challenge:
+                        con.execute(
+                            "UPDATE admin_email_challenges SET used_at=CURRENT_TIMESTAMP WHERE id=?",
+                            (challenge_id,),
+                        )
+                    return self.send_json({"ok": True, "twoFactorSetupRequired": True, **setup})
+                if using_email_challenge:
+                    con.execute(
+                        "UPDATE admin_email_challenges SET used_at=CURRENT_TIMESTAMP WHERE id=?",
+                        (challenge_id,),
+                    )
                 clear_login_failures(con, "admin", lock_key)
             user = admin_public(row)
             bundle = issue_session_tokens(
@@ -6877,6 +7906,7 @@ class Handler(SimpleHTTPRequestHandler):
             req_id = slug("req")
             try:
                 location = normalized_location(data.get("location"))
+                availability = normalized_availability(data.get("availability"))
                 base_price = finite_number(
                     data.get("priceFrom", 0), minimum=0, maximum=1_000_000
                 )
@@ -6897,7 +7927,7 @@ class Handler(SimpleHTTPRequestHandler):
                 "commercialNo": safe_text(data.get("commercialNo"), 120),
                 "commercialExpiry": safe_text(data.get("commercialExpiry"), 40),
                 "licenseExpiry": safe_text(data.get("licenseExpiry"), 40),
-                "registrationVersion": 58,
+                "registrationVersion": 59,
                 "companySize": safe_text(data.get("companySize"), 80),
                 "businessRole": safe_text(data.get("businessRole"), 80),
                 "legalPath": safe_text(data.get("legalPath"), 40),
@@ -6920,6 +7950,7 @@ class Handler(SimpleHTTPRequestHandler):
                 "note": safe_text(data.get("note"), 600),
                 "bio": safe_text(data.get("bio") or data.get("note"), 600),
                 "hours": safe_text(data.get("hours"), 240),
+                "availability": availability,
                 "imagePath": "",
                 "workImages": [],
                 "documents": [],
@@ -6956,7 +7987,12 @@ class Handler(SimpleHTTPRequestHandler):
                         con, raw_services,
                         limit=max(1, int(limits.get("maxServices") or 1)),
                         category_limit=max(1, int(limits.get("maxCategories") or 1)),
-                        fallback_price=item["priceFrom"], default_areas=[item["wilayah"]],
+                        fallback_price=item["priceFrom"],
+                        default_areas=[item["wilayah"]] if item["wilayah"] else [],
+                        provider_type=item["providerType"],
+                        coverage_areas=[item["wilayah"]] if item["wilayah"] else [],
+                        coverage_governorates=[],
+                        wilayah_limit=int(limits.get("maxWilayats") or 0),
                     )
             except DomainError as err:
                 return self.send_domain_error(err)
@@ -6994,12 +8030,10 @@ class Handler(SimpleHTTPRequestHandler):
                 return self.send_json({"error": "company_pathway_required"}, 400)
             if item["providerType"] == "individual" and item["legalPath"] == "company":
                 return self.send_json({"error": "individual_pathway_required"}, 400)
-            if item["providerType"] == "company" and not item["commercialNo"]:
+            if not item["commercialNo"]:
                 return self.send_json({"error": "commercial_number_required"}, 400)
             credential_expiry = item["commercialExpiry"] if item["providerType"] == "company" else item["licenseExpiry"]
-            if item["providerType"] == "company" and not credential_expiry:
-                return self.send_json({"error": "credential_expiry_required"}, 400)
-            if item["providerType"] == "individual" and item["commercialNo"] and not credential_expiry:
+            if not credential_expiry:
                 return self.send_json({"error": "credential_expiry_required"}, 400)
             if item["legalPath"] == "individual_foreign" and (
                 not item["employerName"] or not item["workPermitExpiry"]
@@ -7012,7 +8046,7 @@ class Handler(SimpleHTTPRequestHandler):
                 return self.send_json({"error": "description_word_limit"}, 400)
             if not item["services"]:
                 return self.send_json({"error": "service_required"}, 400)
-            if not item["hours"]:
+            if not item["hours"] or not item["availability"].get("days"):
                 return self.send_json({"error": "availability_required"}, 400)
             documents_data = (
                 data.get("documentsData")
@@ -7022,62 +8056,89 @@ class Handler(SimpleHTTPRequestHandler):
             if len([doc for doc in documents_data if doc]) < 2:
                 return self.send_json({"error": "documents_required"}, 400)
             try:
-                if data.get("imageData"):
-                    item["imagePath"] = save_data_url(req_id, data.get("imageData"))
-                if data.get("workImagesData"):
-                    item["workImages"] = save_many_images(
-                        req_id,
-                        data.get("workImagesData"),
-                        "work",
-                        max(1, int(limits.get("maxImages") or 2)),
-                    )
-                if data.get("documentsData"):
-                    item["documents"] = save_many_documents(
-                        req_id, data.get("documentsData"), "doc", 4
-                    )
-            except ValueError as err:
-                return self.send_json({"error": str(err)}, 400)
-            with db() as con:
-                invitation_id = ""
-                invite_token = safe_text(data.get("inviteToken"), 200)
-                if invite_token:
-                    try:
+                with db() as con:
+                    invitation_id = ""
+                    invite_token = safe_text(data.get("inviteToken"), 200)
+                    if invite_token:
                         invitation = KnownProviderInvitationService(
                             con
                         ).resolve_for_registration(invite_token, item["phone"])
-                    except DomainError as err:
-                        return self.send_domain_error(err)
-                    invitation_id = invitation["id"]
-                    item["invitationId"] = invitation_id
-                con.execute("INSERT INTO provider_requests(id,payload) VALUES(?,?)", (item["id"], jdump(item)))
-                if invitation_id:
-                    KnownProviderInvitationService(con).mark_registration(
-                        invitation_id, item["id"]
+                        invitation_id = invitation["id"]
+                        item["invitationId"] = invitation_id
+
+                    # Files and the pending request are one logical operation.
+                    # New files are removed automatically if this transaction,
+                    # including session creation, fails to commit.
+                    if data.get("imageData"):
+                        item["imagePath"] = save_data_url(
+                            req_id, data.get("imageData")
+                        )
+                    if data.get("workImagesData"):
+                        item["workImages"] = save_many_images(
+                            req_id,
+                            data.get("workImagesData"),
+                            "work",
+                            max(1, int(limits.get("maxImages") or 2)),
+                        )
+                    if data.get("documentsData"):
+                        item["documents"] = save_many_documents(
+                            req_id, data.get("documentsData"), "doc", 4
+                        )
+
+                    con.execute(
+                        "INSERT INTO provider_requests(id,payload) VALUES(?,?)",
+                        (item["id"], jdump(item)),
                     )
-                settings = jload(con.execute("SELECT value FROM settings WHERE key='platform'").fetchone()["value"], {})
-                create_notification(
-                    con,
-                    "admin",
-                    "",
-                    "طلب تسجيل شركة جديد" if item["providerType"] == "company" else "طلب تسجيل مزود جديد",
-                    f"{item['name']} • {item['phone']}",
-                    type_="provider_request",
-                    related_id=item["id"],
-                    priority="high",
-                    action_text="مراجعة الطلب",
-                    action_route=f"admin:providerRequest:{item['id']}",
-                )
-            send_whatsapp(settings.get("adminWhatsapp"), f"طلب مزود جديد في خدماتي: {item['name']} - {item['phone']} - {len(item['services'])} خدمات")
-            safe_item = provider_request_view(item)
-            bundle = issue_session_tokens({
-                "kind": "provider_pending",
-                "requestId": item["id"],
-                "name": item["name"],
-                "phone": item["phone"],
-            }, device_id=data.get("deviceId", ""))
-            return self.send_session_json(
-                {"ok": True, "request": safe_item}, bundle, 201
-            )
+                    if invitation_id:
+                        KnownProviderInvitationService(con).mark_registration(
+                            invitation_id, item["id"]
+                        )
+                    settings_row = con.execute(
+                        "SELECT value FROM settings WHERE key='platform'"
+                    ).fetchone()
+                    settings = jload(settings_row["value"], {}) if settings_row else {}
+                    create_notification(
+                        con,
+                        "admin",
+                        "",
+                        "طلب تسجيل شركة جديد"
+                        if item["providerType"] == "company"
+                        else "طلب تسجيل مزود جديد",
+                        f"{item['name']} • {item['phone']}",
+                        type_="provider_request",
+                        related_id=item["id"],
+                        priority="high",
+                        action_text="مراجعة الطلب",
+                        action_route=f"admin:providerRequest:{item['id']}",
+                    )
+                    safe_item = provider_request_view(item)
+                    bundle = issue_session_tokens(
+                        {
+                            "kind": "provider_pending",
+                            "requestId": item["id"],
+                            "name": item["name"],
+                            "phone": item["phone"],
+                        },
+                        device_id=data.get("deviceId", ""),
+                        con=con,
+                    )
+                    admin_phone = settings.get("adminWhatsapp")
+                    whatsapp_text = (
+                        f"طلب مزود جديد في خدماتي: {item['name']} - "
+                        f"{item['phone']} - {len(item['services'])} خدمات"
+                    )
+                    _after_database_commit(
+                        lambda phone=admin_phone, message=whatsapp_text: send_whatsapp(
+                            phone, message
+                        )
+                    )
+                    return self.send_session_json(
+                        {"ok": True, "request": safe_item}, bundle, 201
+                    )
+            except DomainError as err:
+                return self.send_domain_error(err)
+            except ValueError as err:
+                return self.send_json({"error": str(err)}, 400)
         if path == "/api/reviews":
             return self.save_review(data)
         if path == "/api/complaints":
@@ -7374,6 +8435,7 @@ class Handler(SimpleHTTPRequestHandler):
             "service_value": (data.get("serviceValue", "") or "").strip()[:120],
             "service_name": (data.get("serviceName", "") or "").strip()[:120],
             "gov": (data.get("gov", "") or "").strip()[:80],
+            "wilayah": (data.get("wilayah", "") or "").strip()[:80],
             "status": (data.get("status", "open") or "open").strip()[:40],
         }
         with db() as con:
@@ -7385,13 +8447,16 @@ class Handler(SimpleHTTPRequestHandler):
                     return self.send_json({"error": "provider_not_found"}, 404)
             if session_kind == "user":
                 user_row = con.execute(
-                    "SELECT name,phone FROM app_users WHERE id=? AND status='active'",
+                    """SELECT name,phone,gov,wilayah FROM app_users
+                    WHERE id=? AND status='active'""",
                     (session.get("userId"),),
                 ).fetchone()
                 if not user_row:
                     return self.send_json({"error": "user_not_found"}, 404)
                 item["customer_name"] = user_row["name"] or ""
                 item["phone"] = user_row["phone"] or ""
+                item["gov"] = item["gov"] or user_row["gov"] or ""
+                item["wilayah"] = item["wilayah"] or user_row["wilayah"] or ""
             elif session_kind == "admin":
                 item["customer_name"] = "إدارة خدماتي"
             elif kind == "quote":
@@ -7402,20 +8467,23 @@ class Handler(SimpleHTTPRequestHandler):
             if exists:
                 con.execute(
                     """UPDATE leads
-                    SET provider_id=?, kind=?, customer_name=?, phone=?, note=?, service_value=?, service_name=?, gov=?, status=?
+                    SET provider_id=?, kind=?, customer_name=?, phone=?, note=?, service_value=?,
+                    service_name=?, gov=?, wilayah=?, status=?
                     WHERE id=?""",
                     (
                         item["provider_id"], item["kind"], item["customer_name"], item["phone"], item["note"],
-                        item["service_value"], item["service_name"], item["gov"], item["status"], item["id"],
+                        item["service_value"], item["service_name"], item["gov"], item["wilayah"],
+                        item["status"], item["id"],
                     ),
                 )
             else:
                 con.execute(
-                    """INSERT INTO leads(id,provider_id,kind,customer_name,phone,note,service_value,service_name,gov,status,created_at)
-                    VALUES(?,?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP)""",
+                    """INSERT INTO leads(id,provider_id,kind,customer_name,phone,note,
+                    service_value,service_name,gov,wilayah,status,created_at)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP)""",
                     (
                         item["id"], item["provider_id"], item["kind"], item["customer_name"], item["phone"], item["note"],
-                        item["service_value"], item["service_name"], item["gov"], item["status"],
+                        item["service_value"], item["service_name"], item["gov"], item["wilayah"], item["status"],
                     ),
                 )
             provider = None
@@ -8443,6 +9511,15 @@ class Handler(SimpleHTTPRequestHandler):
                     "flexible", "scheduled", "specific", "agreement"
                 }:
                     schedule_type = "flexible"
+                requested_at_raw = safe_text(data.get("requestedAt"), 80)
+                requested_at_value = ""
+                if requested_at_raw:
+                    requested_at_parsed = parse_marketplace_datetime(requested_at_raw)
+                    if not requested_at_parsed:
+                        return self.send_json({"error": "invalid_requested_at"}, 400)
+                    requested_at_value = requested_at_parsed.isoformat()
+                elif schedule_type in {"scheduled", "specific"}:
+                    return self.send_json({"error": "requested_at_required"}, 400)
                 asset_id = safe_text(data.get("assetId"), 120)
                 if asset_id:
                     ServiceAssetService(con).get_for_user(asset_id, user_id)
@@ -8508,7 +9585,7 @@ class Handler(SimpleHTTPRequestHandler):
                         request_id, user_id, request_item["customerName"], user_row["phone"],
                         service_value, service_name, request_item["gov"], request_item["wilayah"],
                         location.get("lat"), location.get("lng"), urgency,
-                        schedule_type, safe_text(data.get("requestedAt"), 80),
+                        schedule_type, requested_at_value,
                         budget_min, budget_max,
                         str(data.get("locationText", "") or "")[:240],
                         str(data.get("note", "") or "")[:1200], jdump(images), "matching", "",
@@ -8862,6 +9939,10 @@ class Handler(SimpleHTTPRequestHandler):
             return self.send_json({"error": "invalid_request_action"}, 400)
         provider_id = session["providerId"]
         with db() as con:
+            if action == "accept" and not con.in_transaction:
+                # Serialize the eligibility snapshot, capacity count, and
+                # accepted_provider_id write across concurrent requests.
+                con.execute("BEGIN IMMEDIATE")
             row = con.execute("SELECT * FROM customer_requests WHERE id=?", (request_id,)).fetchone()
             if not row:
                 return self.send_json({"error": "request_not_found"}, 404)
@@ -8871,6 +9952,9 @@ class Handler(SimpleHTTPRequestHandler):
             if action == "accept":
                 if item.get("workflowVersion") == "booking_v2":
                     return self.send_json({"error": "customer_offer_selection_required"}, 409)
+                if item["acceptedProviderId"] or not item["offersOpen"]:
+                    return self.send_json({"error": "request_already_accepted"}, 409)
+                require_provider_acceptance_eligibility(con, row, provider_id)
                 result = con.execute(
                     """UPDATE customer_requests SET accepted_provider_id=?,status='accepted',
                     offers_open=0,contact_consent=?,updated_at=CURRENT_TIMESTAMP
@@ -9083,20 +10167,21 @@ class Handler(SimpleHTTPRequestHandler):
             elif action == "choose_offer":
                 if not is_user:
                     return self.send_json({"error": "offer_selection_not_allowed"}, 403)
-                if item.get("workflowVersion") == "booking_v2":
-                    if not con.in_transaction:
-                        con.execute("BEGIN IMMEDIATE")
-                    # The pre-lock request snapshot may have changed while this
-                    # chooser waited. Refresh it before provider entitlement and
-                    # Work Order validation inside the same write transaction.
-                    locked_row = con.execute(
-                        "SELECT * FROM customer_requests WHERE id=?", (request_id,)
-                    ).fetchone()
-                    item = row_customer_request(locked_row)
-                    if item["userId"] != user_id:
-                        return self.send_json(
-                            {"error": "offer_selection_not_allowed"}, 403
-                        )
+                if not con.in_transaction:
+                    con.execute("BEGIN IMMEDIATE")
+                # The pre-lock request snapshot may have changed while this
+                # chooser waited. Refresh every workflow before eligibility,
+                # capacity, and acceptance inside the same write transaction.
+                locked_row = con.execute(
+                    "SELECT * FROM customer_requests WHERE id=?", (request_id,)
+                ).fetchone()
+                if not locked_row:
+                    return self.send_json({"error": "request_not_found"}, 404)
+                item = row_customer_request(locked_row)
+                if item["userId"] != user_id:
+                    return self.send_json(
+                        {"error": "offer_selection_not_allowed"}, 403
+                    )
                 offer_id = str(data.get("offerId", "") or "")
                 if item["acceptedProviderId"]:
                     existing_work_order = RequestWorkOrderService(con).get(request_id)
@@ -9128,9 +10213,6 @@ class Handler(SimpleHTTPRequestHandler):
                     return self.send_json({"error": "offer_expired"}, 409)
                 selected_provider = selected.get("providerId", "")
                 blocks.assert_allowed(item["userId"], selected_provider)
-                eligible, _, _ = provider_receive_entitlement(con, selected_provider)
-                if not eligible:
-                    return self.send_json({"error": "provider_no_longer_available"}, 409)
                 # In-app chat opens after the customer deliberately selects an offer.
                 # Phone and WhatsApp remain separately consent-gated.
                 chat_granted = True
@@ -9168,6 +10250,9 @@ class Handler(SimpleHTTPRequestHandler):
                 }
                 messages.append(welcome_message)
                 booking_v2 = item.get("workflowVersion") == "booking_v2"
+                require_provider_acceptance_eligibility(
+                    con, locked_row, selected_provider
+                )
                 if booking_v2:
                     _, duplicate_acceptance = RequestWorkOrderService(con).accept_offer(
                         request_id,
@@ -10595,6 +11680,16 @@ class Handler(SimpleHTTPRequestHandler):
                 result = {"cancelled": True}
             elif action == "legal:save" and kind == "provider":
                 result = ProviderLegalProfileService(con).save(actor_id, data)
+                provider_row = con.execute(
+                    "SELECT verified FROM providers WHERE id=?", (actor_id,)
+                ).fetchone()
+                if provider_row and bool(provider_row["verified"]):
+                    ProviderVerificationService(con).invalidate_for_evidence_change(
+                        actor_id,
+                        actor_kind="provider",
+                        actor_id=actor_id,
+                        reason="غيّر المزود بيانات المسار القانوني؛ يلزم اعتماد إداري جديد.",
+                    )
                 create_notification(
                     con,
                     "admin",
@@ -10621,10 +11716,10 @@ class Handler(SimpleHTTPRequestHandler):
             )
 
     def admin_platform_post(self, data):
-        session = self.require_admin("manage_settings")
+        action = safe_text(data.get("action"), 80)
+        session = self.require_admin_platform_action(action)
         if not session:
             return
-        action = safe_text(data.get("action"), 80)
         with db() as con:
             result = None
             if action == "booking-policy:list":
@@ -10640,12 +11735,81 @@ class Handler(SimpleHTTPRequestHandler):
                     safe_text(data.get("key"), 80), data, session["id"]
                 )
             elif action == "legal:review":
-                result = ProviderLegalProfileService(con).review(
-                    safe_text(data.get("providerId"), 120),
-                    safe_text(data.get("status"), 40),
+                provider_id = safe_text(data.get("providerId"), 120)
+                legal_status = safe_text(data.get("status"), 40)
+                legal_profile = ProviderLegalProfileService(con).review(
+                    provider_id,
+                    legal_status,
                     session["id"],
                     safe_text(data.get("note"), 600),
                 )
+                verification_service = ProviderVerificationService(con)
+                provider_row = con.execute(
+                    """SELECT id,provider_type,verified,verification_expiry,status
+                    FROM providers WHERE id=? AND COALESCE(status,'')!='deleted'""",
+                    (provider_id,),
+                ).fetchone()
+                if not provider_row:
+                    raise DomainError("provider_not_found", 404)
+                verification_case = verification_service.ensure_case(provider_row)
+                if legal_status == "approved":
+                    evidence = assert_provider_verification_evidence(
+                        con, provider_id, now=verification_service.now
+                    )
+                    verification_case = verification_service.review(
+                        provider_id,
+                        {
+                            "status": "verified",
+                            "identityStatus": "verified",
+                            "entityStatus": (
+                                "verified"
+                                if provider_row["provider_type"] == "company"
+                                else "not_applicable"
+                            ),
+                            "activityStatus": "verified",
+                            "expiresAt": evidence["credentialExpiry"],
+                            "decisionNote": (
+                                "أعيد الاعتماد بعد موافقة الإدارة على المسار القانوني "
+                                "وفحص أدلة الهوية والنشاط."
+                            ),
+                        },
+                        reviewer_id=session["id"],
+                    )
+                elif legal_status in {"rejected", "expired"}:
+                    verification_case = verification_service.review(
+                        provider_id,
+                        {
+                            "status": legal_status,
+                            "identityStatus": verification_case["identityStatus"],
+                            "entityStatus": verification_case["entityStatus"],
+                            "activityStatus": verification_case["activityStatus"],
+                            "decisionNote": (
+                                "ألغيت أهلية الظهور واستقبال الطلبات بسبب قرار "
+                                "المراجعة القانونية."
+                            ),
+                        },
+                        reviewer_id=session["id"],
+                    )
+                elif bool(provider_row["verified"]):
+                    verification_case = (
+                        verification_service.invalidate_for_evidence_change(
+                            provider_id,
+                            actor_kind="admin",
+                            actor_id=session["id"],
+                            reason=(
+                                "أعادت الإدارة المسار القانوني إلى المراجعة؛ "
+                                "توقفت الأهلية حتى قرار جديد."
+                            ),
+                        )
+                    )
+                canonical_provider_row = con.execute(
+                    "SELECT * FROM providers WHERE id=?", (provider_id,)
+                ).fetchone()
+                result = {
+                    **legal_profile,
+                    "verification": verification_case,
+                    "provider": row_provider(canonical_provider_row, private=True),
+                }
                 create_notification(
                     con,
                     "provider",
@@ -11091,7 +12255,7 @@ class Handler(SimpleHTTPRequestHandler):
                 updated_at=CURRENT_TIMESTAMP""",
                 (slug("push"), session["kind"], target_id, endpoint, jdump(subscription)),
             )
-        return self.send_json({"ok": True, "deliveryReady": bool(os.environ.get("VAPID_PRIVATE_KEY"))})
+        return self.send_json({"ok": True, "deliveryReady": push_ready()})
 
     def policy_accept(self, data):
         session = self.session()
@@ -11147,6 +12311,7 @@ class Handler(SimpleHTTPRequestHandler):
             "/api/provider/quote-templates": "profile",
             "/api/provider/support": "requests",
             "/api/provider/history": "requests",
+            "/api/provider/review-reply": "profile",
             "/api/provider/subscription-request": "subscription",
             "/api/provider/payment-intent": "subscription",
             "/api/provider/team": "team",
@@ -11160,6 +12325,35 @@ class Handler(SimpleHTTPRequestHandler):
             if not row:
                 return self.send_json({"error": "not_found"}, 404)
             provider = row_provider(row, private=True)
+            if path == "/api/provider/review-reply":
+                review_id = safe_text(data.get("reviewId", data.get("id")), 120)
+                reply = str(data.get("text", data.get("reply", "")) or "").strip()
+                if not review_id:
+                    return self.send_json({"error": "review_id_required"}, 400)
+                if not reply or len(reply) > 300:
+                    return self.send_json({"error": "invalid_review_reply"}, 400)
+                review = con.execute(
+                    """SELECT * FROM reviews WHERE id=? AND provider_id=?
+                    AND approved=1 AND COALESCE(deleted_at,'')=''""",
+                    (review_id, provider["id"]),
+                ).fetchone()
+                if not review:
+                    return self.send_json({"error": "review_not_found"}, 404)
+                con.execute(
+                    """UPDATE reviews SET provider_reply=?,provider_reply_at=CURRENT_TIMESTAMP
+                    WHERE id=? AND provider_id=?""",
+                    (reply, review_id, provider["id"]),
+                )
+                log_audit(
+                    con, session, "provider.review_reply.saved", review_id,
+                    provider["id"],
+                )
+                updated = con.execute(
+                    "SELECT * FROM reviews WHERE id=?", (review_id,)
+                ).fetchone()
+                return self.send_json({
+                    "ok": True, "review": row_review(updated, private=False)
+                })
             if path == "/api/provider/history":
                 request_id = safe_text(data.get("requestId"), 120)
                 action = safe_text(data.get("action", "hide"), 20)
@@ -11256,6 +12450,23 @@ class Handler(SimpleHTTPRequestHandler):
                 commercial_no = safe_text(
                     data.get("commercialNo", provider.get("commercialNo", "")), 120
                 )
+                commercial_expiry = safe_text(
+                    data.get(
+                        "commercialExpiry", provider.get("commercialExpiry", "")
+                    ),
+                    40,
+                )
+                license_expiry = safe_text(
+                    data.get("licenseExpiry", provider.get("licenseExpiry", "")), 40
+                )
+                evidence_changed = bool(provider.get("verified")) and (
+                    commercial_no != safe_text(provider.get("commercialNo", ""), 120)
+                    or commercial_expiry
+                    != safe_text(provider.get("commercialExpiry", ""), 40)
+                    or license_expiry
+                    != safe_text(provider.get("licenseExpiry", ""), 40)
+                    or bool(data.get("documentsData"))
+                )
                 status = data.get("status", provider["status"])
                 if status not in {"available", "busy", "unavailable", "under_review"}:
                     return self.send_json({"error": "invalid_provider_status"}, 400)
@@ -11267,7 +12478,7 @@ class Handler(SimpleHTTPRequestHandler):
                 )
                 governorates_value = data.get(
                     "governorates",
-                    provider.get("governorates") or [provider.get("gov", "")],
+                    provider.get("governorates", []),
                 )
                 if not isinstance(governorates_value, list):
                     return self.send_json({"error": "governorates_must_be_list"}, 400)
@@ -11288,6 +12499,10 @@ class Handler(SimpleHTTPRequestHandler):
                         limit=max(1, int(entitlements.get("maxServices") or 1)),
                         category_limit=max(1, int(entitlements.get("maxCategories") or 1)),
                         default_areas=areas,
+                        provider_type=provider.get("providerType", "individual"),
+                        coverage_areas=areas,
+                        coverage_governorates=governorates,
+                        wilayah_limit=int(entitlements.get("maxWilayats") or 0),
                     )
                     availability = normalized_availability(
                         data.get("availability"),
@@ -11333,9 +12548,12 @@ class Handler(SimpleHTTPRequestHandler):
                     "age": age,
                     "nationality": nationality,
                     "commercialNo": commercial_no,
-                    "verificationExpiry": safe_text(data.get("verificationExpiry", provider.get("verificationExpiry", "")), 40),
-                    "commercialExpiry": safe_text(data.get("commercialExpiry", provider.get("commercialExpiry", "")), 40),
-                    "licenseExpiry": safe_text(data.get("licenseExpiry", provider.get("licenseExpiry", "")), 40),
+                    # Only management controls the verification expiry itself.
+                    "verificationExpiry": safe_text(
+                        provider.get("verificationExpiry", ""), 40
+                    ),
+                    "commercialExpiry": commercial_expiry,
+                    "licenseExpiry": license_expiry,
                     "gov": safe_text(data.get("gov", provider["gov"]), 80),
                     "governorates": governorates,
                     "wilayah": safe_text(data.get("wilayah", provider["wilayah"]), 80),
@@ -11386,32 +12604,40 @@ class Handler(SimpleHTTPRequestHandler):
                 except DomainError as err:
                     return self.send_domain_error(err)
                 saved_provider = upsert_provider(con, provider)
-                if saved_provider.get("status") == "available":
-                    waiting_rows = con.execute(
-                        "SELECT * FROM customer_requests WHERE waitlisted=1 AND status='unavailable'"
-                    ).fetchall()
-                    for waiting_row in waiting_rows:
-                        waiting_request = row_customer_request(waiting_row)
-                        if not request_matches_provider(waiting_request, saved_provider):
-                            continue
-                        marketplace = RequestMarketplace(con)
-                        ranked = marketplace.schedule(waiting_request["id"])
-                        if not ranked:
-                            continue
-                        released = marketplace.release_due(waiting_request["id"])
-                        create_marketplace_notifications(con, released)
-                        create_notification(
-                            con, "user", waiting_request["userId"], "توفر مزود لخدمتك",
-                            f"أصبح هناك مزود مناسب لطلب {waiting_request['serviceName'] or waiting_request['serviceValue']}.",
-                            type_="request", related_id=waiting_request["id"], priority="high",
-                            action_text="فتح الطلب", action_route=f"user:request:{waiting_request['id']}",
-                        )
+                if evidence_changed:
+                    ProviderVerificationService(con).invalidate_for_evidence_change(
+                        provider["id"],
+                        actor_kind="provider",
+                        actor_id=provider["id"],
+                        reason="غيّر المزود رقم الترخيص أو صلاحيته أو وثائق التحقق.",
+                    )
+                    create_notification(
+                        con,
+                        "admin",
+                        "",
+                        "تحديث هوية مزود يحتاج مراجعة",
+                        provider["name"],
+                        type_="verification",
+                        related_id=provider["id"],
+                        priority="high",
+                        action_text="فتح التحقق",
+                        action_route=f"admin:trust:{provider['id']}",
+                    )
+                elif saved_provider.get("status") == "available":
+                    redispatch_waitlisted_requests(con, saved_provider["id"])
                 log_audit(con, session, "provider.profile.updated", provider["id"], provider["name"])
                 updated = con.execute("SELECT * FROM providers WHERE id=?", (provider["id"],)).fetchone()
                 return self.send_json({"ok": True, "provider": row_provider(updated, private=True, sign_private=True)})
             if path == "/api/provider/image":
                 image_path = save_data_url(provider["id"], data.get("imageData", ""))
                 con.execute("UPDATE providers SET image_path=? WHERE id=?", (image_path, provider["id"]))
+                old_avatar = _local_upload_target(provider.get("imagePath"))
+                retained_card = _local_upload_target(row["card_image"])
+                new_avatar = _local_upload_target(image_path)
+                if old_avatar and old_avatar not in {retained_card, new_avatar}:
+                    _schedule_upload_deletions(
+                        [old_avatar], event_name="provider.avatar_cleanup_failed"
+                    )
                 recompute_provider_quality(con, provider["id"])
                 return self.send_json({"ok": True, "imageUrl": image_url(image_path)})
             if path == "/api/provider/work-images":
@@ -11422,6 +12648,25 @@ class Handler(SimpleHTTPRequestHandler):
                 )
                 if images:
                     con.execute("UPDATE providers SET work_images=? WHERE id=?", (jdump(images), provider["id"]))
+                    retained = {
+                        target
+                        for target in (
+                            _local_upload_target(value)
+                            for value in [*images, row["card_image"], row["image_path"]]
+                        )
+                        if target is not None
+                    }
+                    removed = {
+                        target
+                        for target in (
+                            _local_upload_target(value)
+                            for value in provider.get("workImages", [])
+                        )
+                        if target is not None and target not in retained
+                    }
+                    _schedule_upload_deletions(
+                        removed, event_name="provider.work_media_cleanup_failed"
+                    )
                     recompute_provider_quality(con, provider["id"])
                 return self.send_json({"ok": True, "workImageUrls": urls(images)})
             if path == "/api/provider/media":
@@ -11433,7 +12678,16 @@ class Handler(SimpleHTTPRequestHandler):
                     return self.send_json({"error": "media_not_found"}, 404)
                 if action == "set-card":
                     con.execute("UPDATE providers SET card_image=? WHERE id=?", (image_url(selected_path), provider["id"]))
-                    return self.send_json({"ok": True, "cardImage": image_url(selected_path)})
+                    updated = con.execute(
+                        "SELECT * FROM providers WHERE id=?", (provider["id"],)
+                    ).fetchone()
+                    return self.send_json({
+                        "ok": True,
+                        "cardImage": image_url(selected_path),
+                        "provider": row_provider(
+                            updated, private=True, sign_private=True
+                        ),
+                    })
                 if action == "delete":
                     work_images = [p for p in provider.get("workImages", []) if p != selected_path]
                     avatar = "" if provider.get("imagePath") == selected_path else provider.get("imagePath", "")
@@ -11447,17 +12701,71 @@ class Handler(SimpleHTTPRequestHandler):
                     target = (UPLOAD_DIR / Path(selected_path).name).resolve()
                     try:
                         target.relative_to(UPLOAD_DIR.resolve())
-                        if target.is_file():
-                            target.unlink()
                     except ValueError:
-                        pass
+                        target = None
+                    if target is not None:
+                        def delete_media_after_commit(path=target):
+                            try:
+                                if path.is_file():
+                                    path.unlink()
+                            except OSError as err:
+                                log_event(
+                                    "provider.media_delete_failed",
+                                    level="error",
+                                    providerId=provider["id"],
+                                    errorType=type(err).__name__,
+                                )
+
+                        _after_database_commit(delete_media_after_commit)
                     recompute_provider_quality(con, provider["id"])
-                    return self.send_json({"ok": True, "cardImage": card_image})
+                    updated = con.execute(
+                        "SELECT * FROM providers WHERE id=?", (provider["id"],)
+                    ).fetchone()
+                    return self.send_json({
+                        "ok": True,
+                        "cardImage": card_image,
+                        "provider": row_provider(
+                            updated, private=True, sign_private=True
+                        ),
+                    })
                 return self.send_json({"error": "invalid_media_action"}, 400)
             if path == "/api/provider/documents":
                 docs = save_many_documents(provider["id"], data.get("documentsData", []), "doc", 3)
                 if docs:
                     con.execute("UPDATE providers SET documents=? WHERE id=?", (jdump(docs), provider["id"]))
+                    retained = {
+                        target for target in (
+                            _local_upload_target(value) for value in docs
+                        ) if target is not None
+                    }
+                    removed = {
+                        target for target in (
+                            _local_upload_target(value)
+                            for value in provider.get("documents", [])
+                        ) if target is not None and target not in retained
+                    }
+                    _schedule_upload_deletions(
+                        removed, event_name="provider.document_cleanup_failed"
+                    )
+                    if provider.get("verified"):
+                        ProviderVerificationService(con).invalidate_for_evidence_change(
+                            provider["id"],
+                            actor_kind="provider",
+                            actor_id=provider["id"],
+                            reason="استبدل المزود وثائق التحقق؛ يلزم اعتماد إداري جديد.",
+                        )
+                        create_notification(
+                            con,
+                            "admin",
+                            "",
+                            "وثائق مزود تحتاج مراجعة",
+                            provider["name"],
+                            type_="verification",
+                            related_id=provider["id"],
+                            priority="high",
+                            action_text="فتح التحقق",
+                            action_route=f"admin:trust:{provider['id']}",
+                        )
                 return self.send_json({
                     "ok": True,
                     "documents": [secure_media_url(path) for path in docs],
@@ -11529,7 +12837,7 @@ class Handler(SimpleHTTPRequestHandler):
                     if result.rowcount != 1:
                         return self.send_json({"error": "team_member_not_found"}, 404)
                     log_audit(con, session, "provider.team.disabled", member_id, provider["id"])
-                    return self.send_json({"ok": True})
+                    return self.send_json({"ok": True, "id": member_id})
                 existing_count = con.execute(
                     """SELECT COUNT(*) n FROM provider_team_members
                     WHERE provider_id=? AND active=1 AND id!=?""",
@@ -11642,6 +12950,8 @@ class Handler(SimpleHTTPRequestHandler):
             "/api/admin/packages": "manage_subscriptions",
             "/api/admin/subscriptions": "manage_subscriptions",
             "/api/admin/payments": "manage_finance",
+            "/api/admin/finance": "manage_finance",
+            "/api/admin/sponsorships": "manage_finance",
             "/api/admin/coupons": "manage_subscriptions",
             "/api/admin/campaigns": "manage_campaigns",
             "/api/admin/team": "manage_team",
@@ -11658,6 +12968,12 @@ class Handler(SimpleHTTPRequestHandler):
         session = self.require_admin(permission)
         if not session:
             return
+        if path in {
+            "/api/admin/finance",
+            "/api/admin/sponsorships",
+            "/api/admin/coupons",
+        }:
+            return self.commercial_record_post(path, data, session)
         with db() as con:
             if path == "/api/admin/verification":
                 provider_id = safe_text(data.get("providerId"), 120)
@@ -12093,9 +13409,99 @@ class Handler(SimpleHTTPRequestHandler):
                     {"ok": True, "categories": catalog_snapshot(con)}
                 )
             if path == "/api/admin/providers":
-                p = upsert_provider(con, data)
-                log_audit(con, session, "provider.upserted", p["id"], p.get("name", ""))
-                return self.send_json({"ok": True, "provider": p})
+                provider_id = safe_text(data.get("id"), 120)
+                current_provider = (
+                    con.execute(
+                        "SELECT * FROM providers WHERE id=?", (provider_id,)
+                    ).fetchone()
+                    if provider_id
+                    else None
+                )
+                if "verified" in data and data.get("verified") not in (
+                    True, False, 0, 1
+                ):
+                    return self.send_json(
+                        {"error": "invalid_boolean", "field": "verified"}, 400
+                    )
+                requested_verified = bool(data.get("verified", False))
+                if not current_provider and requested_verified:
+                    return self.send_json(
+                        {"error": "verification_review_required"}, 409
+                    )
+                if (
+                    current_provider
+                    and "verified" in data
+                    and requested_verified != bool(current_provider["verified"])
+                ):
+                    return self.send_json(
+                        {"error": "use_provider_verification_endpoint"}, 409
+                    )
+                if (
+                    current_provider
+                    and "verificationExpiry" in data
+                    and safe_text(data.get("verificationExpiry"), 80)
+                    != safe_text(current_provider["verification_expiry"], 80)
+                ):
+                    return self.send_json(
+                        {"error": "use_provider_verification_endpoint"}, 409
+                    )
+
+                controlled_data = dict(data)
+                controlled_data["verified"] = bool(
+                    current_provider["verified"] if current_provider else False
+                )
+                controlled_data["verificationExpiry"] = (
+                    current_provider["verification_expiry"]
+                    if current_provider
+                    else ""
+                )
+                before_material = provider_verification_material(current_provider)
+                saved = upsert_provider(con, controlled_data)
+                saved_row = con.execute(
+                    "SELECT * FROM providers WHERE id=?", (saved["id"],)
+                ).fetchone()
+                evidence_changed = bool(
+                    current_provider
+                    and current_provider["verified"]
+                    and provider_verification_material(saved_row) != before_material
+                )
+                if evidence_changed:
+                    ProviderVerificationService(con).invalidate_for_evidence_change(
+                        saved["id"],
+                        actor_kind="admin",
+                        actor_id=session["id"],
+                        reason=(
+                            "غيّرت الإدارة رقم الترخيص أو صلاحيته أو وثائق التحقق؛ "
+                            "يلزم قرار اعتماد جديد."
+                        ),
+                    )
+                elif not current_provider:
+                    con.execute(
+                        """UPDATE providers SET verified=0,verification_expiry='',
+                        status=CASE WHEN status IN ('available','busy')
+                          THEN 'under_review' ELSE status END,
+                        listing_enabled=0,request_enabled=0,
+                        updated_at=CURRENT_TIMESTAMP WHERE id=?""",
+                        (saved["id"],),
+                    )
+                saved_row = con.execute(
+                    "SELECT * FROM providers WHERE id=?", (saved["id"],)
+                ).fetchone()
+                canonical_provider = row_provider(saved_row, private=True)
+                log_audit(
+                    con,
+                    session,
+                    "provider.upserted",
+                    saved["id"],
+                    canonical_provider.get("name", ""),
+                )
+                return self.send_json(
+                    {
+                        "ok": True,
+                        "provider": canonical_provider,
+                        "verificationInvalidated": evidence_changed,
+                    }
+                )
             if path == "/api/admin/provider-status":
                 provider_id = safe_text(data.get("id"), 120)
                 lifecycle_action = safe_text(data.get("action"), 24)
@@ -12130,6 +13536,22 @@ class Handler(SimpleHTTPRequestHandler):
                     return self.send_json({"error": "provider_not_found"}, 404)
                 if status == "deleted":
                     return self.send_json({"error": "use_provider_delete_endpoint"}, 409)
+                if flags[1] and not bool(current_provider["verified"]):
+                    try:
+                        assert_provider_verification_evidence(con, provider_id)
+                    except DomainError as err:
+                        error_payload = {"error": err.code}
+                        if err.code == "commercial_number_required":
+                            error_payload["field"] = "commercialNo"
+                        elif err.code == "credential_expiry_required":
+                            error_payload["field"] = "credentialExpiry"
+                        elif err.code == "documents_required":
+                            error_payload.update({
+                                "field": "documents",
+                                "requiredDocuments": 2,
+                                "currentDocuments": int(err.detail or 0),
+                            })
+                        return self.send_json(error_payload, err.status)
                 if not flags[0] or status in {"suspended", "archived"}:
                     try:
                         result = provider_lifecycle_transition(
@@ -12155,30 +13577,19 @@ class Handler(SimpleHTTPRequestHandler):
                     except DomainError as err:
                         return self.send_domain_error(err)
                     restored_snapshot = restored["provider"].get("lifecycleSnapshot") or {}
-                listing_enabled = int(bool(
-                    restored_snapshot.get(
-                        "listingEnabled", current_provider["listing_enabled"]
-                    )
-                ))
-                request_enabled = int(bool(
-                    restored_snapshot.get(
-                        "requestEnabled", current_provider["request_enabled"]
-                    )
-                ))
-                con.execute(
-                    """UPDATE providers SET active=?,verified=?,featured=?,status=?,
-                    listing_enabled=?,request_enabled=?,lifecycle_state='active',
-                    status_reason='',updated_at=CURRENT_TIMESTAMP WHERE id=?""",
-                    (*flags, status, listing_enabled, request_enabled, provider_id),
-                )
                 provider_row = con.execute(
-                    """SELECT id,provider_type,verified,verification_expiry,status
+                    """SELECT id,provider_type,verified,verification_expiry,status,
+                    listing_enabled,request_enabled
                     FROM providers WHERE id=?""",
                     (provider_id,),
                 ).fetchone()
                 verification_service = ProviderVerificationService(con)
                 verification_case = verification_service.ensure_case(provider_row)
-                if flags[1] and verification_case["status"] != "verified":
+                verification_transition = False
+                if flags[1] and (
+                    not bool(provider_row["verified"])
+                    or verification_case["status"] != "verified"
+                ):
                     verification_service.review(
                         provider_id,
                         {
@@ -12194,7 +13605,11 @@ class Handler(SimpleHTTPRequestHandler):
                         },
                         reviewer_id=session["id"],
                     )
-                elif not flags[1] and verification_case["status"] == "verified":
+                    verification_transition = True
+                elif not flags[1] and (
+                    bool(provider_row["verified"])
+                    or verification_case["status"] == "verified"
+                ):
                     verification_service.review(
                         provider_id,
                         {
@@ -12206,9 +13621,57 @@ class Handler(SimpleHTTPRequestHandler):
                         },
                         reviewer_id=session["id"],
                     )
+                    verification_transition = True
+                provider_row = con.execute(
+                    """SELECT id,provider_type,verified,verification_expiry,status,
+                    listing_enabled,request_enabled FROM providers WHERE id=?""",
+                    (provider_id,),
+                ).fetchone()
+                listing_enabled = int(bool(
+                    provider_row["listing_enabled"]
+                    if verification_transition
+                    else restored_snapshot.get(
+                        "listingEnabled", provider_row["listing_enabled"]
+                    )
+                ))
+                request_enabled = int(bool(
+                    provider_row["request_enabled"]
+                    if verification_transition
+                    else restored_snapshot.get(
+                        "requestEnabled", provider_row["request_enabled"]
+                    )
+                ))
+                effective_status = (
+                    provider_row["status"]
+                    if verification_transition and not flags[1]
+                    else status
+                )
+                con.execute(
+                    """UPDATE providers SET active=?,verified=?,featured=?,status=?,
+                    listing_enabled=?,request_enabled=?,lifecycle_state='active',
+                    status_reason='',updated_at=CURRENT_TIMESTAMP WHERE id=?""",
+                    (
+                        flags[0], int(bool(provider_row["verified"])), flags[2],
+                        effective_status, listing_enabled, request_enabled, provider_id,
+                    ),
+                )
                 recompute_provider_quality(con, provider_id)
-                log_audit(con, session, "provider.status.updated", provider_id, status)
-                return self.send_json({"ok": True})
+                redispatch = (
+                    redispatch_waitlisted_requests(con, provider_id)
+                    if flags[0] and provider_row["verified"] and effective_status == "available"
+                    else {"considered": 0, "matched": 0, "released": 0}
+                )
+                log_audit(
+                    con, session, "provider.status.updated", provider_id, effective_status
+                )
+                saved_provider = con.execute(
+                    "SELECT * FROM providers WHERE id=?", (provider_id,)
+                ).fetchone()
+                return self.send_json({
+                    "ok": True,
+                    "redispatch": redispatch,
+                    "provider": row_provider(saved_provider, private=True),
+                })
             if path == "/api/admin/provider-delete":
                 provider_id = str(data.get("id", "") or "")
                 admin_code = safe_text(data.get("adminCode", ""), 128)
@@ -12311,7 +13774,15 @@ class Handler(SimpleHTTPRequestHandler):
                     if status in {"stopped", "suspended"}:
                         revoke_account_sessions(con, "user", user_id)
                     log_audit(con, session, "app_user.updated", user_id, status)
-                    return self.send_json({"ok": True})
+                    updated_user = con.execute(
+                        "SELECT * FROM app_users WHERE id=?", (user_id,)
+                    ).fetchone()
+                    return self.send_json({
+                        "ok": True,
+                        "user": row_app_user(
+                            updated_user, private=True, sign_private=True
+                        ),
+                    })
                 if action == "delete":
                     admin_code = safe_text(data.get("adminCode", ""), 128)
                     reason = safe_text(data.get("reason", ""), 500)
@@ -12349,7 +13820,9 @@ class Handler(SimpleHTTPRequestHandler):
                         user_id,
                         f"{user_row['name']} | {reason}",
                     )
-                    return self.send_json({"ok": True})
+                    return self.send_json({
+                        "ok": True, "deleted": True, "id": user_id
+                    })
                 return self.send_json({"error": "invalid_action"}, 400)
             if path == "/api/admin/request-decision":
                 decision = safe_text(data.get("decision"), 20)
@@ -12362,14 +13835,10 @@ class Handler(SimpleHTTPRequestHandler):
                 description = safe_text(payload.get("bio") or payload.get("note"), 600)
                 if decision == "accept":
                     note_words = len(description.split())
-                    if (
-                        payload.get("providerType") == "company"
-                        and not payload.get("commercialNo")
-                    ):
+                    if not payload.get("commercialNo"):
                         return self.send_json({"error": "commercial_number_required"}, 400)
                     credential_expiry = payload.get("commercialExpiry") if payload.get("providerType") == "company" else payload.get("licenseExpiry")
-                    requires_credential_expiry = payload.get("providerType") == "company" or bool(payload.get("commercialNo"))
-                    if int(payload.get("registrationVersion") or 0) >= 57 and requires_credential_expiry and not credential_expiry:
+                    if not credential_expiry:
                         return self.send_json({"error": "credential_expiry_required"}, 400)
                     if payload.get("legalPath") == "individual_foreign" and (
                         not payload.get("employerName") or not payload.get("workPermitExpiry")
@@ -12381,6 +13850,14 @@ class Handler(SimpleHTTPRequestHandler):
                         return self.send_json({"error": "documents_required"}, 400)
                     if not payload.get("pinHash"):
                         return self.send_json({"error": "pin_not_configured"}, 400)
+                    try:
+                        verification_evidence = assert_verification_evidence({
+                            **payload,
+                            "id": safe_text(data.get("id"), 120),
+                        })
+                    except DomainError as err:
+                        return self.send_domain_error(err)
+                    credential_expiry = verification_evidence["credentialExpiry"]
                 con.execute("DELETE FROM provider_requests WHERE id=?", (data.get("id"),))
                 if decision == "accept":
                     provider = {
@@ -12405,9 +13882,12 @@ class Handler(SimpleHTTPRequestHandler):
                         "areas": [payload.get("wilayah", "")],
                         "bio": description,
                         "hours": payload.get("hours", ""),
+                        "availability": payload.get("availability", {}),
                         "status": "available",
                         "active": True,
-                        "verified": True,
+                        # The case service below is the only authority allowed
+                        # to grant verification after all evidence checks pass.
+                        "verified": False,
                         "featured": False,
                         "packageId": PlanCatalog.foundation_for(
                             "company" if payload.get("providerType") == "company" else "individual"
@@ -12437,7 +13917,13 @@ class Handler(SimpleHTTPRequestHandler):
                         limit=max(1, int(limits.get("maxServices") or 1)),
                         category_limit=max(1, int(limits.get("maxCategories") or 1)),
                         fallback_price=payload.get("priceFrom") or 0,
-                        default_areas=[payload.get("wilayah", "")],
+                        default_areas=[payload.get("wilayah", "")]
+                        if payload.get("wilayah")
+                        else [],
+                        provider_type=provider["providerType"],
+                        coverage_areas=provider["areas"],
+                        coverage_governorates=[],
+                        wilayah_limit=int(limits.get("maxWilayats") or 0),
                     )
                     service = payload.get("service", "")
                     if not provider["services"] and "|" in service:
@@ -12573,14 +14059,24 @@ class Handler(SimpleHTTPRequestHandler):
                             action_route=f"user:request:{linked['requestId']}",
                         )
                     log_audit(con, session, "provider.request.accepted", provider["id"], provider["name"])
-                    send_whatsapp(provider["phone"], "تم قبول حسابك كمزود في خدماتي. يمكنك الدخول من بوابة المزودين.")
+                    _after_database_commit(
+                        lambda phone=provider["phone"]: send_whatsapp(
+                            phone,
+                            "تم قبول حسابك كمزود في خدماتي. يمكنك الدخول من بوابة المزودين.",
+                        )
+                    )
                     approved_row = con.execute(
                         "SELECT * FROM providers WHERE id=?", (provider["id"],)
                     ).fetchone()
+                    redispatch = redispatch_waitlisted_requests(
+                        con, provider["id"]
+                    )
                 else:
+                    redispatch = {"considered": 0, "matched": 0, "released": 0}
                     log_audit(con, session, "provider.request.rejected", data.get("id", ""), payload.get("name", ""))
                 return self.send_json({
                     "ok": True,
+                    "redispatch": redispatch,
                     "provider": row_provider(approved_row, private=True, sign_private=True)
                     if decision == "accept" and approved_row else None,
                 })
@@ -12618,7 +14114,19 @@ class Handler(SimpleHTTPRequestHandler):
                     audit_detail = str(approved)
                 recompute_provider_quality(con, row["provider_id"])
                 log_audit(con, session, audit_action, review_id, audit_detail)
-                return self.send_json({"ok": True})
+                updated_review = con.execute(
+                    "SELECT * FROM reviews WHERE id=?", (review_id,)
+                ).fetchone()
+                updated_provider = con.execute(
+                    "SELECT * FROM providers WHERE id=?", (row["provider_id"],)
+                ).fetchone()
+                return self.send_json({
+                    "ok": True,
+                    "review": row_review(updated_review, private=True),
+                    "provider": row_provider(
+                        updated_provider, private=True, sign_private=True
+                    ) if updated_provider else None,
+                })
             if path == "/api/admin/complaint-status":
                 complaint_id = data.get("id")
                 row = con.execute(
@@ -13052,43 +14560,6 @@ class Handler(SimpleHTTPRequestHandler):
                         )
                 log_audit(con, session, f"payment.{action}", payment_id, jdump(result))
                 return self.send_json({"ok": True, "payment": result})
-            if path == "/api/admin/coupons":
-                coupon_id = str(data.get("id") or slug("coupon"))
-                if data.get("action") == "disable":
-                    con.execute(
-                        "UPDATE coupons SET active=0,updated_at=CURRENT_TIMESTAMP WHERE id=?",
-                        (coupon_id,),
-                    )
-                    log_audit(con, session, "coupon.disabled", coupon_id, "")
-                    return self.send_json({"ok": True})
-                code = re.sub(r"[^A-Z0-9_-]", "", str(data.get("code", "") or "").upper())[:32]
-                discount_type = str(data.get("discountType", "fixed") or "fixed")
-                if not code or discount_type not in {"fixed", "percent"}:
-                    return self.send_json({"error": "invalid_coupon"}, 400)
-                value = finite_number(data.get("discountValue", 0), minimum=0, maximum=1_000_000)
-                if discount_type == "percent" and value > 100:
-                    return self.send_json({"error": "invalid_coupon_value"}, 400)
-                applies_to = [plan for plan in data.get("appliesTo", []) if plan in PLAN_IDS]
-                con.execute(
-                    """INSERT INTO coupons(
-                    id,code,name_ar,name_en,discount_type,discount_value,applies_to,
-                    starts_at,ends_at,max_uses,active)
-                    VALUES(?,?,?,?,?,?,?,?,?,?,1)
-                    ON CONFLICT(id) DO UPDATE SET code=excluded.code,name_ar=excluded.name_ar,
-                    name_en=excluded.name_en,discount_type=excluded.discount_type,
-                    discount_value=excluded.discount_value,applies_to=excluded.applies_to,
-                    starts_at=excluded.starts_at,ends_at=excluded.ends_at,
-                    max_uses=excluded.max_uses,active=1,updated_at=CURRENT_TIMESTAMP""",
-                    (
-                        coupon_id, code, str(data.get("nameAr", "") or "")[:120],
-                        str(data.get("nameEn", "") or "")[:120], discount_type, value,
-                        jdump(applies_to), str(data.get("startsAt", "") or "")[:40],
-                        str(data.get("endsAt", "") or "")[:40],
-                        max(0, int(data.get("maxUses", 0) or 0)),
-                    ),
-                )
-                log_audit(con, session, "coupon.upserted", coupon_id, code)
-                return self.send_json({"ok": True, "id": coupon_id})
             if path == "/api/admin/campaigns":
                 service = RewardCampaignService(con)
                 action = safe_text(data.get("action"), 40)
@@ -13338,7 +14809,7 @@ class Handler(SimpleHTTPRequestHandler):
                 settings_data.pop("serviceAreas", None)
                 con.execute("UPDATE settings SET value=? WHERE key='platform'", (jdump(settings_data),))
                 log_audit(con, session, "settings.updated", "platform", "")
-                return self.send_json({"ok": True})
+                return self.send_json({"ok": True, "settings": settings_data})
             if path == "/api/admin/ads":
                 ad_id = str(data.get("id") or slug("ad"))
                 existing = con.execute("SELECT * FROM advertisements WHERE id=?", (ad_id,)).fetchone()
@@ -13353,7 +14824,9 @@ class Handler(SimpleHTTPRequestHandler):
                         con, "admin", "", "تمت أرشفة إعلان",
                         existing["advertiser"] or ad_id, type_="advertisement", related_id=ad_id,
                     )
-                    return self.send_json({"ok": True, "archived": True})
+                    return self.send_json({
+                        "ok": True, "archived": True, "id": ad_id
+                    })
                 image_path = existing["image_path"] if existing else ""
                 if data.get("imageData"):
                     image_path = save_upload_data(ad_id, data["imageData"], "banner", IMAGE_MIMES, 4_000_000)
@@ -13415,6 +14888,52 @@ class Handler(SimpleHTTPRequestHandler):
             if path == "/api/admin/test-whatsapp":
                 return self.send_json(send_whatsapp(data.get("to"), data.get("message", "اختبار من منصة خدماتي")))
         self.send_json({"error": "not_found"}, 404)
+
+    def commercial_record_post(self, path, data, session):
+        """Commit canonical private records before acknowledging success."""
+        try:
+            with db() as con:
+                service = CommercialRecordService(con)
+                if path == "/api/admin/finance":
+                    result = service.save_finance(data, session["id"])
+                    audit_action = "finance.record_saved"
+                elif path == "/api/admin/sponsorships":
+                    result = service.save_sponsorship(data, session["id"])
+                    audit_action = "sponsorship.record_saved"
+                else:
+                    result = service.save_coupon(
+                        data, session["id"], allowed_plan_ids=PLAN_IDS
+                    )
+                    audit_action = "coupon.record_saved"
+                log_audit(
+                    con,
+                    session,
+                    audit_action,
+                    result["id"],
+                    f"version={result['version']}",
+                )
+                # The response is deliberately emitted after this commit.  A
+                # failed transaction therefore cannot be reported as success.
+                con.commit()
+        except DomainError as err:
+            return self.send_domain_error(err)
+        except sqlite3.IntegrityError as err:
+            log_event(
+                "commercial_record.conflict",
+                level="warning",
+                recordType=path.rsplit("/", 1)[-1],
+                errorType=type(err).__name__,
+            )
+            return self.send_json({"error": "record_conflict"}, 409)
+        except sqlite3.Error as err:
+            log_event(
+                "commercial_record.commit_failed",
+                level="error",
+                recordType=path.rsplit("/", 1)[-1],
+                errorType=type(err).__name__,
+            )
+            return self.send_json({"error": "transaction_failed"}, 503)
+        return self.send_json({"ok": True, "record": result})
 
 
 if __name__ == "__main__":

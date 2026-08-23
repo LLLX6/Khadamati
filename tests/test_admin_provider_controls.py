@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 from datetime import UTC, datetime, timedelta
 import json
 import os
@@ -7,6 +8,7 @@ from pathlib import Path
 import sqlite3
 import sys
 import tempfile
+import types
 import unittest
 
 
@@ -18,6 +20,33 @@ os.environ["KHADAMATI_UPLOAD_DIR"] = str(Path(TEMP.name) / "uploads")
 os.environ["KHADAMATI_BACKUP_DIR"] = str(Path(TEMP.name) / "backups")
 os.environ["KHADAMATI_ENV"] = "test"
 os.environ["KHADAMATI_SEED_SAMPLE_DATA"] = "false"
+
+# Some locked-down Windows hosts block cryptography's native Rust DLL before
+# tests can import the server.  This suite does not exercise encryption; use
+# the same deterministic test-only shim as the source-of-truth tests there.
+try:
+    from cryptography.fernet import Fernet as _CryptographyProbe  # noqa: F401
+except (ImportError, OSError):
+    class _TestFernet:
+        @staticmethod
+        def generate_key():
+            return base64.urlsafe_b64encode(b"k" * 32)
+
+        def __init__(self, _key):
+            pass
+
+        def encrypt(self, value):
+            return base64.urlsafe_b64encode(value)
+
+        def decrypt(self, value):
+            return base64.urlsafe_b64decode(value)
+
+    cryptography_module = sys.modules.get("cryptography") or types.ModuleType("cryptography")
+    fernet_module = types.ModuleType("cryptography.fernet")
+    fernet_module.Fernet = _TestFernet
+    fernet_module.InvalidToken = ValueError
+    sys.modules["cryptography"] = cryptography_module
+    sys.modules["cryptography.fernet"] = fernet_module
 
 import server  # noqa: E402
 from khadamati_domain import RequestMarketplace  # noqa: E402
@@ -221,7 +250,7 @@ class AdminProviderControlTests(unittest.TestCase):
     def test_matching_contract_and_admin_reports_are_aggregate(self):
         self.provider()
         availability = server.service_availability_snapshot(self.con)
-        self.assertEqual("matching_v2", availability["contractVersion"])
+        self.assertEqual("matching_v3", availability["contractVersion"])
         self.assertEqual(1, availability["services"]["tech|tech_support"])
         self.assertEqual(1, availability["exactServices"]["tech|networks"])
         self.assertNotIn("tech|design", availability["services"])

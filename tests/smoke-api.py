@@ -343,6 +343,7 @@ def main():
             "services": [{"catId": "homecare", "serviceId": "electrician", "priceFrom": 8}],
             "note": "خدمة كهرباء منزلية دقيقة وموثوقة",
             "hours": "الأحد: 8:00 ص - 8:00 م",
+            "availability": {"days": ["0", "1", "2", "3", "4", "5", "6"], "start": "00:00", "end": "23:59", "dailyCapacity": 2},
             "documentsData": [TEST_PNG, TEST_PNG],
         },
     )
@@ -371,7 +372,8 @@ def main():
             ],
             "priceFrom": 8,
             "note": "خدمة كهرباء منزلية دقيقة وموثوقة",
-            "hours": "الأحد، الاثنين: 8:00 ص - 8:00 م",
+            "hours": "متاح يومياً طوال اليوم",
+            "availability": {"days": ["0", "1", "2", "3", "4", "5", "6"], "start": "00:00", "end": "23:59", "dailyCapacity": 2},
             "documentsData": [TEST_PNG, TEST_PNG],
         },
     )
@@ -444,7 +446,8 @@ def main():
                 {"catId": "cleaning", "serviceId": "home_clean", "priceFrom": 12, "areas": ["السيب"]},
             ],
             "note": "شركة تقدم خدمات منزلية متعددة موثوقة",
-            "hours": "الأحد، الاثنين: 8:00 ص - 8:00 م",
+            "hours": "متاح يومياً طوال اليوم",
+            "availability": {"days": ["0", "1", "2", "3", "4", "5", "6"], "start": "00:00", "end": "23:59", "dailyCapacity": 4},
             "documentsData": [TEST_PNG, TEST_PNG],
         },
     )

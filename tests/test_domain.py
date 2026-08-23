@@ -76,7 +76,9 @@ class KhadamatiDomainTests(unittest.TestCase):
                 "pin": "7349",
                 "gov": gov,
                 "wilayah": wilayah,
-                "areas": [gov, wilayah],
+                # The governorate is the profile address; explicit coverage is
+                # expressed as wilayats and must consume only real plan slots.
+                "areas": [wilayah],
                 "bio": "مزود مهني لخدمة العملاء",
                 "hours": "الأحد 8:00 ص - 8:00 م",
                 "status": "available",
@@ -334,7 +336,10 @@ class KhadamatiDomainTests(unittest.TestCase):
                         "active": True,
                     }
                 ],
-                "areas": [gov, wilayah],
+                # ``gov`` is the profile address. Coverage contains explicit
+                # wilayats only; mixing the governorate into this list would
+                # incorrectly grandfather an extra paid-plan coverage slot.
+                "areas": [wilayah],
                 "gov": gov,
                 "wilayah": wilayah,
             }

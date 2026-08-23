@@ -108,6 +108,11 @@ CREATE TABLE IF NOT EXISTS leads (
   customer_name TEXT,
   phone TEXT,
   note TEXT,
+  service_value TEXT DEFAULT '',
+  service_name TEXT DEFAULT '',
+  gov TEXT DEFAULT '',
+  wilayah TEXT DEFAULT '',
+  status TEXT DEFAULT 'open',
   created_at TIMESTAMPTZ DEFAULT now()
 );
 
@@ -138,8 +143,12 @@ CREATE TABLE IF NOT EXISTS reviews (
   dimensions JSONB NOT NULL DEFAULT '{}',
   tags JSONB NOT NULL DEFAULT '[]',
   approved BOOLEAN NOT NULL DEFAULT TRUE,
+  provider_reply TEXT DEFAULT '',
+  provider_reply_at TIMESTAMPTZ,
   created_at TIMESTAMPTZ DEFAULT now()
 );
+ALTER TABLE reviews ADD COLUMN IF NOT EXISTS provider_reply TEXT DEFAULT '';
+ALTER TABLE reviews ADD COLUMN IF NOT EXISTS provider_reply_at TIMESTAMPTZ;
 
 CREATE TABLE IF NOT EXISTS complaints (
   id TEXT PRIMARY KEY,
@@ -463,7 +472,17 @@ ALTER TABLE providers ADD COLUMN IF NOT EXISTS location_updated_at TIMESTAMPTZ;
 ALTER TABLE leads ADD COLUMN IF NOT EXISTS service_value TEXT DEFAULT '';
 ALTER TABLE leads ADD COLUMN IF NOT EXISTS service_name TEXT DEFAULT '';
 ALTER TABLE leads ADD COLUMN IF NOT EXISTS gov TEXT DEFAULT '';
+ALTER TABLE leads ADD COLUMN IF NOT EXISTS wilayah TEXT DEFAULT '';
 ALTER TABLE leads ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'open';
+CREATE INDEX IF NOT EXISTS idx_leads_matching
+  ON leads(status,kind,service_value,gov,wilayah);
+UPDATE leads
+SET wilayah=app_users.wilayah
+FROM app_users
+WHERE leads.phone=app_users.phone
+  AND btrim(COALESCE(leads.wilayah,''))=''
+  AND btrim(COALESCE(leads.phone,''))!=''
+  AND btrim(COALESCE(app_users.wilayah,''))!='';
 
 -- Khadamati subscription, consent, marketplace, and security domain.
 ALTER TABLE providers ADD COLUMN IF NOT EXISTS before_after JSONB DEFAULT '[]';
@@ -589,8 +608,73 @@ CREATE TABLE IF NOT EXISTS coupons (
   discount_type TEXT NOT NULL DEFAULT 'fixed', discount_value NUMERIC NOT NULL DEFAULT 0,
   applies_to JSONB DEFAULT '[]', starts_at TIMESTAMPTZ, ends_at TIMESTAMPTZ,
   max_uses INTEGER NOT NULL DEFAULT 0, uses_count INTEGER NOT NULL DEFAULT 0,
-  active BOOLEAN NOT NULL DEFAULT TRUE, created_at TIMESTAMPTZ DEFAULT now(),
+  active BOOLEAN NOT NULL DEFAULT TRUE, external_key TEXT NOT NULL DEFAULT '',
+  created_at TIMESTAMPTZ DEFAULT now(),
   updated_at TIMESTAMPTZ DEFAULT now()
+);
+
+ALTER TABLE coupons ADD COLUMN IF NOT EXISTS external_key TEXT NOT NULL DEFAULT '';
+ALTER TABLE coupons ADD COLUMN IF NOT EXISTS created_by TEXT NOT NULL DEFAULT '';
+ALTER TABLE coupons ADD COLUMN IF NOT EXISTS updated_by TEXT NOT NULL DEFAULT '';
+ALTER TABLE coupons ADD COLUMN IF NOT EXISTS version INTEGER NOT NULL DEFAULT 1;
+ALTER TABLE coupons ADD COLUMN IF NOT EXISTS archived_at TIMESTAMPTZ;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_coupon_external_key
+  ON coupons(external_key) WHERE external_key!='';
+
+CREATE TABLE IF NOT EXISTS finance_entries (
+  id TEXT PRIMARY KEY,
+  kind TEXT NOT NULL CHECK (kind IN ('revenue','expense','adjustment','refund')),
+  amount_milli BIGINT NOT NULL CHECK (amount_milli >= 0),
+  currency TEXT NOT NULL DEFAULT 'OMR' CHECK (currency='OMR'),
+  source TEXT NOT NULL DEFAULT '', reference_kind TEXT NOT NULL DEFAULT '',
+  reference_id TEXT NOT NULL DEFAULT '', external_key TEXT NOT NULL DEFAULT '',
+  note TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'posted' CHECK (status IN ('draft','posted','voided')),
+  occurred_at TIMESTAMPTZ NOT NULL, created_by TEXT NOT NULL, updated_by TEXT NOT NULL,
+  version INTEGER NOT NULL DEFAULT 1 CHECK (version >= 1), archived_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(), updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_finance_external_key
+  ON finance_entries(external_key) WHERE external_key!='';
+CREATE INDEX IF NOT EXISTS idx_finance_occurred
+  ON finance_entries(status,occurred_at,kind);
+
+CREATE TABLE IF NOT EXISTS finance_entry_events (
+  id TEXT PRIMARY KEY, entry_id TEXT NOT NULL REFERENCES finance_entries(id),
+  event_type TEXT NOT NULL, actor_id TEXT NOT NULL, version INTEGER NOT NULL,
+  snapshot JSONB NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_finance_events_entry
+  ON finance_entry_events(entry_id,created_at);
+
+CREATE TABLE IF NOT EXISTS sponsorships (
+  id TEXT PRIMARY KEY, sponsor_name TEXT NOT NULL, contact_phone TEXT NOT NULL DEFAULT '',
+  placement TEXT NOT NULL DEFAULT 'home', amount_milli BIGINT NOT NULL DEFAULT 0
+    CHECK (amount_milli >= 0), currency TEXT NOT NULL DEFAULT 'OMR' CHECK (currency='OMR'),
+  starts_at TIMESTAMPTZ, ends_at TIMESTAMPTZ,
+  status TEXT NOT NULL DEFAULT 'draft'
+    CHECK (status IN ('draft','scheduled','active','paused','completed','cancelled')),
+  external_key TEXT NOT NULL DEFAULT '', note TEXT NOT NULL DEFAULT '',
+  created_by TEXT NOT NULL, updated_by TEXT NOT NULL,
+  version INTEGER NOT NULL DEFAULT 1 CHECK (version >= 1), archived_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(), updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+ALTER TABLE sponsorships ADD COLUMN IF NOT EXISTS external_key TEXT NOT NULL DEFAULT '';
+CREATE UNIQUE INDEX IF NOT EXISTS idx_sponsorship_external_key
+  ON sponsorships(external_key) WHERE external_key!='';
+CREATE INDEX IF NOT EXISTS idx_sponsorship_status_dates
+  ON sponsorships(status,starts_at,ends_at);
+
+CREATE TABLE IF NOT EXISTS sponsorship_events (
+  id TEXT PRIMARY KEY, sponsorship_id TEXT NOT NULL REFERENCES sponsorships(id),
+  event_type TEXT NOT NULL, actor_id TEXT NOT NULL, version INTEGER NOT NULL,
+  snapshot JSONB NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS coupon_events (
+  id TEXT PRIMARY KEY, coupon_id TEXT NOT NULL REFERENCES coupons(id),
+  event_type TEXT NOT NULL, actor_id TEXT NOT NULL, version INTEGER NOT NULL,
+  snapshot JSONB NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
 CREATE TABLE IF NOT EXISTS coupon_redemptions (

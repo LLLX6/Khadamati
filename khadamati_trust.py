@@ -116,6 +116,119 @@ def _safe_text(value, limit=1200) -> str:
     return str(value or "").strip()[:limit]
 
 
+def _record_value(record, *names):
+    """Read the first present key from sqlite rows or API-shaped mappings."""
+
+    if record is None:
+        return None
+    keys = set(record.keys()) if hasattr(record, "keys") else set()
+    for name in names:
+        if name in keys:
+            return record[name]
+        if isinstance(record, dict) and name in record:
+            return record[name]
+    return None
+
+
+def _canonical_future_expiry(
+    value,
+    *,
+    now: datetime | None = None,
+    invalid_code: str = "credential_expiry_invalid",
+    expired_code: str = "credential_expired",
+) -> str:
+    """Parse an expiry defensively and return one comparable UTC value.
+
+    Date-only credentials remain valid through the end of the stated date.
+    Naive date-times are interpreted as UTC so legacy records remain
+    deterministic; all newly accepted values are persisted with a UTC offset.
+    """
+
+    text = _safe_text(value, 80)
+    if not text:
+        raise DomainError("credential_expiry_required", 409)
+    try:
+        if len(text) == 10:
+            parsed = datetime.strptime(text, "%Y-%m-%d").replace(tzinfo=UTC)
+            parsed = parsed + timedelta(days=1) - timedelta(microseconds=1)
+        else:
+            normalized = text[:-1] + "+00:00" if text.endswith(("Z", "z")) else text
+            parsed = datetime.fromisoformat(normalized)
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=UTC)
+            parsed = parsed.astimezone(UTC)
+    except (TypeError, ValueError, OverflowError):
+        raise DomainError(invalid_code, 409) from None
+    reference = now or _now()
+    if reference.tzinfo is None:
+        reference = reference.replace(tzinfo=UTC)
+    reference = reference.astimezone(UTC)
+    if parsed <= reference:
+        raise DomainError(expired_code, 409)
+    return parsed.isoformat()
+
+
+def assert_verification_evidence(record, *, now: datetime | None = None) -> dict:
+    """Require durable identity/activity evidence before a verified transition.
+
+    This is deliberately shared by registration approval, the provider status
+    endpoint, and the trust review service so no client or alternate admin route
+    can manufacture a verified badge.
+    """
+
+    provider_id = _safe_text(_record_value(record, "id"), 120)
+    if not provider_id:
+        raise DomainError("provider_not_found", 404)
+    provider_kind = _safe_text(
+        _record_value(record, "provider_type", "providerType"), 30
+    ) or "individual"
+    credential_number = _safe_text(
+        _record_value(
+            record,
+            "commercial_no",
+            "commercialNo",
+            "license_no",
+            "licenseNo",
+        ),
+        120,
+    )
+    if not credential_number:
+        raise DomainError("commercial_number_required", 409)
+    expiry = _canonical_future_expiry(
+        _record_value(
+            record,
+            "commercial_expiry" if provider_kind == "company" else "license_expiry",
+            "commercialExpiry" if provider_kind == "company" else "licenseExpiry",
+        ),
+        now=now,
+    )
+    documents = _json(_record_value(record, "documents"), [])
+    document_count = len(
+        [item for item in documents if isinstance(item, str) and _safe_text(item, 2000)]
+    ) if isinstance(documents, list) else 0
+    if document_count < 2:
+        raise DomainError("documents_required", 409, str(document_count))
+    return {
+        "providerId": provider_id,
+        "providerKind": provider_kind,
+        "credentialNumber": credential_number,
+        "credentialExpiry": expiry,
+        "documentCount": document_count,
+    }
+
+
+def assert_provider_verification_evidence(
+    con, provider_id: str, *, now: datetime | None = None
+) -> dict:
+    row = con.execute(
+        """SELECT id,provider_type,commercial_no,commercial_expiry,
+        license_expiry,verification_expiry,documents
+        FROM providers WHERE id=? AND COALESCE(status,'')!='deleted'""",
+        (_safe_text(provider_id, 120),),
+    ).fetchone()
+    return assert_verification_evidence(row, now=now)
+
+
 def _ensure_column(con, table: str, name: str, definition: str) -> None:
     columns = {row["name"] for row in con.execute(f"PRAGMA table_info({table})")}
     if name not in columns:
@@ -514,7 +627,11 @@ class ProviderVerificationService:
         level = _safe_text(payload.get("level", case["level"]), 40)
         if level not in VERIFICATION_LEVELS:
             raise DomainError("invalid_verification_level", 400)
+        evidence = None
         if status == "verified":
+            evidence = assert_provider_verification_evidence(
+                self.con, provider_id, now=self.now
+            )
             required_checks = [identity_status, activity_status]
             if case["providerKind"] == "company":
                 required_checks.append(entity_status)
@@ -525,9 +642,20 @@ class ProviderVerificationService:
                 if case["providerKind"] == "company"
                 else "professional"
             )
-        expires_at = _safe_text(payload.get("expiresAt"), 80)
-        if status == "verified" and not expires_at:
-            expires_at = (self.now + timedelta(days=365)).isoformat()
+        expires_at = ""
+        if status == "verified":
+            credential_expiry = evidence["credentialExpiry"]
+            requested_expiry = _safe_text(payload.get("expiresAt"), 80)
+            if requested_expiry:
+                requested_expiry = _canonical_future_expiry(
+                    requested_expiry,
+                    now=self.now,
+                    invalid_code="verification_expiry_invalid",
+                    expired_code="verification_expired",
+                )
+                expires_at = min(requested_expiry, credential_expiry)
+            else:
+                expires_at = credential_expiry
         note = _safe_text(payload.get("decisionNote"), 1200)
         old_status = case["status"]
         self.con.execute(
@@ -551,11 +679,11 @@ class ProviderVerificationService:
         if status == "verified":
             self.con.execute(
                 """UPDATE providers SET verified=1,verification_expiry=?,
-                status=CASE WHEN status IN ('under_review','pending','suspended')
+                status=CASE WHEN status IN ('under_review','pending')
                   THEN 'available' ELSE status END,
-                listing_enabled=CASE WHEN status IN ('under_review','pending','suspended')
+                listing_enabled=CASE WHEN status IN ('under_review','pending')
                   THEN 1 ELSE listing_enabled END,
-                request_enabled=CASE WHEN status IN ('under_review','pending','suspended')
+                request_enabled=CASE WHEN status IN ('under_review','pending')
                   THEN 1 ELSE request_enabled END,
                 updated_at=CURRENT_TIMESTAMP WHERE id=?""",
                 (expires_at, provider_id),
@@ -563,15 +691,19 @@ class ProviderVerificationService:
         elif status in {"rejected", "suspended", "expired"}:
             self.con.execute(
                 """UPDATE providers SET verified=0,
-                status=CASE WHEN ?='suspended' THEN 'suspended' ELSE status END,
-                listing_enabled=CASE WHEN ?='suspended' THEN 0 ELSE listing_enabled END,
-                request_enabled=CASE WHEN ?='suspended' THEN 0 ELSE request_enabled END,
+                verification_expiry='',
+                status=CASE WHEN ?='suspended' OR status='suspended'
+                  THEN 'suspended' ELSE 'under_review' END,
+                listing_enabled=0,request_enabled=0,
                 updated_at=CURRENT_TIMESTAMP WHERE id=?""",
-                (status, status, status, provider_id),
+                (status, provider_id),
             )
         else:
             self.con.execute(
-                "UPDATE providers SET verified=0,updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                """UPDATE providers SET verified=0,verification_expiry='',
+                status=CASE WHEN status='suspended' THEN status ELSE 'under_review' END,
+                listing_enabled=0,request_enabled=0,updated_at=CURRENT_TIMESTAMP
+                WHERE id=?""",
                 (provider_id,),
             )
         self._event(
@@ -589,6 +721,53 @@ class ProviderVerificationService:
                 "level": level,
                 "expiresAt": expires_at,
             },
+        )
+        return self.get(provider_id, private=True)
+
+    def invalidate_for_evidence_change(
+        self,
+        provider_id: str,
+        *,
+        actor_kind: str,
+        actor_id: str,
+        reason: str,
+    ) -> dict:
+        """Remove matching eligibility when verified evidence materially changes."""
+
+        provider = self.con.execute(
+            """SELECT id,provider_type,verified,verification_expiry,status
+            FROM providers WHERE id=? AND COALESCE(status,'')!='deleted'""",
+            (_safe_text(provider_id, 120),),
+        ).fetchone()
+        if not provider:
+            raise DomainError("provider_not_found", 404)
+        case = self.ensure_case(provider)
+        old_status = case["status"]
+        self.con.execute(
+            """UPDATE provider_verification_cases SET status='submitted',
+            identity_status='pending',entity_status=?,activity_status='pending',
+            reviewer_id='',decision_note='',reviewed_at='',expires_at='',managed=1,
+            submitted_at=?,updated_at=CURRENT_TIMESTAMP WHERE id=?""",
+            (
+                "pending" if case["providerKind"] == "company" else "not_applicable",
+                _iso(self.now),
+                case["id"],
+            ),
+        )
+        self.con.execute(
+            """UPDATE providers SET verified=0,status='under_review',
+            listing_enabled=0,request_enabled=0,verification_expiry='',
+            updated_at=CURRENT_TIMESTAMP WHERE id=?""",
+            (provider_id,),
+        )
+        self._event(
+            case["id"],
+            "verification_evidence_changed",
+            actor_kind=_safe_text(actor_kind, 30),
+            actor_id=_safe_text(actor_id, 120),
+            from_status=old_status,
+            to_status="submitted",
+            message=_safe_text(reason, 1200),
         )
         return self.get(provider_id, private=True)
 
