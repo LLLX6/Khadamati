@@ -10073,7 +10073,7 @@ body{
 /* Mobile management uses one stable bottom destination bar; secondary tools stay in More. */
 .admin-provider-row{display:grid!important;grid-template-columns:minmax(0,1fr) auto!important;align-items:center!important;gap:10px!important}
 .admin-provider-summary{min-width:0;display:grid;gap:5px}.admin-provider-name{display:flex;align-items:center;flex-wrap:wrap;gap:6px}.admin-provider-name b{min-width:0}.admin-provider-primary-actions{display:flex;align-items:center;gap:6px}.admin-provider-primary-actions .pill-btn{min-height:38px;padding:7px 12px}.admin-provider-primary-actions .icon-btn{width:38px;height:38px}
-.provider-lifecycle-active{color:var(--success);background:color-mix(in srgb,var(--success) 10%,var(--panel))}.provider-lifecycle-suspended{color:var(--danger);background:color-mix(in srgb,var(--danger) 10%,var(--panel))}.provider-lifecycle-archived{color:var(--muted);background:var(--panel2)}
+.provider-lifecycle-active{color:var(--ok);background:color-mix(in srgb,var(--ok) 10%,var(--panel))}.provider-lifecycle-suspended{color:var(--danger);background:color-mix(in srgb,var(--danger) 10%,var(--panel))}.provider-lifecycle-archived{color:var(--muted);background:var(--panel2)}
 .admin-provider-lifecycle-actions{display:grid;gap:8px;padding-top:12px;border-top:1px solid var(--line)}
 .provider-status-reason{display:flex;align-items:flex-start;gap:6px;padding:7px 9px;border-radius:10px;background:color-mix(in srgb,var(--danger) 8%,var(--panel));color:var(--muted);font-size:.76rem;line-height:1.45}.provider-status-reason svg{width:15px;height:15px;flex:0 0 auto;color:var(--danger)}
 .admin-provider-lifecycle-sheet .contact-privacy-note,.admin-provider-delete-sheet .contact-privacy-note{margin-bottom:12px}.admin-provider-delete-sheet .contact-privacy-note.danger{border-color:color-mix(in srgb,var(--danger) 34%,var(--line));background:color-mix(in srgb,var(--danger) 7%,var(--panel))}
@@ -10099,4 +10099,46 @@ body{
   .request-detail-facts>span:last-child{grid-column:1/-1}
   .known-provider-result{grid-template-columns:38px minmax(0,1fr)}
   .known-provider-result>em{grid-column:2;justify-self:start}.known-provider-result>span,.known-provider-result .avatar{width:38px;height:38px}
+}
+
+/* Production UX v1.2.0: explicit sync, readable workflows, and compact mobile management. */
+.request-sync-state{display:grid;grid-template-columns:auto minmax(0,1fr) auto;align-items:center;gap:11px;margin:10px 0;padding:12px 13px;border:1px solid var(--line);border-radius:16px;background:var(--panel2);box-shadow:0 7px 20px rgba(8,47,73,.05)}
+.request-sync-state>span{display:grid;place-items:center;width:34px;height:34px;border-radius:12px;background:var(--panel);color:var(--muted)}
+.request-sync-state>span svg{width:18px;height:18px}.request-sync-state>div{min-width:0;display:grid;gap:2px}.request-sync-state b{font-size:.82rem}.request-sync-state small{color:var(--muted);font-size:.7rem;line-height:1.5}.request-sync-actions{display:flex!important;flex-wrap:wrap;gap:6px!important}
+.request-sync-state.tone-ok{border-color:color-mix(in srgb,var(--ok) 28%,var(--line));background:color-mix(in srgb,var(--ok) 7%,var(--panel))}.request-sync-state.tone-ok>span{color:var(--ok)}
+.request-sync-state.tone-waiting,.request-sync-state.tone-pending{border-color:color-mix(in srgb,var(--warn) 38%,var(--line));background:color-mix(in srgb,var(--warn) 8%,var(--panel))}.request-sync-state.tone-waiting>span,.request-sync-state.tone-pending>span{color:var(--warn)}
+.request-sync-state.tone-failed{border-color:color-mix(in srgb,var(--danger) 40%,var(--line));background:color-mix(in srgb,var(--danger) 7%,var(--panel))}.request-sync-state.tone-failed>span{color:var(--danger)}
+
+.provider-workflow-timeline{position:relative;display:grid!important;grid-template-columns:repeat(5,minmax(0,1fr));gap:0;margin:13px 0 17px;padding:0 4px;overflow:visible!important}
+.provider-workflow-timeline::before{content:"";position:absolute;z-index:0;top:17px;inset-inline:9%;height:3px;border-radius:99px;background:var(--line)}
+.provider-workflow-timeline>span{position:relative;z-index:1;display:grid!important;justify-items:center;align-content:start;gap:7px;min-width:0;color:var(--muted)}
+.provider-workflow-timeline>span i{display:grid!important;place-items:center;width:35px!important;height:35px!important;border:3px solid var(--panel);border-radius:999px;background:var(--panel2)!important;color:var(--muted)!important;box-shadow:0 0 0 2px var(--line);font-size:.72rem;font-style:normal;font-weight:950}
+.provider-workflow-timeline>span small{max-width:104px;text-align:center;font-size:.64rem!important;line-height:1.35;font-weight:850;color:inherit}
+.provider-workflow-timeline>span.on i{background:var(--accent)!important;color:#fff!important;box-shadow:0 0 0 2px color-mix(in srgb,var(--accent) 55%,transparent)}
+.provider-workflow-timeline>span.current{color:var(--danger)}.provider-workflow-timeline>span.current i{background:var(--danger)!important;box-shadow:0 0 0 3px color-mix(in srgb,var(--danger) 26%,transparent),0 0 20px color-mix(in srgb,var(--danger) 48%,transparent);animation:provider-step-pulse 1.8s ease-in-out infinite}
+@keyframes provider-step-pulse{50%{box-shadow:0 0 0 7px color-mix(in srgb,var(--danger) 9%,transparent),0 0 25px color-mix(in srgb,var(--danger) 38%,transparent)}}
+@media(prefers-reduced-motion:reduce){.provider-workflow-timeline>span.current i{animation:none}}
+
+.admin-decision-summary{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px;margin:8px 0 14px}
+.admin-decision-summary button{min-width:0;min-height:88px;display:grid;align-content:center;gap:3px;padding:12px;border:1px solid var(--line);border-radius:17px;background:var(--panel);text-align:inherit;box-shadow:0 8px 24px rgba(8,47,73,.05)}
+.admin-decision-summary button small{color:var(--muted);font-size:.69rem;font-weight:850}.admin-decision-summary button b{font-size:1.55rem}.admin-decision-summary .urgent{border-color:color-mix(in srgb,var(--danger) 34%,var(--line));background:color-mix(in srgb,var(--danger) 6%,var(--panel));color:var(--danger)}.admin-decision-summary .decision{border-color:color-mix(in srgb,var(--warn) 34%,var(--line));background:color-mix(in srgb,var(--warn) 7%,var(--panel));color:var(--warn)}.admin-decision-summary .routine{border-color:color-mix(in srgb,var(--accent) 28%,var(--line));background:color-mix(in srgb,var(--accent) 6%,var(--panel));color:var(--accent)}
+.admin-list-summary{display:flex;align-items:center;justify-content:space-between;gap:10px;margin:2px 0 9px;padding:8px 11px;border-radius:12px;background:var(--panel2);color:var(--muted)}.admin-list-summary span{font-size:.75rem;font-weight:900;color:var(--text)}.admin-list-summary small{font-size:.67rem}.admin-notification-more{width:100%;margin-top:10px}
+.admin-notification-list .notification-disclosure{border-radius:16px!important;box-shadow:none!important}.admin-notification-list .notification-disclosure summary{padding:11px!important}.admin-notification-list .notification-message-preview{display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+
+.request-detail-center{display:grid;gap:10px;padding:2px}.request-detail-center>.status-timeline{margin-block:2px 8px}.request-detail-hero{display:flex;align-items:flex-start;justify-content:space-between;gap:10px}.request-detail-hero h2{margin:3px 0 0;font-size:1.3rem}.request-detail-facts{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px}.request-detail-facts>span{min-width:0;display:grid;grid-template-columns:auto minmax(0,1fr);gap:2px 8px;align-items:center;padding:10px;border-radius:14px;background:var(--panel2)}.request-detail-facts svg{grid-row:1/3;width:18px;height:18px;color:var(--accent)}.request-detail-facts small{font-size:.62rem;color:var(--muted)}.request-detail-facts b{min-width:0;overflow-wrap:anywhere;font-size:.76rem}
+.request-detail-section{margin:0!important;border:1px solid var(--line)!important;border-radius:15px!important;background:transparent!important;box-shadow:none!important;overflow:hidden}.request-detail-section>summary{min-height:58px;padding:10px 12px!important}.request-detail-section>summary>svg{width:19px;height:19px;color:var(--accent)}.request-detail-section>summary span{min-width:0}.request-detail-section>summary b{font-size:.82rem}.request-detail-section>summary small{display:block;margin-top:2px;color:var(--muted);font-size:.65rem}.request-detail-section>div{padding:2px 12px 12px!important;border:0!important}.request-detail-options:not([open]){opacity:.88}
+
+@media(max-width:940px){
+  .admin-topbar{position:sticky!important;top:0!important;z-index:98!important}.admin-topbar+.admin-shell{padding-top:8px!important}.admin-shell>.side-layout{display:block!important}.admin-workspace{min-width:0;padding-top:0!important}
+  .admin-workspace>.admin-section-surface{min-width:0}.admin-workspace .section-head:first-child{margin-top:5px}
+  .admin-notification-head{display:grid!important;grid-template-columns:minmax(0,1fr)!important;gap:8px!important}.admin-notification-head .row-actions{justify-content:flex-start!important}.admin-notification-head .row-actions button{flex:1;min-width:132px}
+  .admin-decision-summary{gap:7px}.admin-decision-summary button{min-height:76px;padding:9px}.admin-decision-summary button small{font-size:.62rem}.admin-decision-summary button b{font-size:1.35rem}
+  .admin-list-summary{align-items:flex-start;flex-direction:column;gap:2px}.admin-notification-list{gap:8px!important}
+  .request-detail-center{gap:8px}.request-detail-hero{align-items:center}.request-detail-hero h2{font-size:1.08rem}.request-detail-facts{gap:6px}.request-detail-facts>span{padding:8px}.request-detail-facts b{font-size:.7rem}
+}
+@media(max-width:520px){
+  .request-sync-state{grid-template-columns:auto minmax(0,1fr);padding:10px}.request-sync-actions{grid-column:1/-1;width:100%}.request-sync-actions button{flex:1}
+  .provider-workflow-timeline{padding-inline:0;margin-inline:-3px}.provider-workflow-timeline::before{inset-inline:8%;top:15px}.provider-workflow-timeline>span i{width:31px!important;height:31px!important}.provider-workflow-timeline>span small{font-size:.54rem!important;max-width:68px}
+  .request-detail-facts{grid-template-columns:repeat(2,minmax(0,1fr))}.request-detail-facts>span:last-child{grid-column:1/-1}.request-detail-section>summary{min-height:54px}.request-detail-section>summary small{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .admin-decision-summary button{min-height:70px}.admin-decision-summary button small{line-height:1.3}.admin-decision-summary button b{font-size:1.2rem}
 }

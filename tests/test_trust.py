@@ -9,6 +9,7 @@ from khadamati_trust import (
     ComplaintCaseService,
     InteractionBlockService,
     ProviderVerificationService,
+    assert_verification_evidence,
     install_trust_schema,
 )
 
@@ -25,6 +26,10 @@ class TrustServiceTests(unittest.TestCase):
               provider_type TEXT DEFAULT 'individual',
               verified INTEGER DEFAULT 0,
               verification_expiry TEXT DEFAULT '',
+              commercial_no TEXT DEFAULT '',
+              commercial_expiry TEXT DEFAULT '',
+              license_expiry TEXT DEFAULT '',
+              documents TEXT DEFAULT '[]',
               status TEXT DEFAULT 'available',
               listing_enabled INTEGER DEFAULT 1,
               request_enabled INTEGER DEFAULT 1,
@@ -54,13 +59,17 @@ class TrustServiceTests(unittest.TestCase):
         install_trust_schema(self.con)
         self.con.execute(
             """INSERT INTO providers(
-            id,provider_type,verified,verification_expiry,status)
-            VALUES('p1','individual',0,'','available')"""
+            id,provider_type,verified,verification_expiry,commercial_no,
+            license_expiry,documents,status)
+            VALUES('p1','individual',0,'','LIC-P1','2027-07-30',
+            '["front.webp","back.webp"]','available')"""
         )
         self.con.execute(
             """INSERT INTO providers(
-            id,provider_type,verified,verification_expiry,status)
-            VALUES('c1','company',1,'2027-07-30T00:00:00+00:00','available')"""
+            id,provider_type,verified,verification_expiry,commercial_no,
+            commercial_expiry,documents,status)
+            VALUES('c1','company',1,'2027-07-30T00:00:00+00:00','CR-C1',
+            '2027-07-30','["front.webp","back.webp"]','available')"""
         )
         self.con.execute(
             "INSERT INTO app_users(id) VALUES('u1')"
@@ -114,6 +123,89 @@ class TrustServiceTests(unittest.TestCase):
         self.assertEqual("business_verified", case["badge"]["key"])
         self.assertEqual("verified", case["entityStatus"])
 
+    def test_review_cannot_manufacture_verification_without_evidence(self):
+        self.con.execute(
+            """UPDATE providers SET commercial_no='',license_expiry='',documents='[]'
+            WHERE id='p1'"""
+        )
+        service = ProviderVerificationService(self.con, now=self.now)
+        with self.assertRaises(DomainError) as context:
+            service.review(
+                "p1",
+                {
+                    "status": "verified",
+                    "identityStatus": "verified",
+                    "activityStatus": "verified",
+                },
+                reviewer_id="admin-1",
+            )
+        self.assertEqual("commercial_number_required", context.exception.code)
+        provider_state = self.con.execute(
+            "SELECT verified FROM providers WHERE id='p1'"
+        ).fetchone()
+        self.assertEqual(0, provider_state["verified"])
+
+    def test_credential_expiry_is_validated_and_canonicalized(self):
+        base = {
+            "id": "p-evidence",
+            "providerType": "individual",
+            "commercialNo": "LIC-EVIDENCE",
+            "documents": ["front.webp", "back.webp"],
+        }
+        with self.assertRaises(DomainError) as malformed:
+            assert_verification_evidence(
+                {**base, "licenseExpiry": "not-a-date"}, now=self.now
+            )
+        self.assertEqual("credential_expiry_invalid", malformed.exception.code)
+        with self.assertRaises(DomainError) as expired:
+            assert_verification_evidence(
+                {**base, "licenseExpiry": "2026-07-29"}, now=self.now
+            )
+        self.assertEqual("credential_expired", expired.exception.code)
+
+        evidence = assert_verification_evidence(
+            {**base, "licenseExpiry": "2026-08-15"}, now=self.now
+        )
+        self.assertEqual(
+            "2026-08-15T23:59:59.999999+00:00",
+            evidence["credentialExpiry"],
+        )
+
+    def test_verification_expiry_is_capped_by_credential_expiry(self):
+        self.con.execute(
+            "UPDATE providers SET license_expiry='2026-08-15' WHERE id='p1'"
+        )
+        service = ProviderVerificationService(self.con, now=self.now)
+        verified = service.review(
+            "p1",
+            {
+                "status": "verified",
+                "identityStatus": "verified",
+                "activityStatus": "verified",
+                "expiresAt": "2027-12-31T23:59:59+00:00",
+            },
+            reviewer_id="admin-1",
+        )
+        expected = "2026-08-15T23:59:59.999999+00:00"
+        self.assertEqual(expected, verified["expiresAt"])
+        stored = self.con.execute(
+            "SELECT verification_expiry FROM providers WHERE id='p1'"
+        ).fetchone()["verification_expiry"]
+        self.assertEqual(expected, stored)
+
+        with self.assertRaises(DomainError) as malformed:
+            service.review(
+                "p1",
+                {
+                    "status": "verified",
+                    "identityStatus": "verified",
+                    "activityStatus": "verified",
+                    "expiresAt": "later",
+                },
+                reviewer_id="admin-1",
+            )
+        self.assertEqual("verification_expiry_invalid", malformed.exception.code)
+
     def test_only_managed_cases_expire_automatically(self):
         service = ProviderVerificationService(self.con, now=self.now)
         provider = self.con.execute(
@@ -126,9 +218,14 @@ class TrustServiceTests(unittest.TestCase):
                 "status": "verified",
                 "identityStatus": "verified",
                 "activityStatus": "verified",
-                "expiresAt": (self.now - timedelta(days=1)).isoformat(),
+                "expiresAt": (self.now + timedelta(days=1)).isoformat(),
             },
             reviewer_id="admin-1",
+        )
+        self.con.execute(
+            """UPDATE provider_verification_cases SET expires_at=?
+            WHERE provider_id='p1'""",
+            ((self.now - timedelta(days=1)).isoformat(),),
         )
         expired = service.expire_managed_cases()
         self.assertEqual(["p1"], expired)

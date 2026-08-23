@@ -14,6 +14,8 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
+from runtime_test_env import add_windows_crypto_shim
+
 
 ROOT = Path(__file__).resolve().parents[1]
 ADMIN_CODE = "Trust-Admin-6732"
@@ -112,6 +114,7 @@ def register_provider(base: str, admin_token: str):
                 "priceFrom": 8,
                 "note": "خدمة كهرباء منزلية لاختبار الثقة",
                 "hours": "الأحد: 8:00 ص - 8:00 م",
+                "availability": {"days": ["0", "1", "2", "3", "4", "5", "6"], "start": "00:00", "end": "23:59", "dailyCapacity": 2},
                 "documentsData": [TEST_PNG, TEST_PNG],
             },
         ),
@@ -181,6 +184,7 @@ def run() -> None:
                 "KHADAMATI_MEDIA_SIGNING_KEY": "trust-media-signing-key-6732",
             }
         )
+        add_windows_crypto_shim(env, temp)
         process = subprocess.Popen(
             [sys.executable, "server.py"],
             cwd=ROOT,

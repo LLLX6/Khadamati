@@ -1,9 +1,15 @@
-const CACHE_NAME = 'khadamati-app-shell-v1.1.1-matching-admin-sync-r7';
+const CACHE_PREFIX = 'khadamati-app-shell-v';
+const CACHE_NAME = 'khadamati-app-shell-v1.2.0-r1';
+const INDEX_CACHE_KEY = './index.html';
+const PRIVATE_PATH = /\/(?:api|media|uploads)(?:\/|$)/i;
+const DOWNLOAD_PATH = /\/(?:downloads?|exports?)(?:\/|$)|\.(?:pdf|zip|csv|xlsx?|docx?|pptx?)$/i;
+const STATIC_ASSET_PATH = /\.(?:css|m?js|png|jpe?g|webp|svg|ico|woff2?|ttf)$/i;
 const SHELL = [
   './',
   './index.html',
   './assets/styles/khadamati-v1.css',
   './assets/scripts/khadamati-visuals.js',
+  './assets/scripts/khadamati-ui-state.js',
   './app-icon-192.png',
   './app-icon-512.png',
   './assets/providers/omani-electrician.webp',
@@ -39,14 +45,19 @@ const SHELL = [
 ];
 
 self.addEventListener('install', event => {
-  event.waitUntil(caches.open(CACHE_NAME).then(cache => cache.addAll(SHELL)).catch(() => {}));
-  self.skipWaiting();
+  // A failed pre-cache must fail this installation so the last complete worker
+  // remains active. The page may explicitly promote a fully installed worker.
+  event.waitUntil(caches.open(CACHE_NAME).then(cache => cache.addAll(SHELL)));
 });
 
 self.addEventListener('activate', event => {
   event.waitUntil(
     caches.keys()
-      .then(keys => Promise.all(keys.filter(key => key !== CACHE_NAME).map(key => caches.delete(key))))
+      .then(keys => Promise.all(
+        keys
+          .filter(key => key.startsWith(CACHE_PREFIX) && key !== CACHE_NAME)
+          .map(key => caches.delete(key))
+      ))
       .then(() => self.clients.claim())
   );
 });
@@ -55,37 +66,85 @@ self.addEventListener('message', event => {
   if (event.data && event.data.type === 'SKIP_WAITING') self.skipWaiting();
 });
 
+function isBlockedPath(url) {
+  return PRIVATE_PATH.test(url.pathname) || DOWNLOAD_PATH.test(url.pathname);
+}
+
+function isHtmlResponse(response) {
+  const contentType = (response.headers.get('content-type') || '').toLowerCase();
+  const disposition = (response.headers.get('content-disposition') || '').toLowerCase();
+  return response.ok
+    && contentType.includes('text/html')
+    && !disposition.includes('attachment');
+}
+
+function isAppNavigation(request, url) {
+  if (request.mode !== 'navigate') return false;
+  if (!(request.headers.get('accept') || '').toLowerCase().includes('text/html')) return false;
+  if (isBlockedPath(url)) return false;
+  const lastSegment = url.pathname.split('/').pop() || '';
+  return !lastSegment.includes('.') || /\.html?$/i.test(lastSegment);
+}
+
+function isCanonicalNavigation(url) {
+  const scopePath = new URL(self.registration.scope).pathname;
+  const indexPath = new URL(INDEX_CACHE_KEY, self.registration.scope).pathname;
+  return url.pathname === scopePath || url.pathname === indexPath;
+}
+
+function isCacheableStaticResponse(response) {
+  const cacheControl = (response.headers.get('cache-control') || '').toLowerCase();
+  return response.ok
+    && response.type === 'basic'
+    && !/(?:^|,)\s*(?:no-store|private)\b/.test(cacheControl);
+}
+
+function staticCacheKey(url) {
+  const keys = [...url.searchParams.keys()];
+  if (keys.some(key => key !== 'v')) return '';
+  if (keys.length && !/^[A-Za-z0-9._-]{1,80}$/.test(url.searchParams.get('v') || '')) return '';
+  const canonical = new URL(url.href);
+  canonical.search = '';
+  canonical.hash = '';
+  return canonical.href;
+}
+
 self.addEventListener('fetch', event => {
   if (event.request.method !== 'GET') return;
   const url = new URL(event.request.url);
-  const privatePath = /\/(api|media|uploads)\//.test(url.pathname);
-  if (url.origin !== self.location.origin || privatePath) {
+  if (url.origin !== self.location.origin || isBlockedPath(url)) {
     event.respondWith(fetch(event.request, { cache: 'no-store' }));
     return;
   }
-  const acceptsHtml = event.request.headers.get('accept')?.includes('text/html');
-  if (event.request.mode === 'navigate' || acceptsHtml) {
+  if (isAppNavigation(event.request, url)) {
     event.respondWith(
       fetch(event.request, { cache: 'no-store' })
         .then(response => {
+          if (!isHtmlResponse(response) || !isCanonicalNavigation(url)) return response;
           const copy = response.clone();
-          caches.open(CACHE_NAME).then(cache => cache.put('./index.html', copy)).catch(() => {});
-          return response;
+          return caches.open(CACHE_NAME)
+            .then(cache => cache.put(INDEX_CACHE_KEY, copy))
+            .catch(() => {})
+            .then(() => response);
         })
-        .catch(() => caches.match('./index.html'))
+        .catch(() => caches.match(INDEX_CACHE_KEY).then(response => response || Response.error()))
     );
     return;
   }
+  if (!STATIC_ASSET_PATH.test(url.pathname)) return;
+  const cacheKey = staticCacheKey(url);
+  if (!cacheKey) return;
   event.respondWith(
     fetch(event.request)
       .then(response => {
-        if (response.ok && response.type === 'basic') {
-          const copy = response.clone();
-          caches.open(CACHE_NAME).then(cache => cache.put(event.request, copy)).catch(() => {});
-        }
-        return response;
+        if (!isCacheableStaticResponse(response)) return response;
+        const copy = response.clone();
+        return caches.open(CACHE_NAME)
+          .then(cache => cache.put(cacheKey, copy))
+          .catch(() => {})
+          .then(() => response);
       })
-      .catch(() => caches.match(event.request))
+      .catch(() => caches.match(cacheKey))
   );
 });
 

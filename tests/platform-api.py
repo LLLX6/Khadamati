@@ -13,6 +13,8 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
+from runtime_test_env import add_windows_crypto_shim
+
 
 ROOT = Path(__file__).resolve().parents[1]
 ADMIN_CODE = "Platform-Admin-4826"
@@ -80,13 +82,16 @@ def register_provider(base: str, admin_token: str):
             "name": "مزود منصة الاختبار", "phone": phone, "pin": pin,
             "providerType": "individual", "legalPath": "individual_omani",
             "age": 34, "nationality": "عُماني", "businessRole": "فني كهرباء",
+            "commercialNo": "PLATFORM-LIC-881",
+            "licenseExpiry": "2028-12-31",
             "gov": "مسقط", "wilayah": "السيب",
             "service": "homecare|electrician",
             "services": [{"catId": "homecare", "serviceId": "electrician", "priceFrom": 8}],
             "note": "خدمة كهرباء منزلية موثوقة وآمنة",
             "hours": "الأحد: 8:00 ص - 8:00 م",
+            "availability": {"days": ["0", "1", "2", "3", "4", "5", "6"], "start": "00:00", "end": "23:59", "dailyCapacity": 2},
             "documentsData": [TEST_PNG, TEST_PNG],
-        }), {201}, "provider registration without false licence requirement",
+        }), {201}, "provider registration with verified licence evidence",
     )
     expect(
         http(base, "/api/admin/request-decision", {
@@ -138,6 +143,7 @@ def run() -> None:
             "KHADAMATI_BACKUP_DIR": str(Path(temp) / "backups"),
             "KHADAMATI_MEDIA_SIGNING_KEY": "platform-media-key-4826",
         })
+        add_windows_crypto_shim(env, temp)
         process = subprocess.Popen(
             [sys.executable, "server.py"], cwd=ROOT, env=env,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,

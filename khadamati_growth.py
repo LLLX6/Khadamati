@@ -11,7 +11,6 @@ from typing import Any
 from khadamati_domain import (
     DomainError,
     EntitlementService,
-    RankingService,
     RequestMarketplace,
 )
 
@@ -107,18 +106,24 @@ class KnownProviderInvitationService:
     def _assert_eligible(self, request_row, provider_row) -> None:
         request = dict(request_row)
         provider = dict(provider_row)
-        if not RankingService.service_match(request, provider) or not RankingService.area_match(
-            request, provider
-        ):
-            raise DomainError("provider_not_eligible_for_request", 409)
-        enforce_subscription = RequestMarketplace(
-            self.con, now=self.now
-        ).subscription_delays_enabled()
+        marketplace = RequestMarketplace(self.con, now=self.now)
+        enforce_subscription = marketplace.subscription_delays_enabled()
         allowed, _, _ = EntitlementService(self.con, now=self.now).can_receive(
             provider["id"], enforce_subscription=enforce_subscription
         )
         if not allowed:
             raise DomainError("provider_no_longer_available", 409)
+        requested_at = _parse(request.get("requested_at")) or self.now
+        match_reason = marketplace.provider_match_reason(
+            request,
+            provider,
+            requested_at=requested_at,
+            request_id=str(request.get("id") or ""),
+        )
+        if match_reason:
+            raise DomainError(
+                "provider_not_eligible_for_request", 409, match_reason
+            )
 
     def attach(self, request_row, provider_row) -> dict[str, Any]:
         self._assert_eligible(request_row, provider_row)

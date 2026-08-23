@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone
 from decimal import Decimal, ROUND_HALF_UP
 import hashlib
 import hmac
@@ -16,8 +16,9 @@ from typing import Any, Callable, Iterable
 SUPPORT_EMAIL = os.environ.get("KHADAMATI_SUPPORT_EMAIL", "om.khadamati@gmail.com").strip()
 POLICY_VERSION = "2026-08-02.1"
 MIGRATION_KEY = "KHADAMATI_SUBSCRIPTION_MIGRATION_V2"
-RANKING_VERSION = "khadamati-ranking-v2"
+RANKING_VERSION = "khadamati-ranking-v3"
 OMR = "OMR"
+OMAN_TZ = timezone(timedelta(hours=4), "Asia/Muscat")
 
 
 # Keep service-family matching explicit and reviewable.  A related service is
@@ -27,9 +28,10 @@ RELATED_SERVICE_GROUPS: tuple[frozenset[str], ...] = (
     frozenset({"ac", "ac_repair", "ac_clean", "ac_install", "ac_gas", "emergency_ac"}),
     frozenset({"plumber", "water_leak"}),
     frozenset({"electrician"}),
-    frozenset({"networks", "tech_support"}),
     frozenset({"furniture_move", "items_delivery", "loading", "small_truck", "large_truck"}),
     frozenset({"home_clean", "apt_clean", "deep_clean", "post_build", "rental_clean"}),
+    # One transitive technology family keeps matching and availability counts
+    # identical for tech_support, networks, pc, and printer.
     frozenset({"pc", "tech_support", "printer", "networks"}),
     frozenset({"mechanic", "inspection", "car_electric", "battery", "tires", "tow", "ac_car"}),
     frozenset({"photo", "commercial_photo", "product_photo", "property_photo"}),
@@ -124,9 +126,28 @@ def parse_datetime(value: Any) -> datetime | None:
     return parsed.astimezone(UTC)
 
 
+def parse_marketplace_datetime(value: Any) -> datetime | None:
+    """Parse a service appointment as an instant, treating naive input as Oman time."""
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=OMAN_TZ)
+    return parsed.astimezone(UTC)
+
+
 def as_money(value: Any) -> Decimal:
     try:
-        return Decimal(str(value or 0)).quantize(Decimal("0.001"), rounding=ROUND_HALF_UP)
+        amount = Decimal(str(value or 0)).quantize(
+            Decimal("0.001"), rounding=ROUND_HALF_UP
+        )
+        if not amount.is_finite():
+            raise ValueError("money must be finite")
+        return amount
     except Exception as exc:
         raise DomainError("invalid_amount") from exc
 
@@ -159,6 +180,730 @@ def normalized_phone(value: Any) -> str:
 
 def row_dict(row: Any) -> dict[str, Any]:
     return dict(row) if row is not None else {}
+
+
+class CommercialRecordService:
+    """Server-owned, audited finance, sponsorship, and coupon records.
+
+    Money is stored as integer thousandths of an Omani rial.  Every update is
+    optimistic: the caller must send the version it read, preventing silent
+    overwrites when two administrators edit the same record.
+    """
+
+    FINANCE_KINDS = {"revenue", "expense", "adjustment", "refund"}
+    FINANCE_STATUSES = {"draft", "posted", "voided"}
+    SPONSORSHIP_STATUSES = {
+        "draft", "scheduled", "active", "paused", "completed", "cancelled"
+    }
+    LEGACY_MIGRATION_KEY = "COMMERCIAL_RECORDS_SERVER_V1"
+    SCHEMA_MIGRATION_KEY = "COMMERCIAL_RECORDS_SCHEMA_V2"
+
+    def __init__(self, con, *, now: datetime | None = None):
+        self.con = con
+        self.now = now or utcnow()
+
+    @staticmethod
+    def install_schema(con) -> None:
+        con.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS finance_entries(
+              id TEXT PRIMARY KEY, kind TEXT NOT NULL, amount_milli INTEGER NOT NULL,
+              currency TEXT NOT NULL DEFAULT 'OMR', source TEXT NOT NULL DEFAULT '',
+              reference_kind TEXT NOT NULL DEFAULT '', reference_id TEXT NOT NULL DEFAULT '',
+              external_key TEXT NOT NULL DEFAULT '', note TEXT NOT NULL DEFAULT '',
+              status TEXT NOT NULL DEFAULT 'posted', occurred_at TEXT NOT NULL,
+              created_by TEXT NOT NULL, updated_by TEXT NOT NULL,
+              version INTEGER NOT NULL DEFAULT 1, archived_at TEXT NOT NULL DEFAULT '',
+              created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+              updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+              CHECK(kind IN ('revenue','expense','adjustment','refund')),
+              CHECK(status IN ('draft','posted','voided')), CHECK(currency='OMR'),
+              CHECK(amount_milli>=0), CHECK(version>=1)
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_finance_external_key
+              ON finance_entries(external_key) WHERE external_key!='';
+            CREATE INDEX IF NOT EXISTS idx_finance_occurred
+              ON finance_entries(status,occurred_at,kind);
+            CREATE TABLE IF NOT EXISTS finance_entry_events(
+              id TEXT PRIMARY KEY, entry_id TEXT NOT NULL, event_type TEXT NOT NULL,
+              actor_id TEXT NOT NULL, version INTEGER NOT NULL, snapshot TEXT NOT NULL,
+              created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+              FOREIGN KEY(entry_id) REFERENCES finance_entries(id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_finance_events_entry
+              ON finance_entry_events(entry_id,created_at);
+            CREATE TABLE IF NOT EXISTS sponsorships(
+              id TEXT PRIMARY KEY, sponsor_name TEXT NOT NULL,
+              contact_phone TEXT NOT NULL DEFAULT '', placement TEXT NOT NULL DEFAULT 'home',
+              amount_milli INTEGER NOT NULL DEFAULT 0, currency TEXT NOT NULL DEFAULT 'OMR',
+              starts_at TEXT NOT NULL DEFAULT '', ends_at TEXT NOT NULL DEFAULT '',
+              status TEXT NOT NULL DEFAULT 'draft', external_key TEXT NOT NULL DEFAULT '',
+              note TEXT NOT NULL DEFAULT '',
+              created_by TEXT NOT NULL, updated_by TEXT NOT NULL,
+              version INTEGER NOT NULL DEFAULT 1, archived_at TEXT NOT NULL DEFAULT '',
+              created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+              updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+              CHECK(status IN ('draft','scheduled','active','paused','completed','cancelled')),
+              CHECK(currency='OMR'), CHECK(amount_milli>=0), CHECK(version>=1)
+            );
+            CREATE INDEX IF NOT EXISTS idx_sponsorship_status_dates
+              ON sponsorships(status,starts_at,ends_at);
+            CREATE TABLE IF NOT EXISTS sponsorship_events(
+              id TEXT PRIMARY KEY, sponsorship_id TEXT NOT NULL, event_type TEXT NOT NULL,
+              actor_id TEXT NOT NULL, version INTEGER NOT NULL, snapshot TEXT NOT NULL,
+              created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+              FOREIGN KEY(sponsorship_id) REFERENCES sponsorships(id)
+            );
+            CREATE TABLE IF NOT EXISTS coupon_events(
+              id TEXT PRIMARY KEY, coupon_id TEXT NOT NULL, event_type TEXT NOT NULL,
+              actor_id TEXT NOT NULL, version INTEGER NOT NULL, snapshot TEXT NOT NULL,
+              created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+              FOREIGN KEY(coupon_id) REFERENCES coupons(id)
+            );
+            """
+        )
+        for table, additions in {
+            "sponsorships": {
+                "external_key": "TEXT NOT NULL DEFAULT ''",
+            },
+            "coupons": {
+                "external_key": "TEXT NOT NULL DEFAULT ''",
+                "created_by": "TEXT NOT NULL DEFAULT ''",
+                "updated_by": "TEXT NOT NULL DEFAULT ''",
+                "version": "INTEGER NOT NULL DEFAULT 1",
+                "archived_at": "TEXT NOT NULL DEFAULT ''",
+            },
+        }.items():
+            columns = {
+                row["name"] if hasattr(row, "keys") else row[1]
+                for row in con.execute(f"PRAGMA table_info({table})")  # nosec B608
+            }
+            for name, definition in additions.items():
+                if name not in columns:
+                    # Table, column, and definitions are fixed literals above.
+                    con.execute(  # nosec B608
+                        f"ALTER TABLE {table} ADD COLUMN {name} {definition}"
+                    )
+        con.executescript(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_sponsorship_external_key
+              ON sponsorships(external_key) WHERE external_key!='';
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_coupon_external_key
+              ON coupons(external_key) WHERE external_key!='';
+            """
+        )
+        CommercialRecordService.migrate_legacy_records(con)
+        tables = {
+            str(row[0]) for row in con.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
+        }
+        if "settings" in tables:
+            con.execute(
+                "INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)",
+                (
+                    CommercialRecordService.SCHEMA_MIGRATION_KEY,
+                    dump({"version": 2, "installedAt": iso(utcnow())}),
+                ),
+            )
+
+    @classmethod
+    def migrate_legacy_records(cls, con) -> dict[str, int]:
+        """Copy legacy local records once without deleting their rollback source."""
+        tables = {
+            str(row[0]) for row in con.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
+        }
+        has_settings = "settings" in tables
+        if has_settings and con.execute(
+            "SELECT 1 FROM settings WHERE key=?", (cls.LEGACY_MIGRATION_KEY,)
+        ).fetchone():
+            return {"finance": 0, "sponsorships": 0, "coupons": 0}
+
+        service = cls(con)
+        migrated = {"finance": 0, "sponsorships": 0, "coupons": 0}
+        seen_finance_ids: set[str] = set()
+
+        def source_id(source: str, item: dict[str, Any], index: int) -> str:
+            raw = str(item.get("id") or "").strip()
+            if raw:
+                return raw[:120]
+            digest = hashlib.sha256(
+                f"{source}:{index}:{dump(item)}".encode("utf-8")
+            ).hexdigest()[:24]
+            return digest
+
+        def canonical_id(kind: str, original_id: str) -> str:
+            digest = hashlib.sha256(
+                f"{kind}:{original_id}".encode("utf-8")
+            ).hexdigest()[:24]
+            return f"migrated-{kind}-{digest}"
+
+        def safe_date(value: Any) -> str:
+            parsed = parse_datetime(value)
+            return iso(parsed) if parsed else iso(service.now)
+
+        def migrate_finance(
+            item: dict[str, Any], index: int, source: str, default_kind: str = ""
+        ) -> None:
+            original_id = source_id(source, item, index)
+            if original_id in seen_finance_ids:
+                return
+            seen_finance_ids.add(original_id)
+            record_id = canonical_id("finance", original_id)
+            if con.execute(
+                "SELECT 1 FROM finance_entries WHERE id=?", (record_id,)
+            ).fetchone():
+                return
+            try:
+                amount = as_money(item.get("amount", 0))
+            except DomainError:
+                amount = Decimal("0")
+            if not amount.is_finite():
+                amount = Decimal("0")
+            raw_kind = str(item.get("kind") or item.get("type") or default_kind).lower()
+            if raw_kind not in cls.FINANCE_KINDS:
+                raw_kind = "expense" if amount < 0 or default_kind == "expense" else "revenue"
+            service.save_finance(
+                {
+                    "id": record_id,
+                    "kind": raw_kind,
+                    "amount": str(abs(amount)),
+                    "source": str(item.get("source") or source)[:120],
+                    "referenceKind": source,
+                    "referenceId": original_id,
+                    "externalKey": f"migration:{source}:{original_id}"[:160],
+                    "note": str(item.get("note") or "")[:1000],
+                    "status": "posted",
+                    "occurredAt": safe_date(
+                        item.get("occurredAt") or item.get("date")
+                        or item.get("created_at") or item.get("createdAt")
+                    ),
+                },
+                "system:migration",
+            )
+            migrated["finance"] += 1
+
+        if "finance" in tables:
+            for index, row in enumerate(con.execute("SELECT * FROM finance")):
+                migrate_finance(row_dict(row), index, "legacy_finance")
+
+        classic_state: dict[str, Any] = {}
+        if has_settings:
+            row = con.execute(
+                "SELECT value FROM settings WHERE key='classicState'"
+            ).fetchone()
+            loaded = load(row[0], {}) if row else {}
+            classic_state = loaded if isinstance(loaded, dict) else {}
+        for key, default_kind in (("finance", ""), ("expenses", "expense")):
+            rows = classic_state.get(key, [])
+            if not isinstance(rows, list):
+                continue
+            for index, item in enumerate(rows):
+                if isinstance(item, dict):
+                    migrate_finance(item, index, "classic_finance", default_kind)
+
+        sponsorship_rows: list[Any] = []
+        for key in ("sponsorships", "sponsors"):
+            rows = classic_state.get(key, [])
+            if isinstance(rows, list):
+                sponsorship_rows.extend(rows)
+        seen_sponsorship_ids: set[str] = set()
+        if sponsorship_rows:
+            for index, item in enumerate(sponsorship_rows):
+                if not isinstance(item, dict):
+                    continue
+                original_id = source_id("classic_sponsorship", item, index)
+                if original_id in seen_sponsorship_ids:
+                    continue
+                seen_sponsorship_ids.add(original_id)
+                record_id = canonical_id("sponsorship", original_id)
+                if con.execute(
+                    "SELECT 1 FROM sponsorships WHERE id=?", (record_id,)
+                ).fetchone():
+                    continue
+                raw_status = str(item.get("status") or "").strip().lower()
+                if raw_status not in cls.SPONSORSHIP_STATUSES:
+                    raw_status = "active" if item.get("active") else "draft"
+                start = parse_datetime(item.get("startsAt") or item.get("start"))
+                end = parse_datetime(item.get("endsAt") or item.get("end"))
+                if start and end and start > end:
+                    end = None
+                try:
+                    amount = as_money(item.get("amount", 0))
+                except DomainError:
+                    amount = Decimal("0")
+                if not amount.is_finite() or amount < 0:
+                    amount = Decimal("0")
+                service.save_sponsorship(
+                    {
+                        "id": record_id,
+                        "name": item.get("sponsorName") or item.get("name")
+                        or "Legacy sponsorship",
+                        "phone": item.get("phone", ""),
+                        "placement": item.get("placement", "home"),
+                        "amount": str(amount),
+                        "startsAt": iso(start) if start else "",
+                        "endsAt": iso(end) if end else "",
+                        "status": raw_status,
+                        "note": item.get("note", ""),
+                    },
+                    "system:migration",
+                )
+                migrated["sponsorships"] += 1
+
+        coupon_rows = classic_state.get("coupons", [])
+        if isinstance(coupon_rows, list):
+            for index, item in enumerate(coupon_rows):
+                if not isinstance(item, dict):
+                    continue
+                code = "".join(
+                    ch for ch in str(item.get("code") or "").upper()
+                    if ch.isascii() and (ch.isalnum() or ch in "_-")
+                )[:32]
+                if not code or con.execute(
+                    "SELECT 1 FROM coupons WHERE code=?", (code,)
+                ).fetchone():
+                    continue
+                original_id = source_id("classic_coupon", item, index)
+                record_id = canonical_id("coupon", original_id)
+                start = parse_datetime(item.get("startsAt"))
+                end = parse_datetime(item.get("endsAt"))
+                if start and end and start > end:
+                    end = None
+                discount_type = str(item.get("discountType") or "fixed").lower()
+                if discount_type not in {"fixed", "percent"}:
+                    discount_type = "fixed"
+                try:
+                    discount_value = as_money(
+                        item.get("discountValue", item.get("value", 0))
+                    )
+                except DomainError:
+                    discount_value = Decimal("0")
+                if not discount_value.is_finite() or discount_value < 0:
+                    discount_value = Decimal("0")
+                discount_value = min(
+                    discount_value,
+                    Decimal("100") if discount_type == "percent" else Decimal("1000000"),
+                )
+                applies_to = item.get("appliesTo", [])
+                if not isinstance(applies_to, list):
+                    applies_to = []
+                try:
+                    max_uses = max(0, min(int(item.get("maxUses", 0) or 0), 1_000_000))
+                except (TypeError, ValueError):
+                    max_uses = 0
+                try:
+                    active = cls._boolean(item.get("active"), default=True)
+                except DomainError:
+                    active = True
+                service.save_coupon(
+                    {
+                        "id": record_id,
+                        "code": code,
+                        "nameAr": item.get("nameAr", ""),
+                        "nameEn": item.get("nameEn", ""),
+                        "discountType": discount_type,
+                        "discountValue": str(discount_value),
+                        "appliesTo": applies_to,
+                        "startsAt": iso(start) if start else "",
+                        "endsAt": iso(end) if end else "",
+                        "maxUses": max_uses,
+                        "active": active,
+                    },
+                    "system:migration",
+                    allowed_plan_ids=PLAN_IDS,
+                )
+                migrated["coupons"] += 1
+
+        if has_settings:
+            con.execute(
+                "INSERT INTO settings(key,value) VALUES(?,?)",
+                (cls.LEGACY_MIGRATION_KEY, dump(migrated)),
+            )
+        return migrated
+
+    @staticmethod
+    def _text(value: Any, limit: int) -> str:
+        return str(value or "").strip()[:limit]
+
+    @staticmethod
+    def _milli(value: Any) -> int:
+        amount = as_money(value)
+        if amount < 0 or amount > Decimal("1000000000"):
+            raise DomainError("amount_out_of_range", 400)
+        return int(amount * 1000)
+
+    @staticmethod
+    def _expected(value: Any, *, required: bool) -> int:
+        if value in (None, ""):
+            if required:
+                raise DomainError("expected_version_required", 428)
+            return 0
+        try:
+            result = int(value)
+        except (TypeError, ValueError) as exc:
+            raise DomainError("invalid_expected_version", 400) from exc
+        if result < 0:
+            raise DomainError("invalid_expected_version", 400)
+        return result
+
+    @staticmethod
+    def _timestamp(value: Any, *, required: bool = False) -> str:
+        text = str(value or "").strip()
+        if not text:
+            if required:
+                raise DomainError("commercial_record_date_required", 400)
+            return ""
+        parsed = parse_datetime(text)
+        if not parsed:
+            raise DomainError("invalid_commercial_record_date", 400)
+        return iso(parsed)
+
+    @staticmethod
+    def _boolean(value: Any, *, default: bool = False) -> bool:
+        if value in (None, ""):
+            return default
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, int) and value in (0, 1):
+            return bool(value)
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in {"true", "1"}:
+                return True
+            if normalized in {"false", "0"}:
+                return False
+        raise DomainError("invalid_commercial_record_boolean", 400)
+
+    @staticmethod
+    def finance_public(row: Any) -> dict[str, Any]:
+        item = row_dict(row)
+        amount = float(Decimal(int(item["amount_milli"])) / 1000)
+        return {
+            "id": item["id"], "kind": item["kind"], "type": item["kind"],
+            "amount": amount, "currency": item["currency"], "source": item["source"],
+            "referenceKind": item["reference_kind"], "referenceId": item["reference_id"],
+            "externalKey": item["external_key"], "note": item["note"],
+            "status": item["status"], "occurredAt": item["occurred_at"],
+            "date": str(item["occurred_at"] or "")[:10], "version": int(item["version"]),
+            "archivedAt": item["archived_at"], "createdAt": item["created_at"],
+            "updatedAt": item["updated_at"],
+        }
+
+    @staticmethod
+    def sponsorship_public(row: Any) -> dict[str, Any]:
+        item = row_dict(row)
+        return {
+            "id": item["id"], "name": item["sponsor_name"],
+            "sponsorName": item["sponsor_name"], "phone": item["contact_phone"],
+            "placement": item["placement"],
+            "amount": float(Decimal(int(item["amount_milli"])) / 1000),
+            "currency": item["currency"], "start": item["starts_at"],
+            "end": item["ends_at"], "startsAt": item["starts_at"],
+            "endsAt": item["ends_at"], "status": item["status"],
+            "active": item["status"] == "active" and not item["archived_at"],
+            "externalKey": item.get("external_key", ""),
+            "note": item["note"], "version": int(item["version"]),
+            "archivedAt": item["archived_at"], "createdAt": item["created_at"],
+            "updatedAt": item["updated_at"],
+        }
+
+    @staticmethod
+    def coupon_public(row: Any) -> dict[str, Any]:
+        item = row_dict(row)
+        value = float(item.get("discount_value") or 0)
+        return {
+            "id": item["id"], "code": item["code"], "nameAr": item.get("name_ar", ""),
+            "nameEn": item.get("name_en", ""), "discountType": item["discount_type"],
+            "discountValue": value, "value": value,
+            "appliesTo": load(item.get("applies_to"), []),
+            "startsAt": item.get("starts_at", ""), "endsAt": item.get("ends_at", ""),
+            "maxUses": int(item.get("max_uses") or 0),
+            "usesCount": int(item.get("uses_count") or 0),
+            "active": bool(item.get("active")) and not item.get("archived_at"),
+            "externalKey": item.get("external_key", ""),
+            "version": int(item.get("version") or 1),
+            "archivedAt": item.get("archived_at", ""),
+            "createdAt": item.get("created_at", ""), "updatedAt": item.get("updated_at", ""),
+        }
+
+    def list_finance(self) -> list[dict[str, Any]]:
+        return [self.finance_public(row) for row in self.con.execute(
+            "SELECT * FROM finance_entries ORDER BY occurred_at DESC,created_at DESC"
+        )]
+
+    def list_sponsorships(self) -> list[dict[str, Any]]:
+        return [self.sponsorship_public(row) for row in self.con.execute(
+            "SELECT * FROM sponsorships ORDER BY starts_at DESC,created_at DESC"
+        )]
+
+    def list_coupons(self) -> list[dict[str, Any]]:
+        return [self.coupon_public(row) for row in self.con.execute(
+            "SELECT * FROM coupons ORDER BY created_at DESC"
+        )]
+
+    def save_finance(self, data: dict[str, Any], actor_id: str) -> dict[str, Any]:
+        supplied_id = self._text(data.get("id"), 120)
+        record_id = supplied_id or public_id("fin")
+        actor_id = self._text(actor_id, 120) or "system"
+        external_key = self._text(
+            data.get("externalKey", data.get("clientKey")), 160
+        )
+        current = self.con.execute("SELECT * FROM finance_entries WHERE id=?", (record_id,)).fetchone()
+        replay_via_external_key = False
+        if not current and external_key:
+            current = self.con.execute(
+                "SELECT * FROM finance_entries WHERE external_key=?", (external_key,)
+            ).fetchone()
+            if current:
+                record_id = current["id"]
+                replay_via_external_key = True
+        kind = self._text(data.get("kind", data.get("type")), 24)
+        status = self._text(data.get("status", "posted"), 24)
+        if kind not in self.FINANCE_KINDS:
+            raise DomainError("invalid_finance_kind", 400)
+        if status not in self.FINANCE_STATUSES:
+            raise DomainError("invalid_finance_status", 400)
+        values = (
+            kind, self._milli(data.get("amount")), self._text(data.get("source"), 120),
+            self._text(data.get("referenceKind"), 60),
+            self._text(data.get("referenceId"), 120),
+            external_key, self._text(data.get("note"), 1000),
+            status, self._timestamp(
+                data.get("occurredAt") or data.get("date") or iso(self.now),
+                required=True,
+            ),
+        )
+        if current:
+            expected_supplied = data.get("expectedVersion") not in (None, "")
+            current_values = (
+                current["kind"], int(current["amount_milli"]), current["source"],
+                current["reference_kind"], current["reference_id"],
+                current["external_key"], current["note"], current["status"],
+                current["occurred_at"],
+            )
+            if not expected_supplied and current_values == values:
+                return self.finance_public(current)
+            if replay_via_external_key:
+                raise DomainError("idempotency_key_reused", 409)
+            expected = self._expected(
+                data.get("expectedVersion"), required=True
+            )
+            if expected != int(current["version"]):
+                raise DomainError("record_version_conflict", 409)
+            self.con.execute(
+                """UPDATE finance_entries SET kind=?,amount_milli=?,source=?,reference_kind=?,
+                reference_id=?,external_key=?,note=?,status=?,occurred_at=?,updated_by=?,
+                version=version+1,archived_at=CASE WHEN ?!='voided' THEN ''
+                ELSE archived_at END,updated_at=CURRENT_TIMESTAMP
+                WHERE id=? AND version=?""",
+                (*values, actor_id, status, record_id, expected),
+            )
+            if self.con.execute("SELECT changes()").fetchone()[0] != 1:
+                raise DomainError("record_version_conflict", 409)
+            event = "updated"
+        else:
+            expected = self._expected(data.get("expectedVersion"), required=False)
+            if expected:
+                raise DomainError("record_version_conflict", 409)
+            self.con.execute(
+                """INSERT INTO finance_entries(id,kind,amount_milli,currency,source,
+                reference_kind,reference_id,external_key,note,status,occurred_at,created_by,updated_by)
+                VALUES(?,?,?,'OMR',?,?,?,?,?,?,?,?,?)""",
+                (record_id, *values, actor_id, actor_id),
+            )
+            event = "created"
+        result = self.finance_public(
+            self.con.execute("SELECT * FROM finance_entries WHERE id=?", (record_id,)).fetchone()
+        )
+        self.con.execute(
+            "INSERT INTO finance_entry_events(id,entry_id,event_type,actor_id,version,snapshot) VALUES(?,?,?,?,?,?)",
+            (public_id("finevt"), record_id, event, actor_id, result["version"], dump(result)),
+        )
+        return result
+
+    def save_sponsorship(self, data: dict[str, Any], actor_id: str) -> dict[str, Any]:
+        supplied_id = self._text(data.get("id"), 120)
+        record_id = supplied_id or public_id("sponsor")
+        actor_id = self._text(actor_id, 120) or "system"
+        external_key = self._text(
+            data.get("externalKey", data.get("clientKey")), 160
+        )
+        current = self.con.execute("SELECT * FROM sponsorships WHERE id=?", (record_id,)).fetchone()
+        replay_via_external_key = False
+        if not current and external_key:
+            current = self.con.execute(
+                "SELECT * FROM sponsorships WHERE external_key=?", (external_key,)
+            ).fetchone()
+            if current:
+                record_id = current["id"]
+                replay_via_external_key = True
+        name = self._text(data.get("sponsorName", data.get("name")), 160)
+        status = self._text(data.get("status", "draft"), 24)
+        start = self._timestamp(data.get("startsAt", data.get("start")))
+        end = self._timestamp(data.get("endsAt", data.get("end")))
+        if not name:
+            raise DomainError("sponsor_name_required", 400)
+        if status not in self.SPONSORSHIP_STATUSES:
+            raise DomainError("invalid_sponsorship_status", 400)
+        if start and end and start > end:
+            raise DomainError("invalid_sponsorship_dates", 400)
+        values = (
+            name, self._text(data.get("phone"), 20),
+            self._text(data.get("placement", "home"), 60) or "home",
+            self._milli(data.get("amount", 0)), start, end, status,
+            external_key, self._text(data.get("note"), 1000),
+        )
+        if current:
+            expected_supplied = data.get("expectedVersion") not in (None, "")
+            current_values = (
+                current["sponsor_name"], current["contact_phone"],
+                current["placement"], int(current["amount_milli"]),
+                current["starts_at"], current["ends_at"], current["status"],
+                current["external_key"], current["note"],
+            )
+            if not expected_supplied and current_values == values:
+                return self.sponsorship_public(current)
+            if replay_via_external_key or (
+                not expected_supplied
+                and external_key
+                and current["external_key"] == external_key
+            ):
+                raise DomainError("idempotency_key_reused", 409)
+            expected = self._expected(
+                data.get("expectedVersion"), required=True
+            )
+            if expected != int(current["version"]):
+                raise DomainError("record_version_conflict", 409)
+            self.con.execute(
+                """UPDATE sponsorships SET sponsor_name=?,contact_phone=?,placement=?,amount_milli=?,
+                starts_at=?,ends_at=?,status=?,external_key=?,note=?,updated_by=?,version=version+1,
+                archived_at=CASE WHEN ?!='cancelled' THEN '' ELSE archived_at END,
+                updated_at=CURRENT_TIMESTAMP WHERE id=? AND version=?""",
+                (*values, actor_id, status, record_id, expected),
+            )
+            if self.con.execute("SELECT changes()").fetchone()[0] != 1:
+                raise DomainError("record_version_conflict", 409)
+            event = "updated"
+        else:
+            expected = self._expected(data.get("expectedVersion"), required=False)
+            if expected:
+                raise DomainError("record_version_conflict", 409)
+            self.con.execute(
+                """INSERT INTO sponsorships(id,sponsor_name,contact_phone,placement,amount_milli,
+                currency,starts_at,ends_at,status,external_key,note,created_by,updated_by)
+                VALUES(?,?,?,?,?,'OMR',?,?,?,?,?,?,?)""",
+                (record_id, *values, actor_id, actor_id),
+            )
+            event = "created"
+        result = self.sponsorship_public(
+            self.con.execute("SELECT * FROM sponsorships WHERE id=?", (record_id,)).fetchone()
+        )
+        self.con.execute(
+            "INSERT INTO sponsorship_events(id,sponsorship_id,event_type,actor_id,version,snapshot) VALUES(?,?,?,?,?,?)",
+            (public_id("spevt"), record_id, event, actor_id, result["version"], dump(result)),
+        )
+        return result
+
+    def save_coupon(
+        self, data: dict[str, Any], actor_id: str, *, allowed_plan_ids: Iterable[str]
+    ) -> dict[str, Any]:
+        supplied_id = self._text(data.get("id"), 120)
+        record_id = supplied_id or public_id("coupon")
+        actor_id = self._text(actor_id, 120) or "system"
+        external_key = self._text(
+            data.get("externalKey", data.get("clientKey")), 160
+        )
+        current = self.con.execute("SELECT * FROM coupons WHERE id=?", (record_id,)).fetchone()
+        replay_via_external_key = False
+        if not current and external_key:
+            current = self.con.execute(
+                "SELECT * FROM coupons WHERE external_key=?", (external_key,)
+            ).fetchone()
+            if current:
+                record_id = current["id"]
+                replay_via_external_key = True
+        code = "".join(ch for ch in self._text(data.get("code"), 32).upper()
+                       if ch.isascii() and (ch.isalnum() or ch in "_-"))
+        discount_type = self._text(data.get("discountType", "fixed"), 16)
+        value = as_money(data.get("discountValue", data.get("value", 0)))
+        if not code or discount_type not in {"fixed", "percent"}:
+            raise DomainError("invalid_coupon", 400)
+        if value < 0 or value > Decimal("1000000") or (discount_type == "percent" and value > 100):
+            raise DomainError("invalid_coupon_value", 400)
+        raw_plans = data.get("appliesTo", [])
+        if not isinstance(raw_plans, list):
+            raise DomainError("invalid_coupon_plans", 400)
+        allowed = set(allowed_plan_ids)
+        plans = list(dict.fromkeys(str(item) for item in raw_plans if str(item) in allowed))
+        try:
+            max_uses = int(data.get("maxUses", 0) or 0)
+        except (TypeError, ValueError) as exc:
+            raise DomainError("invalid_coupon_limit", 400) from exc
+        if not 0 <= max_uses <= 1_000_000:
+            raise DomainError("invalid_coupon_limit", 400)
+        start = self._timestamp(data.get("startsAt"))
+        end = self._timestamp(data.get("endsAt"))
+        if start and end and start > end:
+            raise DomainError("invalid_coupon_dates", 400)
+        active = int(self._boolean(data.get("active"), default=True))
+        values = (
+            code, self._text(data.get("nameAr"), 120), self._text(data.get("nameEn"), 120),
+            discount_type, float(value), dump(plans), start, end, max_uses, active,
+            external_key,
+        )
+        if current:
+            expected_supplied = data.get("expectedVersion") not in (None, "")
+            current_values = (
+                current["code"], current["name_ar"], current["name_en"],
+                current["discount_type"], float(current["discount_value"]),
+                current["applies_to"], current["starts_at"], current["ends_at"],
+                int(current["max_uses"] or 0), int(current["active"] or 0),
+                current["external_key"],
+            )
+            if not expected_supplied and current_values == values:
+                return self.coupon_public(current)
+            if replay_via_external_key or (
+                not expected_supplied
+                and external_key
+                and current["external_key"] == external_key
+            ):
+                raise DomainError("idempotency_key_reused", 409)
+            expected = self._expected(data.get("expectedVersion"), required=True)
+            if expected != int(current["version"] or 1):
+                raise DomainError("record_version_conflict", 409)
+            self.con.execute(
+                """UPDATE coupons SET code=?,name_ar=?,name_en=?,discount_type=?,discount_value=?,
+                applies_to=?,starts_at=?,ends_at=?,max_uses=?,active=?,external_key=?,
+                updated_by=?,version=version+1,
+                archived_at=CASE WHEN ?=1 THEN '' ELSE archived_at END,
+                updated_at=CURRENT_TIMESTAMP WHERE id=? AND version=?""",
+                (*values, actor_id, active, record_id, expected),
+            )
+            if self.con.execute("SELECT changes()").fetchone()[0] != 1:
+                raise DomainError("record_version_conflict", 409)
+            event = "updated"
+        else:
+            expected = self._expected(data.get("expectedVersion"), required=False)
+            if expected:
+                raise DomainError("record_version_conflict", 409)
+            self.con.execute(
+                """INSERT INTO coupons(id,code,name_ar,name_en,discount_type,discount_value,
+                applies_to,starts_at,ends_at,max_uses,active,external_key,created_by,updated_by,version)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,1)""",
+                (record_id, *values, actor_id, actor_id),
+            )
+            event = "created"
+        result = self.coupon_public(
+            self.con.execute("SELECT * FROM coupons WHERE id=?", (record_id,)).fetchone()
+        )
+        self.con.execute(
+            "INSERT INTO coupon_events(id,coupon_id,event_type,actor_id,version,snapshot) VALUES(?,?,?,?,?,?)",
+            (public_id("cpevt"), record_id, event, actor_id, result["version"], dump(result)),
+        )
+        return result
 
 
 class PlanCatalog:
@@ -500,9 +1245,15 @@ class SubscriptionService:
                     ),
                 )
                 self.con.execute(
-                    "UPDATE coupons SET uses_count=uses_count+1,updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                    """UPDATE coupons SET uses_count=uses_count+1,
+                    updated_at=CURRENT_TIMESTAMP WHERE id=? AND active=1
+                    AND (max_uses=0 OR uses_count<max_uses)""",
                     (coupon["id"],),
                 )
+                if self.con.execute("SELECT changes()").fetchone()[0] != 1:
+                    # The redemption insert and subscription request live in the
+                    # same transaction, so raising here rolls both back.
+                    raise DomainError("coupon_limit_reached", 409)
         if status == "foundation":
             self._claim_foundation(provider_id, subscription_id)
             if current and current.get("id") != subscription_id:
@@ -762,7 +1513,7 @@ class EntitlementService:
         if not preserve_existing:
             return entitlements
         provider = self.con.execute(
-            "SELECT provider_type,services,areas,governorates,gov FROM providers WHERE id=?",
+            "SELECT provider_type,services,areas,governorates FROM providers WHERE id=?",
             (provider_id,),
         ).fetchone()
         if not provider:
@@ -783,8 +1534,6 @@ class EntitlementService:
             for item in load(provider["governorates"], [])
             if str(item).strip()
         }
-        if str(provider["gov"] or "").strip():
-            existing_governorates.add(str(provider["gov"]).strip())
         existing_area_count = len({
             str(area).strip()
             for area in load(provider["areas"], [])
@@ -1110,48 +1859,155 @@ class RankingService:
         return bool(cls.service_match_details(request, provider)["matched"])
 
     @classmethod
-    def exclusion_reason(cls, request: dict[str, Any], provider: dict[str, Any]) -> str:
+    def exclusion_reason(
+        cls,
+        request: dict[str, Any],
+        provider: dict[str, Any],
+        now: datetime | None = None,
+    ) -> str:
         """Return a stable, privacy-safe catalog/area exclusion code."""
         if not cls.service_match(request, provider):
             return "service_mismatch"
         if not cls.area_match(request, provider):
             return "area_mismatch"
+        if not cls.availability_match(provider, now or utcnow()):
+            return "outside_availability"
         return ""
 
     @classmethod
     def area_match(cls, request: dict[str, Any], provider: dict[str, Any]) -> bool:
         request_wilayah = str(request.get("wilayah") or "").strip()
         request_gov = str(request.get("gov") or "").strip()
-        areas = load(provider.get("areas"), []) if isinstance(provider.get("areas"), str) else provider.get("areas", [])
-        provider_areas = {str(value).strip() for value in [*areas, provider.get("wilayah"), provider.get("gov")] if value}
+        raw_areas = provider.get("areas", [])
+        areas = load(raw_areas, []) if isinstance(raw_areas, str) else raw_areas
+        if not isinstance(areas, list):
+            areas = []
+
+        # A service can deliberately have narrower coverage than the provider
+        # profile.  Prefer those areas for the service that actually matched.
+        match = cls.service_match_details(request, provider)
+        requested_cat, requested_service = cls._request_service(request)
+        matched_service_areas: list[Any] = []
+        if match["matched"]:
+            for service in cls._provider_services(provider):
+                category_id = str(service.get("catId") or "").strip()
+                service_id = str(service.get("serviceId") or "").strip()
+                same_category = not requested_cat or category_id == requested_cat
+                same_service = service_id == requested_service or (
+                    match["kind"] == "related"
+                    and cls.related_service_match(requested_service, service_id)
+                )
+                if not same_category or not same_service:
+                    continue
+                raw_service_areas = service.get("areas", [])
+                service_areas = (
+                    load(raw_service_areas, [])
+                    if isinstance(raw_service_areas, str)
+                    else raw_service_areas
+                )
+                if isinstance(service_areas, list):
+                    matched_service_areas.extend(service_areas)
+        selected_areas = matched_service_areas or areas
+        provider_areas = {
+            str(value).strip()
+            for value in selected_areas
+            if str(value or "").strip()
+        }
+        raw_governorates = provider.get("governorates", [])
+        governorates = (
+            load(raw_governorates, [])
+            if isinstance(raw_governorates, str)
+            else raw_governorates
+        )
+        if not isinstance(governorates, list):
+            governorates = []
+        declared_governorates = {
+            str(value).strip() for value in governorates if str(value or "").strip()
+        }
+        is_company = str(
+            provider.get("provider_type", provider.get("providerType", "individual"))
+            or "individual"
+        ) == "company"
         if request_wilayah:
-            return request_wilayah in provider_areas or (request_gov and request_gov in provider_areas)
-        return not request_gov or request_gov in provider_areas
+            if provider_areas:
+                return request_wilayah in provider_areas
+            # Company plans declare governorate-wide coverage separately.  A
+            # provider's profile governorate is only its location and never
+            # silently expands an individual's service area.  Governorate
+            # fallback is valid only when no narrower wilayah list exists.
+            return bool(
+                is_company
+                and request_gov
+                and request_gov in declared_governorates
+            )
+        # An individual must match a declared wilayah.  A governorate-only
+        # request can therefore be routed only to a company that explicitly
+        # declared governorate-wide coverage; profile location is never
+        # interpreted as service coverage.
+        return bool(
+            not provider_areas
+            and is_company
+            and request_gov
+            and request_gov in declared_governorates
+        )
+
+    @classmethod
+    def availability_match(cls, provider: dict[str, Any], now: datetime) -> bool:
+        """Apply provider status, working days, and hours as one hard gate."""
+        status = str(provider.get("status") or "").strip()
+        if status and status != "available":
+            return False
+        raw_availability = provider.get("availability")
+        availability = (
+            load(raw_availability, {})
+            if isinstance(raw_availability, str)
+            else raw_availability or {}
+        )
+        if not isinstance(availability, dict) or not availability:
+            return True
+        service_now = (
+            now.replace(tzinfo=OMAN_TZ)
+            if now.tzinfo is None
+            else now.astimezone(OMAN_TZ)
+        )
+        days = availability.get("days") or []
+        allowed_days = {str(day) for day in days}
+        # The mobile/web contract stores Sunday=0 through Saturday=6.  Python's
+        # datetime.weekday() is Monday=0, so normalize before every comparison.
+        service_weekday = (service_now.weekday() + 1) % 7
+        start = str(availability.get("start") or "").strip()
+        end = str(availability.get("end") or "").strip()
+        if not start and not end:
+            return not allowed_days or str(service_weekday) in allowed_days
+        if not start or not end:
+            return False
+        current = service_now.strftime("%H:%M")
+        if start <= end:
+            return (
+                (not allowed_days or str(service_weekday) in allowed_days)
+                and start <= current <= end
+            )
+        # Overnight windows, for example 20:00-03:00.
+        if current >= start:
+            service_day = service_weekday
+        elif current <= end:
+            service_day = (service_weekday - 1) % 7
+        else:
+            return False
+        return not allowed_days or str(service_day) in allowed_days
 
     @classmethod
     def availability_score(cls, provider: dict[str, Any], now: datetime) -> float:
-        status = provider.get("status")
-        if status == "unavailable":
-            return 0.0
-        score = 1.0 if status == "available" else 0.55
-        availability = load(provider.get("availability"), {})
-        if not availability:
-            return score
-        days = availability.get("days") or []
-        day_key = str(now.weekday())
-        if days and day_key not in {str(day) for day in days}:
-            return 0.0
-        start, end = availability.get("start"), availability.get("end")
-        if start and end:
-            current = now.strftime("%H:%M")
-            if not (str(start) <= current <= str(end)):
-                return 0.25
-        return score
+        return 1.0 if cls.availability_match(provider, now) else 0.0
 
     @classmethod
     def score(cls, request: dict[str, Any], provider: dict[str, Any], plan_id: str, now: datetime) -> tuple[float, dict[str, float]]:
         match = cls.service_match_details(request, provider)
-        if not match["matched"] or not cls.area_match(request, provider):
+        if (
+            not match["matched"]
+            or not cls.area_match(request, provider)
+            or not cls.availability_match(provider, now)
+        ):
             return 0.0, {key: 0.0 for key in cls.WEIGHTS}
         services = load(provider.get("services"), []) if isinstance(provider.get("services"), str) else provider.get("services", [])
         areas = load(provider.get("areas"), []) if isinstance(provider.get("areas"), str) else provider.get("areas", [])
@@ -1178,6 +2034,20 @@ class RankingService:
 
 
 class RequestMarketplace:
+    TERMINAL_REQUEST_STATUSES = {
+        "accepted",
+        "appointmentConfirmed",
+        "inProgress",
+        "awaitingConfirmation",
+        "qualityReview",
+        "closed",
+        "archived",
+        "completed",
+        "cancelled",
+        "deleted",
+        "expired",
+    }
+
     def __init__(self, con, *, now: datetime | None = None, expansion_minutes: int = 20, min_offers: int = 2):
         self.con = con
         self.now = now or utcnow()
@@ -1233,6 +2103,25 @@ class RequestMarketplace:
             ),
         )
 
+    def provider_match_reason(
+        self,
+        request: dict[str, Any],
+        provider: dict[str, Any],
+        *,
+        requested_at: datetime | None = None,
+        request_id: str = "",
+    ) -> str:
+        """Apply the canonical service, area, hours, and capacity gates."""
+        requested_at = requested_at or parse_marketplace_datetime(request.get("requested_at")) or self.now
+        reason = RankingService.exclusion_reason(request, provider, requested_at)
+        if reason:
+            return reason
+        if not self.provider_has_capacity(
+            provider, requested_at, request_id or str(request.get("id") or "")
+        ):
+            return "daily_capacity_reached"
+        return ""
+
     def diagnostics(self, request_id: str) -> dict[str, Any]:
         """Return aggregate matching reasons suitable for an admin surface.
 
@@ -1248,7 +2137,7 @@ class RequestMarketplace:
         request = row_dict(request_row)
         subscriptions_enabled = self.subscription_delays_enabled()
         entitlements = EntitlementService(self.con, now=self.now)
-        requested_at = parse_datetime(request.get("requested_at")) or self.now
+        requested_at = parse_marketplace_datetime(request.get("requested_at")) or self.now
         counts: dict[str, int] = {}
         eligible = 0
         total = 0
@@ -1261,12 +2150,14 @@ class RequestMarketplace:
             if not allowed:
                 counts[reason] = counts.get(reason, 0) + 1
                 continue
-            reason = RankingService.exclusion_reason(request, provider)
+            reason = self.provider_match_reason(
+                request,
+                provider,
+                requested_at=requested_at,
+                request_id=request_id,
+            )
             if reason:
                 counts[reason] = counts.get(reason, 0) + 1
-                continue
-            if not self.provider_has_capacity(provider, requested_at, request_id):
-                counts["daily_capacity_reached"] = counts.get("daily_capacity_reached", 0) + 1
                 continue
             eligible += 1
         self._persist_diagnostics(
@@ -1289,7 +2180,12 @@ class RequestMarketplace:
         self, provider: dict[str, Any], requested_at: datetime, request_id: str
     ) -> bool:
         """Respect an optional per-day capacity without changing legacy profiles."""
-        availability = load(provider.get("availability"), {})
+        raw_availability = provider.get("availability")
+        availability = (
+            load(raw_availability, {})
+            if isinstance(raw_availability, str)
+            else raw_availability or {}
+        )
         try:
             daily_capacity = int(availability.get("dailyCapacity") or 0)
         except (TypeError, ValueError):
@@ -1299,11 +2195,105 @@ class RequestMarketplace:
         count = self.con.execute(
             """SELECT COUNT(*) n FROM customer_requests
             WHERE accepted_provider_id=? AND id!=?
-            AND substr(COALESCE(NULLIF(requested_at,''),created_at),1,10)=?
-            AND status IN ('accepted','appointmentConfirmed','inProgress','awaitingConfirmation')""",
-            (provider["id"], request_id, requested_at.date().isoformat()),
+            AND CASE
+              WHEN COALESCE(NULLIF(requested_at,''),'')='' THEN date(datetime(created_at,'+4 hours'))
+              WHEN instr(substr(requested_at,11),'Z')>0
+                OR instr(substr(requested_at,11),'+')>0
+                OR instr(substr(requested_at,11),'-')>0
+                THEN date(datetime(requested_at,'+4 hours'))
+              ELSE substr(requested_at,1,10)
+            END=?
+            AND status IN (
+              'accepted','appointmentConfirmed','inProgress','awaitingConfirmation',
+              'qualityReview','closed','archived','completed'
+            )""",
+            (
+                provider["id"],
+                request_id,
+                requested_at.astimezone(OMAN_TZ).date().isoformat(),
+            ),
         ).fetchone()["n"]
         return int(count or 0) < daily_capacity
+
+    def _interaction_blocked(self, user_id: str, provider_id: str) -> bool:
+        if not user_id or not provider_id:
+            return False
+        return bool(
+            self.con.execute(
+                """SELECT 1 FROM interaction_blocks WHERE active=1 AND (
+                  (blocker_kind='user' AND blocker_id=? AND blocked_kind='provider'
+                    AND blocked_id=?)
+                  OR
+                  (blocker_kind='provider' AND blocker_id=? AND blocked_kind='user'
+                    AND blocked_id=?)
+                ) LIMIT 1""",
+                (user_id, provider_id, provider_id, user_id),
+            ).fetchone()
+        )
+
+    def _mark_dispatch_stale(self, dispatch_id: str) -> None:
+        self.con.execute(
+            """UPDATE request_dispatches SET status='stale',
+            notified_at='',updated_at=CURRENT_TIMESTAMP
+            WHERE id=? AND status='scheduled'""",
+            (dispatch_id,),
+        )
+
+    def _request_is_dispatchable(self, request: dict[str, Any]) -> bool:
+        if str(request.get("status") or "") in self.TERMINAL_REQUEST_STATUSES:
+            return False
+        if str(request.get("accepted_provider_id") or "").strip():
+            return False
+        return int(request.get("offers_open", 1) or 0) == 1
+
+    def _release_candidate_is_eligible(
+        self,
+        request: dict[str, Any],
+        provider_id: str,
+        *,
+        enforce_subscription: bool,
+    ) -> bool:
+        """Re-run every intake gate against rows loaded at dispatch time."""
+        allowed, _, _ = EntitlementService(self.con, now=self.now).can_receive(
+            provider_id, enforce_subscription=enforce_subscription
+        )
+        if not allowed:
+            return False
+        # can_receive may synchronize an expired subscription and its provider
+        # flags, so match only against the canonical post-sync provider row.
+        provider_row = self.con.execute(
+            "SELECT * FROM providers WHERE id=?", (provider_id,)
+        ).fetchone()
+        if not provider_row:
+            return False
+        provider = row_dict(provider_row)
+        if str(provider.get("lifecycle_state") or "active") in {
+            "suspended",
+            "archived",
+            "deleted",
+        }:
+            return False
+        requested_at = (
+            parse_marketplace_datetime(request.get("requested_at")) or self.now
+        )
+        if self.provider_match_reason(
+            request,
+            provider,
+            requested_at=requested_at,
+            request_id=str(request.get("id") or ""),
+        ):
+            return False
+        raw_declined = request.get("declined_provider_ids")
+        declined = (
+            load(raw_declined, [])
+            if isinstance(raw_declined, str)
+            else raw_declined or []
+        )
+        if provider_id in declined:
+            return False
+        return not self._interaction_blocked(
+            str(request.get("user_id") or ""), provider_id
+        )
 
     def schedule(self, request_id: str) -> list[dict[str, Any]]:
         request_row = self.con.execute("SELECT * FROM customer_requests WHERE id=?", (request_id,)).fetchone()
@@ -1312,7 +2302,7 @@ class RequestMarketplace:
         request = row_dict(request_row)
         entitlements = EntitlementService(self.con, now=self.now)
         apply_plan_delay = self.subscription_delays_enabled()
-        requested_at = parse_datetime(request.get("requested_at")) or self.now
+        requested_at = parse_marketplace_datetime(request.get("requested_at")) or self.now
         ranked: list[dict[str, Any]] = []
         for provider_row in self.con.execute(
             """SELECT * FROM providers WHERE active=1 AND status!='unavailable'
@@ -1324,7 +2314,12 @@ class RequestMarketplace:
             )
             if not allowed:
                 continue
-            if not self.provider_has_capacity(provider, requested_at, request_id):
+            if self.provider_match_reason(
+                request,
+                provider,
+                requested_at=requested_at,
+                request_id=request_id,
+            ):
                 continue
             score, breakdown = RankingService.score(
                 request, provider, grants["planId"], requested_at
@@ -1377,7 +2372,7 @@ class RequestMarketplace:
             )
         else:
             self.con.execute(
-                """UPDATE customer_requests SET status='unavailable',marketplace_status='unavailable',
+                """UPDATE customer_requests SET status='unavailable',marketplace_status='awaiting_provider',
                 matching_provider_ids='[]',waitlisted=1,updated_at=CURRENT_TIMESTAMP WHERE id=?""",
                 (request_id,),
             )
@@ -1391,18 +2386,14 @@ class RequestMarketplace:
         if request_id:
             params.append(request_id)
             rows = list(self.con.execute(
-                """SELECT d.*,r.service_name,r.service_value,r.gov,r.wilayah,r.offers,
-                r.expansion_at,r.status request_status FROM request_dispatches d
-                JOIN customer_requests r ON r.id=d.request_id
+                """SELECT d.* FROM request_dispatches d
                 WHERE d.status='scheduled' AND d.release_at<=? AND d.request_id=?
                 ORDER BY d.request_id,d.rank""",
                 params,
             ))
         else:
             rows = list(self.con.execute(
-                """SELECT d.*,r.service_name,r.service_value,r.gov,r.wilayah,r.offers,
-                r.expansion_at,r.status request_status FROM request_dispatches d
-                JOIN customer_requests r ON r.id=d.request_id
+                """SELECT d.* FROM request_dispatches d
                 WHERE d.status='scheduled' AND d.release_at<=?
                 ORDER BY d.request_id,d.rank""",
                 params,
@@ -1412,23 +2403,63 @@ class RequestMarketplace:
         for row in rows:
             by_request.setdefault(row["request_id"], []).append(row)
         for rid, candidates in by_request.items():
-            request_row = candidates[0]
-            if request_row["request_status"] in {
-                "accepted", "appointmentConfirmed", "inProgress",
-                "awaitingConfirmation", "qualityReview", "closed", "archived",
-                "completed", "cancelled", "deleted", "expired",
-            }:
+            current_request_row = self.con.execute(
+                "SELECT * FROM customer_requests WHERE id=?", (rid,)
+            ).fetchone()
+            if not current_request_row:
+                for candidate in candidates:
+                    self._mark_dispatch_stale(candidate["id"])
                 continue
-            offers = load(request_row["offers"], [])
-            current_ids = load(
-                self.con.execute("SELECT matching_provider_ids FROM customer_requests WHERE id=?", (rid,)).fetchone()[0],
-                [],
-            )
+            current_request = row_dict(current_request_row)
+            if not self._request_is_dispatchable(current_request):
+                for candidate in candidates:
+                    self._mark_dispatch_stale(candidate["id"])
+                continue
+            current_ids = load(current_request.get("matching_provider_ids"), [])
+            if not isinstance(current_ids, list):
+                current_ids = []
             for row in candidates:
+                # The scheduler's score is only a snapshot. Reload both sides
+                # immediately before release and fail closed if either changed.
+                request_row = self.con.execute(
+                    "SELECT * FROM customer_requests WHERE id=?", (rid,)
+                ).fetchone()
+                provider_row = self.con.execute(
+                    "SELECT * FROM providers WHERE id=?", (row["provider_id"],)
+                ).fetchone()
+                if not request_row or not provider_row:
+                    self._mark_dispatch_stale(row["id"])
+                    continue
+                request = row_dict(request_row)
+                if not self._request_is_dispatchable(request):
+                    self._mark_dispatch_stale(row["id"])
+                    continue
                 if int(row["wave"] or 1) == 2:
-                    expansion = parse_datetime(row["expansion_at"])
-                    if not expansion or self.now < expansion or len(offers) >= self.min_offers:
+                    expansion = parse_datetime(request.get("expansion_at"))
+                    offers = load(request.get("offers"), [])
+                    if not expansion or self.now < expansion:
                         continue
+                    if len(offers) >= self.min_offers:
+                        self._mark_dispatch_stale(row["id"])
+                        continue
+                enforce_subscription = self.subscription_delays_enabled()
+                request_row = self.con.execute(
+                    "SELECT * FROM customer_requests WHERE id=?", (rid,)
+                ).fetchone()
+                if not request_row:
+                    self._mark_dispatch_stale(row["id"])
+                    continue
+                request = row_dict(request_row)
+                if (
+                    not self._request_is_dispatchable(request)
+                    or not self._release_candidate_is_eligible(
+                        request,
+                        row["provider_id"],
+                        enforce_subscription=enforce_subscription,
+                    )
+                ):
+                    self._mark_dispatch_stale(row["id"])
+                    continue
                 self.con.execute(
                     """UPDATE request_dispatches SET status='notified',notified_at=?,
                     updated_at=CURRENT_TIMESTAMP WHERE id=? AND status='scheduled'""",
@@ -1443,13 +2474,36 @@ class RequestMarketplace:
                     "providerId": row["provider_id"],
                     "rank": row["rank"],
                     "score": row["score"],
-                    "serviceName": row["service_name"] or row["service_value"],
-                    "area": row["wilayah"] or row["gov"],
+                    "serviceName": request.get("service_name")
+                    or request.get("service_value"),
+                    "area": request.get("wilayah") or request.get("gov"),
                 })
             self.con.execute(
-                """UPDATE customer_requests SET matching_provider_ids=?,marketplace_status=?,
+                """UPDATE customer_requests SET matching_provider_ids=?,
+                marketplace_status=CASE
+                  WHEN ? THEN 'notified'
+                  WHEN EXISTS(SELECT 1 FROM request_dispatches
+                    WHERE request_id=? AND status='scheduled') THEN 'scheduled'
+                  ELSE 'awaiting_provider' END,
+                status=CASE WHEN NOT ? AND NOT EXISTS(
+                  SELECT 1 FROM request_dispatches
+                  WHERE request_id=? AND status='scheduled'
+                ) AND status='matching' THEN 'unavailable' ELSE status END,
+                waitlisted=CASE WHEN NOT ? AND NOT EXISTS(
+                  SELECT 1 FROM request_dispatches
+                  WHERE request_id=? AND status='scheduled'
+                ) THEN 1 ELSE waitlisted END,
                 updated_at=CURRENT_TIMESTAMP WHERE id=?""",
-                (dump(current_ids), "notified" if current_ids else "scheduled", rid),
+                (
+                    dump(current_ids),
+                    bool(current_ids),
+                    rid,
+                    bool(current_ids),
+                    rid,
+                    bool(current_ids),
+                    rid,
+                    rid,
+                ),
             )
         return released
 
