@@ -2940,7 +2940,7 @@ async function completeCustomerAuthentication(res,phone){
  S.user={...S.user,...res.user,location:normalizeCoordinates({lat:res.user.latitude,lng:res.user.longitude})||S.user.location};
  S.session={mode:'registered',userId:res.user.id};
  mergeRemote(await api('/api/bootstrap',null,AUTH.userToken));
- LOGIN_ACCOUNT_OVERRIDE.user=false;clearFailedLogin('user',res.user.phone||phone);S.entrySeen=true;S.splashSeen=true;S.view='home';persistAccountMemory(S);save();closeModal();render();
+ LOGIN_ACCOUNT_OVERRIDE.user=false;clearFailedLogin('user',res.user.phone||phone);clearToast();S.entrySeen=true;S.splashSeen=true;S.view='home';persistAccountMemory(S);save();closeModal();render();
  showRoleOnboarding('user',user.id||user.phone,()=>{showUnreadOnLogin('user',user.id);resumePendingNotificationTarget();});requestDeviceNotificationsOnce();
 }
 const CONTEXT_HELP_COPY={
