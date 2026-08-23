@@ -1291,16 +1291,16 @@ async function disablePushBinding(kind,token=tokenForKind(kind),subjectId=authSu
   if(!token||!subjectId||!navigator.serviceWorker)return false;
   try{const reg=await currentServiceWorkerRegistration(false),subscription=await reg?.pushManager?.getSubscription();if(!subscription){rememberPushBinding(kind,subjectId,false,'disabled');return true;}const result=await api('/api/push/subscribe',{action:'unsubscribe',role:kind,subjectId,endpoint:subscription.endpoint},token,{silentLoading:true,skipQueue:true});if(result?.ok!==true)return false;rememberPushBinding(kind,subjectId,false,'disabled');return true;}catch(err){console.warn('Push binding removal pending',err);return false;}
 }
-async function requestDeviceNotifications(){
+async function requestDeviceNotifications({silent=false}={}){
  if(!('Notification' in window))return false;
- const kind=activeAuthKind(),subjectId=authSubjectForKind(kind);if(!tokenForKind(kind)||!subjectId){toast(L('سجّل الدخول أولاً لربط الإشعارات بهذا الحساب.','Sign in first to link notifications to this account.'));return false;}
+ const kind=activeAuthKind(),subjectId=authSubjectForKind(kind);if(!tokenForKind(kind)||!subjectId){if(!silent)toast(L('سجّل الدخول أولاً لربط الإشعارات بهذا الحساب.','Sign in first to link notifications to this account.'));return false;}
  const permission=Notification.permission==='default'?await Notification.requestPermission():Notification.permission;
  if(permission==='granted'){
   const bound=await ensurePushBinding(kind,subjectId);
-  if(bound){toast(L('تم تفعيل إشعارات الهاتف لهذا الحساب.','Phone notifications are enabled for this account.'));return true;}
-  toast(L('سمح المتصفح بالإشعارات، لكن خدمة الإرسال من الخادم غير مهيأة أو تعذر تأكيدها الآن.','Browser permission is granted, but server push is not configured or could not be confirmed.'));return false;
+  if(bound){if(!silent)toast(L('تم تفعيل إشعارات الهاتف لهذا الحساب.','Phone notifications are enabled for this account.'));return true;}
+  if(!silent)toast(L('سمح المتصفح بالإشعارات، لكن خدمة الإرسال من الخادم غير مهيأة أو تعذر تأكيدها الآن.','Browser permission is granted, but server push is not configured or could not be confirmed.'));return false;
  }
- toast(L('لم يتم السماح بإشعارات الهاتف.','Phone notifications were not allowed.'));return false;
+ if(!silent)toast(L('لم يتم السماح بإشعارات الهاتف.','Phone notifications were not allowed.'));return false;
 }
 async function requestDeviceNotificationsOnce(){
  if(!('Notification' in window)||!window.isSecureContext)return false;
@@ -1311,7 +1311,7 @@ async function requestDeviceNotificationsOnce(){
   return ensurePushBinding(kind,subjectId);
  }
  localStorage.setItem(key,nowISO());
- return requestDeviceNotifications();
+ return requestDeviceNotifications({silent:true});
 }
 async function dispatchDeviceNotification(item){
  if(!devicePushBindingReady()||!notificationIsForCurrentSession(item)||!('Notification' in window)||Notification.permission!=='granted')return;
