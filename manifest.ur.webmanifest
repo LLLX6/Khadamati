@@ -1,0 +1,22 @@
+{
+  "name": "Khadamati | سروس ایپ",
+  "short_name": "Khadamati",
+  "version": "1.3.0",
+  "id": "./",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "display_override": ["standalone", "minimal-ui"],
+  "orientation": "portrait-primary",
+  "description": "مقامی خدمات طلب کرنے، ان کی پیش رفت دیکھنے اور فراہم کنندگان اور کمپنیوں سے رابطے کے لیے عمانی پلیٹ فارم۔",
+  "categories": ["business", "lifestyle", "utilities"],
+  "prefer_related_applications": false,
+  "background_color": "#f4f8f9",
+  "theme_color": "#071d2e",
+  "dir": "rtl",
+  "lang": "ur",
+  "icons": [
+    {"src": "app-icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any"},
+    {"src": "app-icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any maskable"}
+  ]
+}

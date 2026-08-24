@@ -68,6 +68,8 @@ jobs:
         run: npx playwright install --with-deps chromium
       - name: Check JavaScript syntax
         run: npm run check:js
+      - name: Five-language contract and mobile flow
+        run: npm run test:i18n
       - name: Responsive UI smoke matrix
         run: |
           for size in "320 740" "375 812" "390 844" "430 932" "1280 800"; do

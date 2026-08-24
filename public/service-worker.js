@@ -1,13 +1,21 @@
 const CACHE_PREFIX = 'khadamati-app-shell-v';
-const CACHE_NAME = 'khadamati-app-shell-v1.2.0-r1';
+const CACHE_NAME = 'khadamati-app-shell-v1.3.0-r1';
 const INDEX_CACHE_KEY = './index.html';
+const LANGUAGE_CACHE_KEY = './.khadamati-language';
 const PRIVATE_PATH = /\/(?:api|media|uploads)(?:\/|$)/i;
 const DOWNLOAD_PATH = /\/(?:downloads?|exports?)(?:\/|$)|\.(?:pdf|zip|csv|xlsx?|docx?|pptx?)$/i;
-const STATIC_ASSET_PATH = /\.(?:css|m?js|png|jpe?g|webp|svg|ico|woff2?|ttf)$/i;
+const STATIC_ASSET_PATH = /\.(?:css|m?js|webmanifest|png|jpe?g|webp|svg|ico|woff2?|ttf)$/i;
 const SHELL = [
   './',
   './index.html',
+  './manifest.webmanifest',
+  './manifest.en.webmanifest',
+  './manifest.hi.webmanifest',
+  './manifest.bn.webmanifest',
+  './manifest.ur.webmanifest',
   './assets/styles/khadamati-v1.css',
+  './assets/scripts/khadamati-i18n-data.js',
+  './assets/scripts/khadamati-i18n.js',
   './assets/scripts/khadamati-visuals.js',
   './assets/scripts/khadamati-ui-state.js',
   './app-icon-192.png',
@@ -43,6 +51,23 @@ const SHELL = [
   './vendor/leaflet.css',
   './vendor/leaflet.js'
 ];
+const PUSH_COPY = Object.freeze({
+  ar: Object.freeze({ title: 'خدماتي', action: 'لديك إجراء مطلوب في خدماتي. افتح التطبيق لمراجعته بأمان.', chat: 'لديك رسالة جديدة في خدماتي. افتح التطبيق لقراءتها.', update: 'لديك تحديث جديد في خدماتي. افتح التطبيق لمراجعته.' }),
+  en: Object.freeze({ title: 'Khadamati', action: 'An action needs your attention in Khadamati. Open the app to review it safely.', chat: 'You have a new message in Khadamati. Open the app to read it.', update: 'You have a new Khadamati update. Open the app to review it.' }),
+  hi: Object.freeze({ title: 'Khadamati', action: 'Khadamati में एक काम पर आपका ध्यान चाहिए। सुरक्षित रूप से देखने के लिए ऐप खोलें।', chat: 'Khadamati में आपका नया संदेश है। पढ़ने के लिए ऐप खोलें।', update: 'Khadamati में नया अपडेट है। देखने के लिए ऐप खोलें।' }),
+  bn: Object.freeze({ title: 'Khadamati', action: 'Khadamati-তে একটি কাজে আপনার মনোযোগ দরকার। নিরাপদে দেখতে অ্যাপ খুলুন।', chat: 'Khadamati-তে আপনার নতুন বার্তা এসেছে। পড়তে অ্যাপ খুলুন।', update: 'Khadamati-তে নতুন আপডেট এসেছে। দেখতে অ্যাপ খুলুন।' }),
+  ur: Object.freeze({ title: 'Khadamati', action: 'Khadamati میں ایک کام آپ کی توجہ چاہتا ہے۔ محفوظ طریقے سے دیکھنے کے لیے ایپ کھولیں۔', chat: 'Khadamati میں آپ کا نیا پیغام ہے۔ پڑھنے کے لیے ایپ کھولیں۔', update: 'Khadamati میں نئی تازہ کاری ہے۔ دیکھنے کے لیے ایپ کھولیں۔' })
+});
+
+function normalizedLanguage(value) {
+  const code = String(value || '').toLowerCase().split(/[-_]/)[0];
+  return PUSH_COPY[code] ? code : 'ar';
+}
+
+async function storedLanguage() {
+  const response = await caches.match(LANGUAGE_CACHE_KEY);
+  return normalizedLanguage(response ? await response.text() : 'ar');
+}
 
 self.addEventListener('install', event => {
   // A failed pre-cache must fail this installation so the last complete worker
@@ -64,6 +89,10 @@ self.addEventListener('activate', event => {
 
 self.addEventListener('message', event => {
   if (event.data && event.data.type === 'SKIP_WAITING') self.skipWaiting();
+  if (event.data && event.data.type === 'KHADAMATI_LANGUAGE') {
+    const language = normalizedLanguage(event.data.language);
+    event.waitUntil(caches.open(CACHE_NAME).then(cache => cache.put(LANGUAGE_CACHE_KEY, new Response(language))));
+  }
 });
 
 function isBlockedPath(url) {
@@ -173,15 +202,18 @@ self.addEventListener('push', event => {
   const route = notificationId
     ? `./#notification=${encodeURIComponent(notificationId)}`
     : (payload.route || './');
-  event.waitUntil(
-    self.registration.showNotification(payload.title || 'خدماتي', {
-      body: payload.body || payload.message || '',
+  event.waitUntil((async () => {
+    const language = await storedLanguage();
+    const copy = PUSH_COPY[language];
+    const messageKind = payload.requiresAction ? 'action' : String(payload.tag || '').startsWith('khadamati-chat-') ? 'chat' : 'update';
+    await self.registration.showNotification(payload.translations?.[language]?.title || copy.title, {
+      body: payload.translations?.[language]?.body || copy[messageKind],
       icon: './app-icon-192.png',
       badge: './app-icon-192.png',
       tag: payload.tag || notificationId || 'khadamati',
       renotify: Boolean(payload.renotify),
       requireInteraction: Boolean(payload.requiresAction),
       data: { route, notificationId }
-    })
-  );
+    });
+  })());
 });

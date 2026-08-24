@@ -27,7 +27,8 @@ Mobile launch performance check:
 node tests/performance-ui.js
 ```
 
-The UI flow covers Arabic RTL and English LTR, modal/map state restoration, live
+The UI flow covers Arabic and Urdu RTL plus English, Hindi, and Bengali LTR,
+language persistence and 320/390/430px fit, modal/map state restoration, live
 geolocation recentering, 320px mobile fit, offer comparison,
 consent-gated contact, text/image/voice chat, calendar export,
 provider video, before/after media, subscriptions, finance, visitor isolation,

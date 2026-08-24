@@ -155,8 +155,8 @@ def environment_flag(name, default=False):
 SERVER_VERSION = (
     os.environ.get("KHADAMATI_SERVER_VERSION")
     or os.environ.get("KHADAMATI_RELEASE")
-    or "1.2.0"
-).strip().removeprefix("v") or "1.2.0"
+    or "1.3.0"
+).strip().removeprefix("v") or "1.3.0"
 # Keep the historic release field as an alias while exposing one version
 # contract to health, readiness, bootstrap, and structured logs.
 APP_RELEASE = SERVER_VERSION
@@ -787,6 +787,14 @@ if SUPPORT_WHATSAPP and not re.fullmatch(r"968\d{8}", SUPPORT_WHATSAPP):
 
 def safe_text(value, limit=240):
     return str(value or "").strip()[:limit]
+
+
+SUPPORTED_LANGUAGES = frozenset({"ar", "en", "hi", "bn", "ur"})
+
+
+def normalize_language(value, fallback="ar"):
+    language = safe_text(value, 12).lower().replace("_", "-").split("-", 1)[0]
+    return language if language in SUPPORTED_LANGUAGES else fallback
 
 
 def log_event(event, level="info", **fields):
@@ -8548,9 +8556,10 @@ class Handler(SimpleHTTPRequestHandler):
             WHERE s.id=? AND s.category_id=?""",
             (service_id, category_id),
         ).fetchone()
-        language = "en" if safe_text(language, 5).lower() == "en" else "ar"
+        language = normalize_language(language)
+        service_language = "ar" if language == "ar" else "en"
         service_name = (
-            (service[language] if service else "")
+            (service[service_language] if service else "")
             or (service["ar"] if service else "")
             or listing["title"]
             or service_value
@@ -8580,18 +8589,22 @@ class Handler(SimpleHTTPRequestHandler):
             "source": "community",
             "createdAt": now,
         }
-        if language == "en":
-            welcome_text = (
-                f"Hello {user['name'] or 'Khadamati customer'}, this is "
-                f"{provider['name']}. Your chat about “{listing['title']}” is now open. "
-                "We can confirm the details and schedule here."
-            )
-        else:
-            welcome_text = (
-                f"مرحباً {user['name'] or 'عميل خدماتي'}، معك {provider['name']}. "
-                f"تم فتح المحادثة بخصوص «{listing['title']}». "
-                "يمكننا تأكيد التفاصيل والموعد هنا."
-            )
+        customer_name = user["name"] or {
+            "ar": "عميل خدماتي", "en": "Khadamati customer",
+            "hi": "ख़दमती ग्राहक", "bn": "খাদামাতি গ্রাহক", "ur": "خدماتی صارف",
+        }[language]
+        welcome_templates = {
+            "ar": "مرحباً {customer}، معك {provider}. تم فتح المحادثة بخصوص «{title}». يمكننا تأكيد التفاصيل والموعد هنا.",
+            "en": "Hello {customer}, this is {provider}. Your chat about “{title}” is now open. We can confirm the details and schedule here.",
+            "hi": "नमस्ते {customer}, मैं {provider} हूँ। “{title}” के बारे में बातचीत अब शुरू है। हम यहाँ विवरण और समय तय कर सकते हैं।",
+            "bn": "স্বাগতম {customer}, আমি {provider}। “{title}” নিয়ে কথোপকথন এখন চালু হয়েছে। আমরা এখানে বিস্তারিত ও সময় নিশ্চিত করতে পারি।",
+            "ur": "خوش آمدید {customer}، میں {provider} ہوں۔ ”{title}“ کے بارے میں گفتگو اب کھل گئی ہے۔ ہم یہاں تفصیلات اور وقت طے کر سکتے ہیں۔",
+        }
+        welcome_text = welcome_templates[language].format(
+            customer=customer_name,
+            provider=provider["name"],
+            title=listing["title"],
+        )
         message = {
             "id": slug("msg"),
             "sender": "provider",
@@ -10221,21 +10234,45 @@ class Handler(SimpleHTTPRequestHandler):
                 provider_row = con.execute(
                     "SELECT name FROM providers WHERE id=?", (selected_provider,)
                 ).fetchone()
-                provider_name = provider_row["name"] if provider_row else "مزود الخدمة"
-                service_name = item["serviceName"] or item["serviceValue"] or "الخدمة"
-                customer_name = item.get("customerName") or "عميل خدماتي"
-                if str(data.get("language", "ar")).lower() == "en":
-                    welcome_text = (
-                        f"Hello {customer_name}, this is {provider_name}. "
-                        f"Thank you for choosing my offer for {service_name}. "
-                        "We can confirm the details and appointment here."
-                    )
-                else:
-                    welcome_text = (
-                        f"مرحباً {customer_name}، معك {provider_name}. "
-                        f"شكراً لاختيار عرضي لخدمة {service_name}. "
-                        "يمكننا الآن تأكيد التفاصيل والموعد هنا."
-                    )
+                language = normalize_language(data.get("language"))
+                fallbacks = {
+                    "ar": ("مزود الخدمة", "الخدمة", "عميل خدماتي"),
+                    "en": ("Service provider", "the service", "Khadamati customer"),
+                    "hi": ("सेवा प्रदाता", "यह सेवा", "Khadamati ग्राहक"),
+                    "bn": ("সেবাদাতা", "এই সেবা", "Khadamati গ্রাহক"),
+                    "ur": ("فراہم کنندہ", "یہ سروس", "Khadamati صارف"),
+                }
+                provider_fallback, service_fallback, customer_fallback = fallbacks[language]
+                provider_name = provider_row["name"] if provider_row else provider_fallback
+                service_name = item["serviceName"] or item["serviceValue"] or service_fallback
+                customer_name = item.get("customerName") or customer_fallback
+                welcome_templates = {
+                    "ar": (
+                        "مرحباً {customer}، معك {provider}. شكراً لاختيار عرضي لخدمة "
+                        "{service}. يمكننا الآن تأكيد التفاصيل والموعد هنا."
+                    ),
+                    "en": (
+                        "Hello {customer}, this is {provider}. Thank you for choosing "
+                        "my offer for {service}. We can confirm the details and appointment here."
+                    ),
+                    "hi": (
+                        "नमस्ते {customer}, मैं {provider} हूँ। मेरा प्रस्ताव चुनने के लिए "
+                        "धन्यवाद। हम यहाँ विवरण और समय की पुष्टि कर सकते हैं।"
+                    ),
+                    "bn": (
+                        "স্বাগতম {customer}, আমি {provider}। আমার প্রস্তাব বেছে নেওয়ার জন্য "
+                        "ধন্যবাদ। আমরা এখানে বিস্তারিত ও সময় নিশ্চিত করতে পারি।"
+                    ),
+                    "ur": (
+                        "خوش آمدید {customer}، میں {provider} ہوں۔ میری پیشکش منتخب کرنے کا "
+                        "شکریہ۔ ہم یہاں تفصیلات اور وقت کی تصدیق کر سکتے ہیں۔"
+                    ),
+                }
+                welcome_text = welcome_templates[language].format(
+                    customer=customer_name,
+                    provider=provider_name,
+                    service=service_name,
+                )
                 messages = list(item.get("messages") or [])
                 welcome_message = {
                     "id": slug("msg"),
@@ -12293,7 +12330,7 @@ class Handler(SimpleHTTPRequestHandler):
                     VALUES(?,?,?,?,?,?,?)""",
                     (
                         slug("pol"), user_id, phone, policy_version, jdump(documents),
-                        "en" if data.get("language") == "en" else "ar",
+                        normalize_language(data.get("language")),
                         jdump({"source": "in_app", "consent": True}),
                     ),
                 )

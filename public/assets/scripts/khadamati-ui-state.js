@@ -1,8 +1,8 @@
 (function attachKhadamatiUiState(root, factory) {
-  const api = factory();
+  const api = factory(root);
   if (typeof module === 'object' && module.exports) module.exports = api;
   root.KhadamatiUI = api;
-})(typeof globalThis !== 'undefined' ? globalThis : this, function buildKhadamatiUiState() {
+})(typeof globalThis !== 'undefined' ? globalThis : this, function buildKhadamatiUiState(root) {
   'use strict';
 
   const COPY = {
@@ -51,16 +51,35 @@
     }
   };
 
-  function language(value) { return value === 'en' ? 'en' : 'ar'; }
+  const LANGUAGES = ['ar', 'en', 'hi', 'bn', 'ur'];
+  function language(value) {
+    const selected = String(value || '').toLowerCase().split(/[-_]/)[0];
+    return LANGUAGES.includes(selected) ? selected : 'ar';
+  }
+  function translateEnglish(value, lang) {
+    return lang === 'en' ? value : root.KhadamatiI18n?.translate ? root.KhadamatiI18n.translate(value, lang) : value;
+  }
+  function presentationCopy(key, lang) {
+    const selected = language(lang);
+    if (selected === 'ar' || selected === 'en') return COPY[selected][key];
+    const source = COPY.en[key];
+    return [translateEnglish(source[0], selected), translateEnglish(source[1], selected), source[2]];
+  }
+  function statusLabel(status, lang) {
+    const selected = language(lang);
+    if (selected === 'ar' || selected === 'en') return STATUS_LABELS[selected][status];
+    const source = STATUS_LABELS.en[status];
+    return source ? translateEnglish(source, selected) : '';
+  }
   function normalizeMutationState(value) {
     return value === 'failed' ? 'failed' : value === 'pending' ? 'pending' : 'confirmed';
   }
   function mutationPresentation(value, lang, options) {
     const state = normalizeMutationState(value);
-    const dictionary = COPY[language(lang)];
+    const selectedLanguage = language(lang);
     const request = !!(options && options.request);
     const key = request && state === 'pending' ? 'requestPending' : request && state === 'failed' ? 'requestFailed' : state;
-    const copy = dictionary[key];
+    const copy = presentationCopy(key, selectedLanguage);
     return { state, label: copy[0], message: copy[1], tone: copy[2], retry: state === 'failed', pending: state === 'pending', confirmed: state === 'confirmed' };
   }
   function requestPresentation(request, lang) {
@@ -70,20 +89,20 @@
     if (syncState !== 'confirmed') return mutationPresentation(syncState, selectedLanguage, { request: true });
     const waitlisted = item.waitlisted === true || item.waitlistState === 'active' || item.status === 'unavailable';
     if (waitlisted) {
-      const copy = COPY[selectedLanguage].waitlisted;
+      const copy = presentationCopy('waitlisted', selectedLanguage);
       return { state: 'confirmed', label: copy[0], message: copy[1], tone: copy[2], retry: false, waitlisted: true };
     }
     const status = String(item.status || 'received');
     if (status === 'matching' || status === 'viewed') {
-      const copy = COPY[selectedLanguage].matching;
-      return { state: 'confirmed', label: STATUS_LABELS[selectedLanguage][status] || copy[0], message: copy[1], tone: copy[2], retry: false };
+      const copy = presentationCopy('matching', selectedLanguage);
+      return { state: 'confirmed', label: statusLabel(status, selectedLanguage) || copy[0], message: copy[1], tone: copy[2], retry: false };
     }
-    const copy = COPY[selectedLanguage].received;
-    return { state: 'confirmed', label: STATUS_LABELS[selectedLanguage][status] || copy[0], message: copy[1], tone: 'ok', retry: false };
+    const copy = presentationCopy('received', selectedLanguage);
+    return { state: 'confirmed', label: statusLabel(status, selectedLanguage) || copy[0], message: copy[1], tone: 'ok', retry: false };
   }
   function humanStatus(status, lang) {
     const selectedLanguage = language(lang);
-    return STATUS_LABELS[selectedLanguage][String(status || '')] || (selectedLanguage === 'ar' ? 'بانتظار التحديث' : 'Awaiting update');
+    return statusLabel(String(status || ''), selectedLanguage) || (selectedLanguage === 'ar' ? 'بانتظار التحديث' : translateEnglish('Awaiting update', selectedLanguage));
   }
   function notificationKind(item) {
     const route = String((item && item.actionRoute) || '');

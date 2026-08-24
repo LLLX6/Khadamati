@@ -23,7 +23,7 @@ function sourceContractBlock(start, end, label) {
   return APP_SOURCE.slice(from, to);
 }
 
-assertSource(APP_SOURCE.includes("const APP_VERSION = '1.2.0'") && APP_SOURCE.includes("const APP_BUILD = 'r1'"), 'Release application version/build marker is missing.');
+assertSource(APP_SOURCE.includes("const APP_VERSION = '1.3.0'") && APP_SOURCE.includes("const APP_BUILD = 'r1'"), 'Release application version/build marker is missing.');
 assertSource(APP_SOURCE.includes('access-horizon-hero') && APP_SOURCE.includes('renderHorizonEntry()') && STYLE_SOURCE.includes("nearby-services.webp") && STYLE_SOURCE.includes('Oman Horizon entry screen'), 'The Oman Horizon entry composition or local background asset is missing.');
 assertSource(APP_SOURCE.includes('<img src="app-icon-192.png"') && APP_SOURCE.includes("L('شعار خدماتي','Khadamati logo')") && APP_SOURCE.includes("L('زائر','Guest')") && !APP_SOURCE.includes("L('دخول زائر','Guest access')"), 'The entry screen is not using the official Khadamati logo or the concise visitor label.');
 assertSource(['للمستخدم','للمزود','رحلة واضحة للطرفين'].every(copy => APP_SOURCE.includes(copy)), 'The first-open guidance does not explain the customer, provider, and shared journey.');
@@ -51,7 +51,7 @@ assertSource(APP_SOURCE.includes('<details class="provider-space-group"') && APP
 assertSource(APP_SOURCE.includes("initialProviderAction=role==='provider'") && APP_SOURCE.includes('${esc(next.label)} ${dirFor'), 'Provider task buttons do not expose the exact next-action label.');
 assertSource(APP_SOURCE.includes('needsFreshRequest') && APP_SOURCE.includes('completionReviewSheet(request.id)'), 'Completion notifications do not refresh and open the exact request.');
 assertSource(APP_SOURCE.includes('async function commitNotificationReads') && APP_SOURCE.includes('await commitNotificationReads') && !APP_SOURCE.includes("if(item)item.read=true;});save();syncVisibleNotificationCounters();if(activeAuthToken())Promise.allSettled"), 'Notification actions can still clear unread counts before server confirmation or a durable pending queue.');
-assertSource(APP_SOURCE.includes('assets/scripts/khadamati-ui-state.js?v=1.2.0-r1') && APP_SOURCE.includes('khadamati-visuals.js?v=1.2.0-r1'), 'Release UI helpers are not pinned to the current build.');
+assertSource(APP_SOURCE.includes('assets/scripts/khadamati-i18n-data.js?v=1.3.0-r1') && APP_SOURCE.includes('assets/scripts/khadamati-i18n.js?v=1.3.0-r1') && APP_SOURCE.includes('assets/scripts/khadamati-ui-state.js?v=1.3.0-r1') && APP_SOURCE.includes('khadamati-visuals.js?v=1.3.0-r1'), 'Release UI helpers are not pinned to the current build.');
 assertSource((APP_SOURCE.match(/function adminOverview\(/g) || []).length === 1, 'The management overview still has duplicate implementations.');
 assertSource((APP_SOURCE.match(/if\(a==='saveProviderProfile'/g) || []).length === 1 && (APP_SOURCE.match(/if\(a==='setProviderStatus'/g) || []).length === 1, 'Legacy provider mutation handlers are still duplicated.');
 assertSource(APP_SOURCE.includes("api('/api/user/profile',payload,AUTH.userToken,{skipQueue:true})") && !APP_SOURCE.includes('async function syncCurrentUserProfile(){'), 'Customer profile synchronization can still fail silently.');
@@ -306,6 +306,17 @@ async function clickFirstAction(page, action) {
   assert(await item.count(), `No accessible action exists for ${action}.`);
   if (await item.isVisible()) await item.click();
   else await item.evaluate(element => element.click());
+}
+
+async function chooseLanguage(page, code, triggerSelector = '[data-action="toggleLang"]:visible') {
+  const trigger = page.locator(triggerSelector).first();
+  assert(await trigger.count(), `No language selector is visible for ${code}.`);
+  await trigger.click();
+  const picker = page.locator('[data-language-picker]');
+  await picker.waitFor({ state: 'visible' });
+  assert(await picker.locator('[data-action="setLanguage"]').count() === 5, 'The language selector must contain exactly five languages.');
+  await picker.locator(`[data-action="setLanguage"][data-lang="${code}"]`).click();
+  await page.waitForFunction(language => document.documentElement.lang === language, code);
 }
 
 async function revealRequestAction(page, action) {
@@ -1027,11 +1038,11 @@ async function clickProviderNav(page, tab) {
   assert(await page.locator('.community-v3-tabs [data-value="board"]').count(), 'The merged request-board Community tab is missing.');
   assert(await page.locator('.community-card').count() === 1, 'Community package card is missing.');
   await capture(page, '08-community-user-packages', { fullPage: false });
-  await page.locator('[data-action="toggleLang"]:visible').first().click();
+  await chooseLanguage(page, 'en');
   assert(await page.locator('html').getAttribute('dir') === 'ltr', 'Community English mode did not switch to LTR.');
   assert(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth + 1), 'Community English mode overflows horizontally.');
   await capture(page, '08h-community-user-english', { fullPage: false });
-  await page.locator('[data-action="toggleLang"]:visible').first().click();
+  await chooseLanguage(page, 'ar');
   await page.evaluate(() => document.documentElement.dataset.theme = 'dark');
   await capture(page, '08i-community-user-dark', { fullPage: false });
   await page.evaluate(() => document.documentElement.dataset.theme = 'light');
@@ -1269,7 +1280,7 @@ async function clickProviderNav(page, tab) {
   assert(companyRowsAfter === Math.min(companyRowsBefore + 1, Math.max(0, companyLimit - 1)), 'Company add-service must reveal one field at a time while respecting its current plan.');
   await capture(page, '01e-provider-register');
   await page.locator('#modalRoot [data-action="closeModal"]').click();
-  await page.locator('[data-action="toggleLang"]').first().click();
+  await chooseLanguage(page, 'en');
   await page.locator('[data-action="openProviderAccess"][data-mode="register"]').click();
   while ((await page.locator('#providerRegisterForm').getAttribute('data-step')) !== '1') {
     await page.locator('[data-action="providerRegistrationBack"]').click();
@@ -1280,7 +1291,7 @@ async function clickProviderNav(page, tab) {
   assert(!(await registrationHasArabic()), 'English company registration still contains Arabic interface labels.');
   assert(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth + 1), 'English provider registration overflows horizontally.');
   await page.locator('#modalRoot [data-action="closeModal"]').click();
-  await page.locator('[data-action="toggleLang"]').first().click();
+  await chooseLanguage(page, 'ar');
   await capture(page, '00f-provider-login', { fullPage: false });
   await page.locator('#loginPhone').fill('91234567');
   await page.locator('#loginOtp').fill('1234');
@@ -1324,7 +1335,7 @@ async function clickProviderNav(page, tab) {
   assert(providerTopFits, 'Provider top bar overflows the mobile viewport.');
   assert(await page.locator('.provider-top-actions > *').evaluateAll(items => items.every(item => { const box = item.getBoundingClientRect(); return box.left >= -1 && box.right <= window.innerWidth + 1; })), 'A provider header control leaves the mobile viewport.');
   await capture(page, '02-provider-dashboard');
-  await page.locator('.provider-top-actions [data-action="toggleLang"]').click();
+  await chooseLanguage(page, 'en', '.provider-top-actions [data-action="toggleLang"]');
   await page.waitForTimeout(150);
   assert(await page.locator('html').getAttribute('dir') === 'ltr', 'Provider English mode did not switch to LTR.');
   assert(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth + 1), 'Provider English layout overflows horizontally.');
@@ -1349,7 +1360,7 @@ async function clickProviderNav(page, tab) {
   assert(await page.locator('.notification-center-sheet').getByText(/بطاقتك متاحة للعملاء|تم إيقاف بطاقتك مؤقتاً/i).count() === 0, 'Arabic system notification copy leaked into English mode.');
   await page.locator('[data-action="closeModal"]').click();
   await capture(page, '02a-provider-english');
-  await page.locator('.provider-top-actions [data-action="toggleLang"]').click();
+  await chooseLanguage(page, 'ar', '.provider-top-actions [data-action="toggleLang"]');
   await page.waitForTimeout(100);
   assert(await page.locator('html').getAttribute('dir') === 'rtl', 'Provider Arabic mode was not restored to RTL.');
   await clickFirstAction(page, 'openQuoteLibrary');
@@ -1908,7 +1919,7 @@ async function clickProviderNav(page, tab) {
   assert(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth + 1), 'Platform administration overflows the mobile viewport.');
   await capture(page, '03b-admin-platform');
 
-  await page.locator('.topbar [data-action="toggleLang"]').click();
+  await chooseLanguage(page, 'en', '.topbar [data-action="toggleLang"]');
   assert(await page.locator('html').getAttribute('dir') === 'ltr', 'English mode did not switch the document to LTR.');
   assert(await page.locator('.brand').filter({ hasText: /Administration/i }).count(), 'English administration title is missing.');
   assert(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth), 'English layout overflows horizontally.');

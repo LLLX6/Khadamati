@@ -51,6 +51,17 @@ from khadamati_growth import KnownProviderInvitationService
 from khadamati_trust import ProviderVerificationService
 
 
+class LanguageContractTests(unittest.TestCase):
+    def test_server_accepts_the_five_interface_languages(self):
+        expected = {"ar": "ar", "en": "en", "hi": "hi", "bn": "bn", "ur": "ur"}
+        self.assertEqual(
+            {language: server.normalize_language(language) for language in expected},
+            expected,
+        )
+        self.assertEqual(server.normalize_language("ur-PK"), "ur")
+        self.assertEqual(server.normalize_language("unsupported"), "ar")
+
+
 class CommercialRecordTests(unittest.TestCase):
     def setUp(self):
         self.con = sqlite3.connect(":memory:")

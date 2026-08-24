@@ -1,12 +1,13 @@
 {
   "name": "khadamati-app",
-  "version": "1.2.0",
+  "version": "1.3.0",
   "private": true,
   "description": "Quality tooling for the Khadamati PWA",
   "scripts": {
-    "check:js": "node --check tests/smoke-ui.js && node --check tests/performance-ui.js && node --check assets/scripts/khadamati-visuals.js && node --check assets/scripts/khadamati-ui-state.js && node --check service-worker.js && node --check public/service-worker.js",
+    "check:js": "node --check tests/smoke-ui.js && node --check tests/performance-ui.js && node --check assets/scripts/khadamati-i18n-data.js && node --check assets/scripts/khadamati-i18n.js && node --check assets/scripts/khadamati-visuals.js && node --check assets/scripts/khadamati-ui-state.js && node --check service-worker.js && node --check public/service-worker.js",
     "sync:public": "node scripts/sync-public.mjs",
     "check:mirrors": "node scripts/sync-public.mjs --check",
+    "test:i18n": "node tests/i18n-contract.js && node tests/i18n-ui.js",
     "test:ui": "node tests/smoke-ui.js",
     "test:performance": "node tests/performance-ui.js"
   },
