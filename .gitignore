@@ -26,6 +26,7 @@ tests/__*.out
 tests/__*.err
 tests/__screens-*/
 tests/__debug*.png
+tmp/**/*.sqlite3
 __screenshots-*/
 .pip-audit-cache*/
 .pip-audit-tool/
@@ -33,3 +34,8 @@ v*-contact-sheet.jpg
 v*-mobile-contact-sheet.jpg
 artifacts/
 outputs/
+
+# Generated local reports, renders, and presentation build files.
+# Public deliverables are uploaded explicitly as GitHub Release assets.
+/output/
+/tmp/

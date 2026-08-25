@@ -13,7 +13,20 @@ const IS_MOBILE = VIEWPORT_WIDTH <= 760;
 let LOCAL_SERVER = null;
 
 const APP_SOURCE = fs.readFileSync(path.resolve(__dirname, '..', 'index.html'), 'utf8');
-assertSource(APP_SOURCE.includes("const APP_VERSION = '1.1.0'") && APP_SOURCE.includes("const APP_BUILD = 'khadamati-v1.1.0-booking-v2-r1-2026-08-08'"), 'Booking v2 application version/build marker is missing.');
+const STYLE_SOURCE = fs.readFileSync(path.resolve(__dirname, '..', 'assets', 'styles', 'khadamati-v1.css'), 'utf8');
+const UI_STATE_SOURCE = fs.readFileSync(path.resolve(__dirname, '..', 'assets', 'scripts', 'khadamati-ui-state.js'), 'utf8');
+
+function sourceContractBlock(start, end, label) {
+  const from = APP_SOURCE.indexOf(start);
+  const to = APP_SOURCE.indexOf(end, from + start.length);
+  assertSource(from >= 0 && to > from, `Could not isolate the ${label} source contract.`);
+  return APP_SOURCE.slice(from, to);
+}
+
+assertSource(APP_SOURCE.includes("const APP_VERSION = '1.3.1'") && APP_SOURCE.includes("const APP_BUILD = 'r1'"), 'Release application version/build marker is missing.');
+assertSource(APP_SOURCE.includes('access-horizon-hero') && APP_SOURCE.includes('renderHorizonEntry()') && STYLE_SOURCE.includes("nearby-services.webp") && STYLE_SOURCE.includes('Oman Horizon entry screen'), 'The Oman Horizon entry composition or local background asset is missing.');
+assertSource(APP_SOURCE.includes('<img src="app-icon-192.png"') && APP_SOURCE.includes("L('شعار خدماتي','Khadamati logo')") && APP_SOURCE.includes("L('زائر','Guest')") && !APP_SOURCE.includes("L('دخول زائر','Guest access')"), 'The entry screen is not using the official Khadamati logo or the concise visitor label.');
+assertSource(['للمستخدم','للمزود','رحلة واضحة للطرفين'].every(copy => APP_SOURCE.includes(copy)), 'The first-open guidance does not explain the customer, provider, and shared journey.');
 assertSource(APP_SOURCE.includes('actionPromptRoot') && APP_SOURCE.includes('renderActionPrompt()'), 'The actionable notification root is not wired to rendering.');
 assertSource(APP_SOURCE.includes("'change_propose'") && APP_SOURCE.includes("'change_decide'"), 'Change-order propose/decision UI is missing.');
 assertSource(APP_SOURCE.includes('work-order-summary') && APP_SOURCE.includes('review_change_order'), 'Work-order summary or change-order routing is missing.');
@@ -28,6 +41,184 @@ assertSource(APP_SOURCE.includes("notification.requiresAction&&notification._ser
 const INSTANT_CONFLICT_CODES = ['instant_slot_reserved', 'instant_slot_not_found', 'instant_slot_expired', 'instant_slot_policy_changed', 'provider_no_longer_available', 'instant_booking_stage_not_allowed', 'provider_area_mismatch', 'provider_daily_capacity_reached', 'instant_booking_conflict', 'instant_slot_service_mismatch'];
 assertSource(INSTANT_CONFLICT_CODES.every(code => APP_SOURCE.includes(`'${code}'`)) && APP_SOURCE.includes('if(definitiveConflict&&intent.requestId)') && APP_SOURCE.includes('if(definitiveConflict)setTimeout(()=>instantBookingSheet'), 'Instant-booking conflicts are not wired to orphan cleanup and slot reselection.');
 assertSource(['suggestion', 'community', 'offers', 'completion', 'change-order', 'quality', 'account'].every(route => APP_SOURCE.includes(`kind==='${route}'`)), 'Structured notification routes are incomplete.');
+const COMMUNITY_PACKAGE_FLOW = APP_SOURCE.slice(APP_SOURCE.indexOf('function communityPackageRequestSheet'), APP_SOURCE.indexOf('function communityReportSheet'));
+const FEATURED_PACKAGE_FLOW = APP_SOURCE.slice(APP_SOURCE.indexOf('function activeFeaturedPackages'), APP_SOURCE.indexOf('function showFeaturedPackage'));
+const PROVIDER_TASK_FLOW = APP_SOURCE.slice(APP_SOURCE.indexOf('function providerActiveTasks'), APP_SOURCE.indexOf('function providerWeekCalendar'));
+assertSource(COMMUNITY_PACKAGE_FLOW.includes("L('تأكيد الطلب','Confirm request')") && !COMMUNITY_PACKAGE_FLOW.includes('data-channel="whatsapp"'), 'Community package requests must confirm inside the app without a WhatsApp branch.');
+assertSource(FEATURED_PACKAGE_FLOW.includes('featuredPackageExposure(item).daysPerWeek>0') && !FEATURED_PACKAGE_FLOW.includes('item.featured&&'), 'Home packages do not follow provider-plan exposure automatically.');
+assertSource(PROVIDER_TASK_FLOW.includes('providerWorkflowSteps(request)') && !PROVIDER_TASK_FLOW.includes('provider-task-summary'), 'Provider jobs must use the named provider workflow instead of summary boxes.');
+assertSource(APP_SOURCE.includes('<details class="provider-space-group"') && APP_SOURCE.includes("contextHelpButton('provider_space')"), 'Provider space sections are not collapsible or lack contextual help.');
+assertSource(APP_SOURCE.includes("initialProviderAction=role==='provider'") && APP_SOURCE.includes('${esc(next.label)} ${dirFor'), 'Provider task buttons do not expose the exact next-action label.');
+assertSource(APP_SOURCE.includes('needsFreshRequest') && APP_SOURCE.includes('completionReviewSheet(request.id)'), 'Completion notifications do not refresh and open the exact request.');
+assertSource(APP_SOURCE.includes('async function commitNotificationReads') && APP_SOURCE.includes('await commitNotificationReads') && !APP_SOURCE.includes("if(item)item.read=true;});save();syncVisibleNotificationCounters();if(activeAuthToken())Promise.allSettled"), 'Notification actions can still clear unread counts before server confirmation or a durable pending queue.');
+assertSource(APP_SOURCE.includes('assets/scripts/khadamati-i18n-data.js?v=1.3.1-r1') && APP_SOURCE.includes('assets/scripts/khadamati-i18n.js?v=1.3.1-r1') && APP_SOURCE.includes('assets/scripts/khadamati-ui-state.js?v=1.3.1-r1') && APP_SOURCE.includes('khadamati-visuals.js?v=1.3.1-r1'), 'Release UI helpers are not pinned to the current build.');
+assertSource(APP_SOURCE.includes("api('/api/admin/demo-providers'") && APP_SOURCE.includes("confirm:'RESTORE_LAUNCH_SAMPLE_PROVIDERS'") && APP_SOURCE.includes('isLaunchSampleProvider'), 'The explicit launch-sample provider restore control is missing.');
+assertSource((APP_SOURCE.match(/function adminOverview\(/g) || []).length === 1, 'The management overview still has duplicate implementations.');
+assertSource((APP_SOURCE.match(/if\(a==='saveProviderProfile'/g) || []).length === 1 && (APP_SOURCE.match(/if\(a==='setProviderStatus'/g) || []).length === 1, 'Legacy provider mutation handlers are still duplicated.');
+assertSource(APP_SOURCE.includes("api('/api/user/profile',payload,AUTH.userToken,{skipQueue:true})") && !APP_SOURCE.includes('async function syncCurrentUserProfile(){'), 'Customer profile synchronization can still fail silently.');
+assertSource(APP_SOURCE.includes("if(a==='setProviderStatus'||a==='cycleProviderStatus')") && APP_SOURCE.includes("operationStateToast('pending'") && APP_SOURCE.includes('queuedMutationExists'), 'Provider availability does not expose confirmed or pending states.');
+assertSource(APP_SOURCE.includes("if(a==='stopRequestOffers'") && APP_SOURCE.includes("if(a==='cancelRequest'") && APP_SOURCE.includes("if(a==='providerDeclineRequest'") && !APP_SOURCE.includes("catch(err){if(String(err?.message||err)==='request_failed')return null;throw err;}"), 'Request mutations can still fall back to a false local success.');
+assertSource(APP_SOURCE.includes("else if(a==='sendAdminProviderNote')") && APP_SOURCE.includes("else if(a==='adminSaveProvider')") && APP_SOURCE.includes("api('/api/admin/providers',proposed,AUTH.adminToken,{skipQueue:true})"), 'Management provider mutations are not server-confirmed.');
+assertSource(APP_SOURCE.includes("api('/api/admin/finance',payload,AUTH.adminToken,{skipQueue:true})") && APP_SOURCE.includes("api('/api/admin/sponsorships',payload,AUTH.adminToken,{skipQueue:true})") && APP_SOURCE.includes("api('/api/admin/coupons',payload,AUTH.adminToken,{skipQueue:true})"), 'Commercial records are not committed through their canonical server endpoints.');
+assertSource((APP_SOURCE.match(/if\(!result\?\.record\?\.id\)throw new Error\('invalid_server_response'\)/g)||[]).length>=6 && APP_SOURCE.includes("if(!saved?.id)throw new Error('invalid_server_response')") && APP_SOURCE.includes("if(!result?.provider?.id)throw new Error('invalid_server_response')") && APP_SOURCE.includes("if(!complaint?.id)throw new Error('invalid_server_response')"), 'A malformed successful response can still produce a confirmed commercial, provider-note, provider, or complaint mutation.');
+assertSource(APP_SOURCE.includes("expectedVersion:Number(item.version||0)") && APP_SOURCE.includes("expectedVersion:Number(sponsor.version||0)") && APP_SOURCE.includes("expectedVersion:Number(coupon.version||0)"), 'Commercial updates are missing optimistic version checks.');
+assertSource(!APP_SOURCE.includes('S.expenses.push(') && !APP_SOURCE.includes('S.sponsors.push(') && !APP_SOURCE.includes('S.coupons.push(') && !APP_SOURCE.includes("catch(_){payload.id=uid('pay')"), 'A commercial or payment mutation can still report local-only success.');
+assertSource(APP_SOURCE.includes("api('/api/backup',{action:'create',label:'admin'}") && APP_SOURCE.includes("api('/api/backup',null,AUTH.adminToken") && APP_SOURCE.includes("kind:'khadamati-device-settings'"), 'Server backup creation/listing or the clearly scoped device export is missing.');
+assertSource(APP_SOURCE.includes("'financeEntries','finance','expenses','sponsors','sponsorships','coupons'") && APP_SOURCE.includes("if(Array.isArray(data.financeEntries))S.finance=data.financeEntries"), 'Canonical private commercial records are not protected from local persistence.');
+const FLUSH_OFFLINE_FLOW=APP_SOURCE.slice(APP_SOURCE.indexOf('async function flushOfflineQueue()'),APP_SOURCE.indexOf('async function api(path'));
+assertSource(FLUSH_OFFLINE_FLOW.includes('const confirmation=offlineMutationConfirmation(item,result)') && FLUSH_OFFLINE_FLOW.indexOf('const confirmation=offlineMutationConfirmation(item,result)') < FLUSH_OFFLINE_FLOW.indexOf("markOfflineRequestSyncState(item,'confirmed')"), 'Offline reconciliation marks confirmation before validating and merging the canonical server response.');
+assertSource(['/api/user/requests','/api/provider/profile','/api/leads','/api/notifications/action'].every(path=>APP_SOURCE.includes(`item?.path==='${path}'`)) && APP_SOURCE.includes("if(!saved?.request)throw new Error('invalid_server_response')") && !APP_SOURCE.includes('S.offlineQueue=S.offlineQueue.slice(-40)'), 'Queued mutations lack endpoint-specific canonical acknowledgements, direct requests can confirm without a request, or the queue can silently drop older work.');
+const QUICK_REQUEST_MUTATION=APP_SOURCE.slice(APP_SOURCE.indexOf("if(a==='saveQuickRequest'"),APP_SOURCE.indexOf("if(a==='stopRequestOffers'"));
+assertSource(QUICK_REQUEST_MUTATION.includes('skipQueue:hasTransferAttachments') && QUICK_REQUEST_MUTATION.includes("queued=!hasTransferAttachments&&code==='request_failed'") && QUICK_REQUEST_MUTATION.includes('S.requestDraft=attachmentFailure?') && QUICK_REQUEST_MUTATION.includes('المسودة والصور على هذا الجهاز'), 'Requests with new image attachments can still enter the offline queue, lose their files, or discard the retry draft.');
+assertSource(!APP_SOURCE.includes('if(res.status>=500&&body&&!options.skipQueue)queueOfflineOperation(path,body)'), 'HTTP 5xx responses can still create a hidden offline mutation.');
+assertSource(APP_SOURCE.includes("api('/api/request-suggestions',{action:'create'") && APP_SOURCE.includes("AUTH.userToken,{skipQueue:true}),suggestion=result?.suggestion") && !APP_SOURCE.includes("catch(err){if(String(err?.message||err)!=='request_failed')throw err;}"), 'Provider suggestions can still report local success after a failed server request.');
+assertSource(APP_SOURCE.includes("if(a==='retryQuickRequest'") && APP_SOURCE.includes("setTimeout(()=>showRequestWizardStep(4)"), 'Failed direct requests do not expose a review-and-retry handler.');
+assertSource(APP_SOURCE.includes("api('/api/provider/review-reply'") && !APP_SOURCE.includes('r.providerReply='), 'Provider review replies are not server-backed.');
+assertSource(APP_SOURCE.includes("clientKey=val('finClientKey')") && APP_SOURCE.includes("id:val('spRecordId')") && APP_SOURCE.includes("id:val('cpRecordId')"), 'Commercial create forms do not keep stable replay keys across retries.');
+assertSource((APP_SOURCE.match(/if\(a==='toggleAd'/g)||[]).length===1 && (APP_SOURCE.match(/if\(a==='saveAdSlides'/g)||[]).length===1 && APP_SOURCE.includes("api('/api/admin/ads'"), 'Advertisement mutations still have a local-only or duplicate legacy handler.');
+const ADMIN_ADS_FLOW=APP_SOURCE.slice(APP_SOURCE.indexOf('function adminAds()'),APP_SOURCE.indexOf('function adPreviewSheet'));
+assertSource(['Home advertisements','Advertisement images','Advertiser name','Contact number','Paid amount (OMR)','Slide interval','Add advertisement','Delete'].every(copy=>ADMIN_ADS_FLOW.includes(copy)), 'The mobile management advertisement screen is not fully bilingual.');
+const ADMIN_AUDIENCE_FLOW=APP_SOURCE.slice(APP_SOURCE.indexOf('function adminAudience()'),APP_SOURCE.indexOf('function adminCredentials'));
+const ADMIN_ASSISTANT_FLOW=APP_SOURCE.slice(APP_SOURCE.indexOf('function adminAssistant()'),APP_SOURCE.indexOf('function adminOverview'));
+assertSource(['Users and guests','Registered users','Guest visits','Total sign-ins','Recent users'].every(copy=>ADMIN_AUDIENCE_FLOW.includes(copy)) && ['Search insights and assistant','Most searched user needs','Management recommendations'].every(copy=>ADMIN_ASSISTANT_FLOW.includes(copy)), 'Management audience or search-insight screens are not fully bilingual.');
+assertSource(APP_SOURCE.includes('S.serverBackups=[result.backup') && APP_SOURCE.includes('try{await refreshServerBackups();}catch(_){}'), 'A successful server backup can be lost from the UI when the follow-up list refresh fails.');
+assertSource(APP_SOURCE.includes("await commitNotificationReads(ids,AUTH.adminToken)") && !APP_SOURCE.includes("Promise.allSettled(ids.map(notificationId=>api('/api/notifications/action'") && !APP_SOURCE.includes("targetNotifications('admin').forEach(n=>n.read=true)"), 'Bulk management notifications can still be marked read locally without confirmed or durably queued writes.');
+assertSource(APP_SOURCE.includes("await commitNotificationReads([notification.id]") && APP_SOURCE.includes("await syncNotificationUiAction(notification,'ack')") && !APP_SOURCE.includes("syncNotificationUiAction(notification,'read');syncNotificationUiAction(notification,'ack')"), 'Action prompts can still mark read or acknowledged before the notification server accepts the action.');
+const ADMIN_UNAVAILABLE_FLOW=APP_SOURCE.slice(APP_SOURCE.indexOf('function adminUnavailable()'),APP_SOURCE.indexOf('function adminExpiries'));
+const ADMIN_EDIT_PROVIDER_FLOW=APP_SOURCE.slice(APP_SOURCE.indexOf('function adminEditProvider('),APP_SOURCE.indexOf('function pictogramPickerHtml'));
+assertSource(['Requests without a matching provider','All areas','Latest request','Find providers','No data yet'].every(copy=>ADMIN_UNAVAILABLE_FLOW.includes(copy)) && ['Registration / licence number','Verification expiry','Commercial registration expiry','Licence expiry'].every(copy=>ADMIN_EDIT_PROVIDER_FLOW.includes(copy)), 'Unavailable-demand or provider-expiry management controls are not fully bilingual.');
+const COMPLETE_REQUEST_FLOW=APP_SOURCE.slice(APP_SOURCE.indexOf("if(a==='completeCustomerRequest'"),APP_SOURCE.indexOf("if(a==='qualityIssue'"));
+const SAVE_REVIEW_FLOW=APP_SOURCE.slice(APP_SOURCE.indexOf("if(a==='saveReview'"),APP_SOURCE.indexOf("if(a==='saveComplaint'"));
+assertSource(COMPLETE_REQUEST_FLOW.includes('if(!result?.request)') && COMPLETE_REQUEST_FLOW.includes('S.loyaltySummary=result.loyaltySummary') && !COMPLETE_REQUEST_FLOW.includes('grantLoyalty(') && !COMPLETE_REQUEST_FLOW.includes('addNotification('), 'Request completion or quality confirmation still fabricates local state, loyalty, or notifications.');
+assertSource(SAVE_REVIEW_FLOW.includes('if(!saved?.review)') && SAVE_REVIEW_FLOW.includes('S.loyaltySummary=saved.loyaltySummary') && !SAVE_REVIEW_FLOW.includes('grantLoyalty('), 'Review submission does not use the canonical review and loyalty summary returned by the server.');
+assertSource(APP_SOURCE.includes("if(!token)throw new Error('auth_required');\n const result=await api('/api/request/collaboration'") && APP_SOURCE.includes("if(!result?.request)throw new Error('invalid_server_response')") && !APP_SOURCE.includes('if(!synced)'), 'Request collaboration still permits local-only offer, chat, consent, or workflow success.');
+const PROVIDER_OPEN_REQUEST_FLOW=APP_SOURCE.slice(APP_SOURCE.indexOf("if(a==='providerOpenRequest'"),APP_SOURCE.indexOf("if(a==='providerDeclineRequest'"));
+assertSource(!PROVIDER_OPEN_REQUEST_FLOW.includes('viewedProviderIds=') && !PROVIDER_OPEN_REQUEST_FLOW.includes('addNotification(') && !PROVIDER_OPEN_REQUEST_FLOW.includes("api('/api/requests/action"), 'Opening a provider request still mutates request state or fabricates a customer notification.');
+assertSource(APP_SOURCE.includes("if(t==='assistant')return adminAssistantPublic()") && APP_SOURCE.includes("assistant:L('ساحة الطلبات','Request marketplace')") && APP_SOURCE.includes('function adminDemandGapSheet(') && !APP_SOURCE.includes("a==='searchProvidersForUnavailable'"), 'The management marketplace or demand-gap diagnosis still routes outside the administration workspace.');
+assertSource(APP_SOURCE.includes('function demandGapItems()') && APP_SOURCE.includes('const items=demandGapItems()') && APP_SOURCE.includes('unavailable=demandGapItems().reduce') && !APP_SOURCE.includes('const items=[...(S.unavailableRequests||[])]'), 'Management demand reporting still depends on local unavailable-request counters instead of canonical demand gaps.');
+assertSource(ADMIN_AUDIENCE_FLOW.includes('Not available as a server metric yet') && !ADMIN_AUDIENCE_FLOW.includes('guests.length'), 'The administration still presents local guest visits as a verified server metric.');
+const SUGGESTION_ACTION_FLOW=APP_SOURCE.slice(APP_SOURCE.indexOf("if(a==='selectProviderSuggestion'"),APP_SOURCE.indexOf("if(a==='categorySearch'"));
+assertSource(['select','delete','report'].every(action=>SUGGESTION_ACTION_FLOW.includes(`action:'${action}'`)) && (SUGGESTION_ACTION_FLOW.match(/if\(!AUTH\.userToken\)/g)||[]).length>=3 && (SUGGESTION_ACTION_FLOW.match(/if\(!result\?\.ok/g)||[]).length>=3 && !SUGGESTION_ACTION_FLOW.includes('}else{found.suggestion.status='), 'Suggestion selection, deletion, or reporting can still claim local success without a confirmed user mutation.');
+assertSource(['claimed', 'contacted', 'expired', 'deleted', 'open', 'submitted', 'approved', 'rejected'].every(status => UI_STATE_SOURCE.includes(`${status}:`)), 'Human-readable dynamic status coverage is incomplete.');
+assertSource(APP_SOURCE.includes('app.__khadamatiMarkup!==markup') && APP_SOURCE.includes('preservedScroll') && APP_SOURCE.includes('requestAnimationFrame(()=>window.scrollTo'), 'Rendering does not preserve position or avoid identical rebuilds.');
+assertSource(APP_SOURCE.includes('admin-decision-summary') && APP_SOURCE.includes('groupedNotificationItems') && STYLE_SOURCE.includes('.admin-decision-summary') && STYLE_SOURCE.includes('.provider-workflow-timeline'), 'The compact management decision center or provider workflow styling is missing.');
+
+// Every sensitive write below must reject a syntactically successful HTTP response
+// that omits the canonical entity acknowledged by the server. These focused source
+// contracts complement the visual flow, whose happy-path mocks always return entities.
+const PROVIDER_PROFILE_WRITE = sourceContractBlock("if(a==='saveProviderProfile'", "if(a==='detectUserLocation'", 'provider-profile mutation');
+const USER_PROFILE_WRITE = sourceContractBlock("if(a==='saveAccountSheet'", "if(a==='assistantChooseService'", 'user-profile mutation');
+assertSource(
+  PROVIDER_PROFILE_WRITE.includes("api('/api/provider/profile'")
+    && /if\s*\(\s*!result\?\.provider\?\.id\s*\)\s*throw new Error\('invalid_server_response'\)/.test(PROVIDER_PROFILE_WRITE)
+    && PROVIDER_PROFILE_WRITE.includes("availabilityPayload('pp',p.availability?.dailyCapacity)")
+    && !PROVIDER_PROFILE_WRITE.includes('else{Object.assign(p,payload')
+    && /if\s*\(\s*!res\?\.user\?\.id\s*\)\s*throw new Error\('invalid_server_response'\)/.test(USER_PROFILE_WRITE),
+  'A malformed user/provider profile 2xx response can still be accepted or replaced with local profile data.'
+);
+
+const PROVIDER_SUPPORT_WRITE = sourceContractBlock("else if(a==='providerUpgradeRequest'", "else if(a==='adminLogin'", 'provider-support mutation');
+assertSource(
+  PROVIDER_SUPPORT_WRITE.includes("api('/api/provider/support'")
+    && /if\s*\(\s*!notificationId\s*\)\s*throw new Error\('invalid_server_response'\)/.test(PROVIDER_SUPPORT_WRITE),
+  'Provider support can still claim delivery when a 2xx response has no canonical notification id.'
+);
+
+const PROVIDER_REGISTRATION_WRITE = sourceContractBlock("else if(a==='providerRegister'", "else if(a==='providerUserMode'", 'provider-registration mutation');
+assertSource(
+  PROVIDER_REGISTRATION_WRITE.includes("api('/api/provider-requests'")
+    && PROVIDER_REGISTRATION_WRITE.includes("availabilityPayload('reg')")
+    && PROVIDER_REGISTRATION_WRITE.includes('availability:localDraft.availability')
+    && PROVIDER_REGISTRATION_WRITE.includes("if(!res?.request?.id")
+    && PROVIDER_REGISTRATION_WRITE.includes("throw new Error('invalid_server_response')")
+    && !/res\.request\?\.id\s*\|\|\s*uid\(/.test(PROVIDER_REGISTRATION_WRITE),
+  'Provider registration can still invent a local request id after an incomplete 2xx response.'
+);
+
+const PUSH_BINDING_FLOW = sourceContractBlock('function pushBindingKey(', 'function recordFailedLogin(', 'device push binding');
+assertSource(
+  PUSH_BINDING_FLOW.includes('keyResponse?.deliveryReady!==true')
+    && PUSH_BINDING_FLOW.includes('result?.ok!==true||result?.deliveryReady!==true')
+    && PUSH_BINDING_FLOW.includes('devicePushBindingReady()')
+    && PUSH_BINDING_FLOW.includes('if(!tokenForKind(kind)||!subjectId)return false')
+    && !APP_SOURCE.includes('S.platform.deviceNotifications=true'),
+  'Phone notifications can still appear enabled without a confirmed per-account server push binding.'
+);
+assertSource(APP_SOURCE.includes("text.includes('Every day')") && APP_SOURCE.includes('fallbackDailyCapacity=0'), 'English all-day schedules or existing daily capacity can be lost when reopening the provider profile.');
+
+const PROVIDER_VERIFICATION_WRITE = sourceContractBlock("if(a==='submitProviderVerification'", "if(a==='openComplaintCase'", 'provider-verification mutation');
+assertSource(
+  PROVIDER_VERIFICATION_WRITE.includes("api('/api/trust/verification'")
+    && /if\s*\(\s*!result\?\.verification\?\.id\s*\)\s*throw new Error\('invalid_server_response'\)/.test(PROVIDER_VERIFICATION_WRITE),
+  'Provider verification can still claim submission when the server returns no verification case.'
+);
+
+const REQUEST_WORKFLOW_WRITE = sourceContractBlock('async function syncRequestWorkflow(', 'let REQUEST_AGREEMENT_RETURN_ROLE', 'request-workflow mutation');
+assertSource(
+  REQUEST_WORKFLOW_WRITE.includes("api('/api/request/workflow'")
+    && /if\s*\(\s*!result\?\.request\?\.id\s*\)\s*throw new Error\('invalid_server_response'\)/.test(REQUEST_WORKFLOW_WRITE),
+  'Request workflow actions can still confirm when the server returns no canonical request.'
+);
+
+const NOTIFICATION_READ_WRITE = sourceContractBlock('function persistNotificationRead(', 'async function persistNotificationReads(', 'notification-read mutation');
+const NOTIFICATION_UI_WRITE = sourceContractBlock('function syncNotificationUiAction(', 'function renderActionPrompt(', 'notification UI mutation');
+const NOTIFICATION_ACTION_WRITE = sourceContractBlock("if(a==='markNotificationRead'", "if(a==='applyMapFilters'", 'notification action mutations');
+assertSource(
+  NOTIFICATION_READ_WRITE.includes('!result?.notification?.id')
+    && NOTIFICATION_READ_WRITE.includes("throw new Error('invalid_server_response')")
+    && NOTIFICATION_UI_WRITE.includes('!result?.notification?.id')
+    && NOTIFICATION_UI_WRITE.includes("throw new Error('invalid_server_response')")
+    && !NOTIFICATION_ACTION_WRITE.includes("api('/api/notifications/action'"),
+  'Notification reads, acknowledgements, or deletions can still mutate local state after an incomplete 2xx response.'
+);
+
+const ADMIN_PROVIDER_WRITE = sourceContractBlock("else if(a==='sendAdminProviderNote'", "else if(a==='adminEditProvider'", 'admin provider-note mutation');
+const ADMIN_PROVIDER_EDIT_WRITE = sourceContractBlock("else if(a==='adminSaveProvider'", "else if(a==='adminAcceptRequest'", 'admin provider-edit mutation');
+assertSource(
+  /if\s*\(\s*!saved\?\.id\s*\)\s*throw new Error\('invalid_server_response'\)/.test(ADMIN_PROVIDER_WRITE)
+    && /if\s*\(\s*!result\?\.provider\?\.id\s*\)\s*throw new Error\('invalid_server_response'\)/.test(ADMIN_PROVIDER_EDIT_WRITE),
+  'Provider administration can still confirm a note or profile update without its canonical entity.'
+);
+
+const ADMIN_SETTINGS_WRITE = sourceContractBlock("else if(a==='saveSettings'", "else if(a==='createServerBackup'", 'administration settings mutations');
+assertSource(
+  (ADMIN_SETTINGS_WRITE.match(/!result\?\.settings/g) || []).length >= 3
+    && (ADMIN_SETTINGS_WRITE.match(/throw new Error\('invalid_server_response'\)/g) || []).length >= 3,
+  'Administration settings save or restore can still accept a 2xx response without canonical settings.'
+);
+
+const COMMUNITY_SAVE_WRITE = sourceContractBlock('async function saveCommunityListingFromSheet(', 'async function handleCommunityAction(', 'community listing mutation');
+const COMMUNITY_ACTION_WRITE = sourceContractBlock('async function handleCommunityAction(', 'function adminCommunityLegacy(', 'community action mutations');
+assertSource(
+  COMMUNITY_SAVE_WRITE.includes('!result?.listing?.id')
+    && COMMUNITY_SAVE_WRITE.includes("throw new Error('invalid_server_response')")
+    && COMMUNITY_ACTION_WRITE.includes('!result?.offer?.id')
+    && (COMMUNITY_ACTION_WRITE.match(/!result\?\.requestId/g) || []).length >= 2
+    && /typeof result\??\.enabled!==['"]boolean['"]/.test(COMMUNITY_ACTION_WRITE)
+    && COMMUNITY_ACTION_WRITE.includes('!result?.report?.id')
+    && COMMUNITY_ACTION_WRITE.includes('!result?.settings'),
+  'Community writes can still close, navigate, or mutate local state after a malformed 2xx response.'
+);
+
+const SERVICE_ASSET_WRITE = sourceContractBlock("if(action==='saveServiceAsset'", "if(action==='editRequestAgreement'", 'service-asset mutations');
+assertSource(
+  /if\s*\(\s*!savedAsset\?\.id\s*\)\s*throw new Error\('invalid_server_response'\)/.test(SERVICE_ASSET_WRITE)
+    && SERVICE_ASSET_WRITE.includes('!Array.isArray(result.serviceAssets)')
+    && SERVICE_ASSET_WRITE.includes('!Array.isArray(result.history)')
+    && (SERVICE_ASSET_WRITE.match(/throw new Error\('invalid_server_response'\)/g) || []).length >= 3,
+  'Service assets can still be saved, archived, or opened after an incomplete 2xx response.'
+);
+
+const INSTANT_BOOKING_CUSTOMER_WRITE = sourceContractBlock('async function instantBookingSheet(', 'function serviceSheet(', 'customer instant-booking mutations');
+const INSTANT_BOOKING_PROVIDER_WRITE = sourceContractBlock('async function providerInstantSlotSheet(', 'function openProviderTools(', 'provider instant-slot mutations');
+assertSource(
+  INSTANT_BOOKING_CUSTOMER_WRITE.includes('!Array.isArray(result?.slots)')
+    && /if\s*\(\s*!created\?\.request\?\.id\s*\)\s*throw new Error\('invalid_server_response'\)/.test(INSTANT_BOOKING_CUSTOMER_WRITE)
+    && /if\s*\(\s*!booked\?\.request\?\.id\s*\)\s*throw new Error\('invalid_server_response'\)/.test(INSTANT_BOOKING_CUSTOMER_WRITE)
+    && /if\s*\(\s*!result\?\.slot\?\.id\s*\)\s*throw new Error\('invalid_server_response'\)/.test(INSTANT_BOOKING_PROVIDER_WRITE)
+    && INSTANT_BOOKING_PROVIDER_WRITE.includes('result?.ok!==true'),
+  'Instant-booking or provider-slot actions can still claim success without canonical server confirmation.'
+);
 
 function assertSource(value, message) {
   if (!value) throw new Error(message);
@@ -116,6 +307,17 @@ async function clickFirstAction(page, action) {
   assert(await item.count(), `No accessible action exists for ${action}.`);
   if (await item.isVisible()) await item.click();
   else await item.evaluate(element => element.click());
+}
+
+async function chooseLanguage(page, code, triggerSelector = '[data-action="toggleLang"]:visible') {
+  const trigger = page.locator(triggerSelector).first();
+  assert(await trigger.count(), `No language selector is visible for ${code}.`);
+  await trigger.click();
+  const picker = page.locator('[data-language-picker]');
+  await picker.waitFor({ state: 'visible' });
+  assert(await picker.locator('[data-action="setLanguage"]').count() === 5, 'The language selector must contain exactly five languages.');
+  await picker.locator(`[data-action="setLanguage"][data-lang="${code}"]`).click();
+  await page.waitForFunction(language => document.documentElement.lang === language, code);
 }
 
 async function revealRequestAction(page, action) {
@@ -235,11 +437,17 @@ async function clickProviderNav(page, tab) {
   let mockBookingV2Enabled = null;
   let mockServicePolicies = {};
   let mockCustomerRequests = null;
+  let mockProviderRecord = { id: 'p1', name: 'سالم البلوشي', phone: '96891234567', gov: 'مسقط', wilayah: 'السيب', areas: ['السيب'], status: 'available', active: true, verified: true, services: [{ id: 'p1s1', catId: 'homecare', serviceId: 'electrician', priceFrom: 8, active: true, areas: ['السيب'] }] };
+  let mockProviderNotificationSequence = 0;
+  const mockCollaborationRequests = new Map();
+  let mockCollaborationSequence = 0;
+  const malformedApiResponses = new Set();
 
   // Keep the visual smoke test deterministic while still exercising authenticated UI paths.
   await context.route('**/api/**', async route => {
     const url = new URL(route.request().url());
     const json = body => route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(body) });
+    if (malformedApiResponses.has(url.pathname)) return json({});
     if (url.pathname === '/api/users/login') {
       return json({ token: 'ui-user-token', user: { id: 'ui-user', phone: '96895550001', name: 'مستخدم الاختبار الآلي', gov: 'مسقط', wilayah: 'السيب', pinConfigured: true } });
     }
@@ -254,7 +462,90 @@ async function clickProviderNav(page, tab) {
       if (kind === 'admin') return json({ token: 'ui-admin-token', sessionKind: 'admin', session: { kind: 'admin', id: 'ui-admin', role: 'super_admin' } });
     }
     if (url.pathname === '/api/auth/logout') return json({ ok: true, revoked: true });
-    if (url.pathname === '/api/provider/profile') return json({});
+    if (url.pathname === '/api/notifications/action') {
+      const payload = route.request().postDataJSON();
+      const now = new Date().toISOString();
+      const required = payload.id === 'ui-required-action';
+      return json({ ok: true, notification: {
+        id: payload.id, type: 'request', title: required ? 'إجراء مطلوب' : 'تحديث', message: required ? 'راجع الطلب' : 'تم تحديث الإشعار',
+        target: 'user', targetId: 'ui-user', relatedId: required ? 'ui-required-request' : '', entityId: required ? 'ui-required-request' : '',
+        actionKind: required ? 'open_booking' : '', actionRoute: required ? 'user:request:ui-required-request' : '', requiresAction: required,
+        stateVersion: 2, priority: required ? 'high' : 'normal', createdAt: now,
+        read: ['read','ack','dismiss'].includes(payload.action), readAt: ['read','ack','dismiss'].includes(payload.action) ? now : '',
+        seenAt: payload.action === 'seen' ? now : '', acknowledgedAt: payload.action === 'ack' ? now : '',
+        dismissedAt: payload.action === 'dismiss' ? now : '', snoozedUntil: payload.action === 'snooze' ? new Date(Date.now() + Number(payload.snoozeMinutes || 20) * 60000).toISOString() : '',
+      } });
+    }
+    if (url.pathname === '/api/request/collaboration') {
+      const payload = route.request().postDataJSON();
+      const id = String(payload.id || 'ui-request');
+      const previous = mockCollaborationRequests.get(id) || {
+        id, serverId: id, userId: 'ui-user', customerName: 'مستخدم الاختبار الآلي',
+        serviceValue: 'homecare|electrician', serviceName: 'كهربائي منازل',
+        gov: 'مسقط', wilayah: 'السيب', status: 'matching', offersOpen: true,
+        offers: [], messages: [], contactConsent: { chat: false, whatsapp: false, call: false },
+        createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
+      };
+      const request = { ...previous, offers: [...(previous.offers || [])], messages: [...(previous.messages || [])], updatedAt: new Date().toISOString() };
+      if (payload.action === 'offer') {
+        const offer = {
+          id: `ui-offer-${++mockCollaborationSequence}`, providerId: 'p1', status: 'submitted',
+          price: Number(payload.price || 0), laborAmount: Number(payload.laborAmount || 0), materialsAmount: Number(payload.materialsAmount || 0),
+          duration: payload.duration || '', scope: payload.scope || '', warrantyDays: Number(payload.warrantyDays || 0),
+          validUntil: new Date(Date.now() + Number(payload.validityDays || 7) * 86400000).toISOString(), note: payload.note || '',
+        };
+        request.offers = [offer, ...request.offers.filter(item => item.providerId !== 'p1')];
+      } else if (payload.action === 'choose_offer') {
+        const offer = request.offers.find(item => item.id === payload.offerId) || request.offers[0];
+        if (offer) {
+          request.offers = request.offers.map(item => ({ ...item, status: item.id === offer.id ? 'accepted' : 'declined' }));
+          request.acceptedOfferId = offer.id;
+          request.acceptedProviderId = offer.providerId;
+          request.status = 'accepted';
+          request.offersOpen = false;
+          request.contactConsent = { ...request.contactConsent, chat: payload.chat !== false };
+          request.messages.push({
+            id: `ui-message-${++mockCollaborationSequence}`, sender: 'provider', senderId: offer.providerId,
+            text: 'شكراً لاختيار عرضي. يمكننا الآن متابعة التفاصيل داخل المحادثة.', createdAt: new Date().toISOString(),
+          });
+        }
+      } else if (payload.action === 'contact_consent') {
+        request.contactConsent = { chat: !!payload.chat, whatsapp: !!payload.whatsapp, call: !!payload.call, updatedAt: new Date().toISOString() };
+      } else if (payload.action === 'message') {
+        request.messages.push({
+          id: `ui-message-${++mockCollaborationSequence}`,
+          sender: (route.request().headers().authorization || '').includes('provider') ? 'provider' : 'user',
+          text: payload.text || '', image: payload.imageData || '', audio: payload.audioData || '', location: payload.location || null,
+          createdAt: new Date().toISOString(),
+        });
+      } else if (payload.action === 'start_work') {
+        request.status = 'in_progress';
+        request.startedAt = new Date().toISOString();
+      } else if (payload.action === 'waitlist') {
+        request.waitlisted = !!payload.enabled;
+        request.status = payload.enabled ? 'unavailable' : 'open';
+      }
+      mockCollaborationRequests.set(id, request);
+      return json({ ok: true, request });
+    }
+    if (url.pathname === '/api/provider/profile') {
+      const payload = route.request().postDataJSON();
+      const statusChanged = typeof payload.status === 'string' && payload.status !== mockProviderRecord.status;
+      const nextProvider = { ...mockProviderRecord, ...payload, id: 'p1' };
+      if (payload.beforeAfterData) {
+        nextProvider.beforeAfter = [...(payload.beforeAfter || mockProviderRecord.beforeAfter || []), {
+          id: `ui-before-after-${++mockCollaborationSequence}`,
+          before: payload.beforeAfterData.before,
+          after: payload.beforeAfterData.after,
+          caption: payload.beforeAfterData.caption || '',
+        }];
+        delete nextProvider.beforeAfterData;
+      }
+      mockProviderRecord = nextProvider;
+      const title = payload.status === 'unavailable' ? 'تم إيقاف بطاقتك مؤقتاً' : payload.status === 'available' ? 'بطاقتك متاحة للعملاء' : 'تم تحديث حالة التوفر';
+      const notifications = statusChanged ? [{ id: `ui-provider-status-${++mockProviderNotificationSequence}`, type: 'availability', title, message: title, target: 'provider', targetId: 'p1', relatedId: 'p1', priority: 'normal', read: false, createdAt: new Date().toISOString() }] : [];
+      return json({ ok: true, provider: mockProviderRecord, notifications });
+    }
     if (url.pathname === '/api/provider/quote-templates') {
       const payload = route.request().postDataJSON();
       return json({ ok: true, templates: payload.templates || [] });
@@ -292,24 +583,78 @@ async function clickProviderNav(page, tab) {
   await page.waitForTimeout(180);
   if (await page.locator('.role-onboarding').count()) {
     assert(await page.locator('.role-onboarding .onboarding-dot').count() === 3, 'First-open onboarding must contain three concise steps.');
-    await capture(page, '00a-first-open-onboarding', { fullPage: false });
+    const expectedArtwork = ['nearby-services.webp','home-services.webp','business-services.webp'];
+    for (let step = 0; step < expectedArtwork.length; step += 1) {
+      const firstOpenImage = page.locator('.role-onboarding .onboarding-visual img');
+      assert((await firstOpenImage.getAttribute('src') || '').endsWith(expectedArtwork[step]), `First-open step ${step + 1} is using the wrong artwork.`);
+      await firstOpenImage.evaluate(image => image.complete ? true : new Promise(resolve => image.addEventListener('load', () => resolve(true), { once: true })));
+      const firstOpenLayout = await page.locator('.role-onboarding').evaluate(dialog => {
+        const image = dialog.querySelector('.onboarding-visual img');
+        const copy = dialog.querySelector('.onboarding-copy');
+        const footer = dialog.querySelector('.onboarding-bottom');
+        const visibleCopyNodes = [...copy.querySelectorAll('.onboarding-kicker,h2,p,.onboarding-benefit')];
+        return {
+          direction: getComputedStyle(dialog).direction,
+          documentDirection: document.documentElement.dir,
+          imageFit: getComputedStyle(image).objectFit,
+          imageLoaded: image.naturalWidth > 0 && image.naturalHeight > 0,
+          dialogBottom: dialog.getBoundingClientRect().bottom,
+          viewportHeight: window.innerHeight,
+          copyScroll: copy.scrollHeight - copy.clientHeight,
+          copyVisible: visibleCopyNodes.every(node => {
+            const box = node.getBoundingClientRect();
+            const copyBox = copy.getBoundingClientRect();
+            return box.top >= copyBox.top - 1 && box.bottom <= copyBox.bottom + 1;
+          }),
+          footerVisible: footer.getBoundingClientRect().bottom <= window.innerHeight + 1,
+        };
+      });
+      assert(firstOpenLayout.direction === firstOpenLayout.documentDirection, 'First-open onboarding does not follow the active RTL/LTR document direction.');
+      assert(firstOpenLayout.imageFit === 'contain' && firstOpenLayout.imageLoaded, 'First-open onboarding must show each full service image without cropping.');
+      assert(firstOpenLayout.dialogBottom <= firstOpenLayout.viewportHeight + 1 && firstOpenLayout.footerVisible, 'First-open onboarding extends below the phone viewport.');
+      assert(firstOpenLayout.copyScroll <= 1 && firstOpenLayout.copyVisible, 'First-open onboarding copy is clipped or requires hidden scrolling.');
+      await capture(page, `00a-first-open-onboarding-${step + 1}`, { fullPage: false });
+      if (step < expectedArtwork.length - 1) {
+        await page.locator('[data-action="onboardingNext"]').click();
+        await page.waitForFunction(expected => document.querySelector('.role-onboarding .onboarding-visual img')?.getAttribute('src')?.endsWith(expected), expectedArtwork[step + 1]);
+      }
+    }
     await page.locator('[data-action="skipOnboarding"]').click();
   }
   await capture(page, '00-entry');
+  const visitorAction = page.locator('[data-action="enterGuest"]');
+  assert(['زائر', 'Guest'].includes((await visitorAction.textContent()).trim()), 'The visitor action contains extra sign-in wording.');
+  assert(await visitorAction.locator('svg').count() === 1, 'The visitor eye icon was removed.');
+  const entryDirection = await page.locator('.access-horizon-stage').evaluate(stage => ({ stage: getComputedStyle(stage).direction, document: document.documentElement.dir }));
+  assert(entryDirection.stage === entryDirection.document, 'The entry screen does not follow the active RTL/LTR document direction.');
   if (IS_MOBILE && VIEWPORT_HEIGHT > 700) {
     const entryLayout = await page.locator('.access-stage').evaluate(card => {
       const cardBox = card.getBoundingClientRect();
       const utilities = card.querySelector('.access-utility')?.getBoundingClientRect();
       const trust = card.querySelector('.access-assurance')?.getBoundingClientRect();
+      const hero = card.querySelector('.access-horizon-hero');
+      const roleGrid = card.querySelector('.access-role-grid');
       return {
         cardHeight: cardBox.height,
         viewportHeight: window.innerHeight,
+        documentHeight: document.documentElement.scrollHeight,
+        documentWidth: document.documentElement.scrollWidth,
+        viewportWidth: window.innerWidth,
         topGap: utilities ? utilities.top - cardBox.top : 999,
         bottomGap: trust ? cardBox.bottom - trust.bottom : 999,
+        heroHeight: hero?.getBoundingClientRect().height || 0,
+        hasLocalHero: hero ? getComputedStyle(hero).backgroundImage.includes('nearby-services.webp') : false,
+        roleColumns: roleGrid ? getComputedStyle(roleGrid).gridTemplateColumns.split(' ').filter(Boolean).length : 0,
+        roleCount: card.querySelectorAll('.access-role-card').length,
+        roleMinHeight: Math.min(...[...card.querySelectorAll('.access-role-card')].map(item => item.getBoundingClientRect().height)),
       };
     });
     assert(entryLayout.cardHeight <= entryLayout.viewportHeight - 8, 'The mobile entry card extends beyond the usable screen height.');
     assert(entryLayout.topGap <= 32 && entryLayout.bottomGap <= 36, 'The mobile entry content leaves an excessive blank band at the top or bottom.');
+    assert(entryLayout.documentHeight <= entryLayout.viewportHeight + 1 && entryLayout.documentWidth <= entryLayout.viewportWidth + 1, 'The entry gateway creates viewport scrolling on mobile.');
+    assert(entryLayout.heroHeight >= 170 && entryLayout.hasLocalHero, 'The Oman Horizon hero is missing, too short, or not using the local optimized asset.');
+    assert(entryLayout.roleColumns === 2, 'The two entry roles must remain side by side on mobile.');
+    assert(entryLayout.roleCount === 2 && entryLayout.roleMinHeight >= 70, 'Entry role actions are missing or too small for touch.');
   }
 
   await page.locator('[data-action="openUserLogin"]').click();
@@ -350,14 +695,14 @@ async function clickProviderNav(page, tab) {
     assert(!IS_MOBILE && await page.locator('.app-top').isVisible(), 'Desktop sign-in reached neither onboarding nor the authenticated application.');
   }
   const onboardingSets = [
-    { role: 'user', slides: ['user-service', 'user-direct-request', 'user-matching', 'user-track'] },
-    { role: 'guest', slides: ['guest-browse', 'guest-compare', 'guest-signin', 'guest-privacy'] },
-    { role: 'provider', slides: ['provider-account-v2', 'provider-community-v2', 'provider-today-v2', 'provider-tasks-v2'] },
-    { role: 'company', slides: ['company-profile', 'company-dispatch', 'company-analytics', 'company-team'] },
-  ].map(set => ({ ...set, slides: set.slides.map(name => `assets/onboarding/core/${name}.webp`) }));
+    { role: 'user', slides: ['user-service', 'user-direct-request', 'user-matching', 'user-track'].map(name => `assets/onboarding/core/${name}.webp`) },
+    { role: 'guest', slides: ['assets/ads/campaigns/nearby-services.webp', 'assets/ads/campaigns/home-services.webp', 'assets/ads/campaigns/business-services.webp', 'assets/onboarding/core/guest-privacy.webp'] },
+    { role: 'provider', slides: ['provider-account-v2', 'provider-community-v2', 'provider-today-v2', 'provider-tasks-v2'].map(name => `assets/onboarding/core/${name}.webp`) },
+    { role: 'company', slides: ['company-profile', 'company-dispatch', 'company-analytics', 'company-team'].map(name => `assets/onboarding/core/${name}.webp`) },
+  ];
   for (const set of onboardingSets) {
     assert(set.slides.length === 4, `${set.role} onboarding must contain four focused steps.`);
-    assert(set.slides.every(src => /assets\/onboarding\/core\//.test(src)), `${set.role} onboarding is using an outdated image.`);
+    assert(set.slides.every(src => /assets\/(?:onboarding\/core|ads\/campaigns)\//.test(src)), `${set.role} onboarding is using an outdated image.`);
     assert(new Set(set.slides).size === set.slides.length, `${set.role} onboarding repeats the same artwork.`);
   }
   assert(new Set(onboardingSets.flatMap(set => set.slides)).size === 16, 'Every onboarding state must use its own artwork.');
@@ -394,7 +739,12 @@ async function clickProviderNav(page, tab) {
       target: 'user', targetId: 'ui-user', relatedId: 'ui-required-request', entityId: 'ui-required-request',
       actionKind: 'open_booking', actionRoute: 'user:request:ui-required-request', requiresAction: true,
       stateVersion: 1, priority: 'high', read: true, readAt: new Date().toISOString(), createdAt: new Date().toISOString(), _serverVerified: true,
-    }, ...(state.notifications || []).filter(item => item.id !== 'ui-required-action')];
+    }, {
+      id: 'ui-malformed-read', type: 'request', title: 'تحديث طلب', message: 'اختبار تأكيد قراءة الإشعار',
+      target: 'user', targetId: 'ui-user', relatedId: 'ui-malformed-request', entityId: 'ui-malformed-request',
+      actionKind: '', actionRoute: 'user:request:ui-malformed-request', requiresAction: false,
+      stateVersion: 1, priority: 'normal', read: false, createdAt: new Date().toISOString(), _serverVerified: true,
+    }, ...(state.notifications || []).filter(item => !['ui-required-action', 'ui-malformed-read'].includes(item.id))];
     sessionStorage.setItem(key, JSON.stringify(state));
   });
   const permissionSession = await browser.newBrowserCDPSession();
@@ -419,17 +769,26 @@ async function clickProviderNav(page, tab) {
   await page.locator('.request-modal [data-action="closeModal"]').click();
   await page.waitForTimeout(80);
   await page.locator('#actionPromptRoot [data-action="snoozeActionPrompt"]').click();
+  await page.waitForSelector('#actionPromptRoot .action-prompt-card', { state: 'detached' });
   assert(await page.locator('#actionPromptRoot .action-prompt-card').count() === 0, 'Later did not defer the current action prompt.');
   assert(await page.locator('.bottom-nav [data-view="tasks"] .nav-count').count(), 'Later incorrectly cleared the unresolved action badge.');
   await page.locator('.app-top [data-action="openNotifications"]').click();
   const requiredCard = page.locator('.notification-disclosure:has(summary[data-id="ui-required-action"])');
   assert(await requiredCard.count(), 'The deferred action disappeared from notification history.');
   assert(await requiredCard.locator('[data-action="deleteNotification"]').count() === 0, 'An unresolved required action can still be deleted.');
+  const malformedReadCard = page.locator('.notification-disclosure:has(summary[data-id="ui-malformed-read"])');
+  assert(await malformedReadCard.count(), 'The malformed-response notification fixture is missing.');
+  await malformedReadCard.locator('summary').click();
+  malformedApiResponses.add('/api/notifications/action');
+  await malformedReadCard.locator('[data-action="markNotificationRead"]').click();
+  await page.waitForTimeout(120);
+  assert(await malformedReadCard.locator('[data-action="markNotificationRead"]').count(), 'An incomplete notification 2xx response was treated as a confirmed read.');
+  malformedApiResponses.delete('/api/notifications/action');
   await page.locator('.notification-center-sheet [data-action="closeModal"]').click();
   await page.evaluate(() => {
     const key = 'KHADAMATI_PRIVATE_STATE_V1';
     const state = JSON.parse(sessionStorage.getItem(key) || '{}');
-    state.notifications = (state.notifications || []).filter(item => item.id !== 'ui-required-action');
+    state.notifications = (state.notifications || []).filter(item => !['ui-required-action', 'ui-malformed-read'].includes(item.id));
     sessionStorage.setItem(key, JSON.stringify(state));
     sessionStorage.removeItem('KHADAMATI_ACTION_PROMPT_SNOOZED_V1');
   });
@@ -471,18 +830,26 @@ async function clickProviderNav(page, tab) {
 
   assert((await page.locator('.clean-grid .category-tile').count()) <= 6, 'Home must show no more than six categories.');
   assert(await page.locator('main.view > .home-ad.ad-slider').count(), 'Advertisement slider must be the first home block.');
-  const adCopyFit = await page.locator('.home-ad.ad-slider').evaluate(ad => {
-    const copy = ad.querySelector('.ad-slider-copy');
-    if (!copy || copy.hidden) return true;
-    const adBox = ad.getBoundingClientRect();
-    const copyBox = copy.getBoundingClientRect();
-    const style = getComputedStyle(copy);
-    const alpha = Number(style.backgroundColor.match(/[\d.]+(?=\))/g)?.at(-1) || 1);
-    return copyBox.height <= adBox.height * 0.46
-      && copyBox.width <= adBox.width * 0.8
-      && alpha < 0.8;
-  });
-  assert(adCopyFit, 'Advertisement copy is oversized or hides too much of the image.');
+  const adSlideCount = Math.max(1, await page.locator('.home-ad.ad-slider .ad-dot').count());
+  await page.evaluate(() => clearInterval(window.__khadamatiAdTimer));
+  for (let slideIndex = 0; slideIndex < adSlideCount; slideIndex += 1) {
+    if (adSlideCount > 1) await page.locator('.home-ad.ad-slider .ad-dot').nth(slideIndex).click();
+    await page.waitForTimeout(25);
+    const adCopyFit = await page.locator('.home-ad.ad-slider').evaluate(ad => {
+      const copy = ad.querySelector('.ad-slider-copy');
+      if (!copy || copy.hidden) return { fits: true, hidden: true };
+      const adBox = ad.getBoundingClientRect();
+      const copyBox = copy.getBoundingClientRect();
+      const style = getComputedStyle(copy);
+      const alpha = Number(style.backgroundColor.match(/[\d.]+(?=\))/g)?.at(-1) || 1);
+      return {
+        fits: copyBox.height <= adBox.height * 0.46 && copyBox.width <= adBox.width * 0.8 && alpha < 0.8,
+        adWidth: Math.round(adBox.width), adHeight: Math.round(adBox.height),
+        copyWidth: Math.round(copyBox.width), copyHeight: Math.round(copyBox.height), alpha,
+      };
+    });
+    assert(adCopyFit.fits, `Advertisement ${slideIndex + 1} copy is oversized or hides too much of the image: ${JSON.stringify(adCopyFit)}`);
+  }
   assert((await page.locator('.popular-rail').count()) === 0, 'Popular services rail should be removed from home.');
   assert((await page.locator('.offline-sync-card').count()) === 0, 'Offline queue banner should not crowd the home page.');
   assert(await page.locator('.direct-request-card').count(), 'Direct request card is missing.');
@@ -672,11 +1039,11 @@ async function clickProviderNav(page, tab) {
   assert(await page.locator('.community-v3-tabs [data-value="board"]').count(), 'The merged request-board Community tab is missing.');
   assert(await page.locator('.community-card').count() === 1, 'Community package card is missing.');
   await capture(page, '08-community-user-packages', { fullPage: false });
-  await page.locator('[data-action="toggleLang"]:visible').first().click();
+  await chooseLanguage(page, 'en');
   assert(await page.locator('html').getAttribute('dir') === 'ltr', 'Community English mode did not switch to LTR.');
   assert(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth + 1), 'Community English mode overflows horizontally.');
   await capture(page, '08h-community-user-english', { fullPage: false });
-  await page.locator('[data-action="toggleLang"]:visible').first().click();
+  await chooseLanguage(page, 'ar');
   await page.evaluate(() => document.documentElement.dataset.theme = 'dark');
   await capture(page, '08i-community-user-dark', { fullPage: false });
   await page.evaluate(() => document.documentElement.dataset.theme = 'light');
@@ -870,6 +1237,9 @@ async function clickProviderNav(page, tab) {
   await page.locator('#regPhone').fill('91234567');
   await page.locator('#regAge').fill('30');
   await page.locator('#regNationality').fill('عماني');
+  assert(await page.locator('#regCommercialNo').getAttribute('required') !== null, 'Individual registration must require a professional licence or activity permit.');
+  await page.locator('#regCommercialNo').fill('IND-LIC-2468');
+  await page.locator('#regCredentialExpiry').fill('2028-12-31');
   await page.locator('#regPin').fill('2468');
   await page.locator('[data-action="providerRegistrationNext"]').click();
   assert(await page.locator('.provider-registration-flow[data-step="2"]').count(), 'Provider registration did not open its services stage.');
@@ -911,7 +1281,7 @@ async function clickProviderNav(page, tab) {
   assert(companyRowsAfter === Math.min(companyRowsBefore + 1, Math.max(0, companyLimit - 1)), 'Company add-service must reveal one field at a time while respecting its current plan.');
   await capture(page, '01e-provider-register');
   await page.locator('#modalRoot [data-action="closeModal"]').click();
-  await page.locator('[data-action="toggleLang"]').first().click();
+  await chooseLanguage(page, 'en');
   await page.locator('[data-action="openProviderAccess"][data-mode="register"]').click();
   while ((await page.locator('#providerRegisterForm').getAttribute('data-step')) !== '1') {
     await page.locator('[data-action="providerRegistrationBack"]').click();
@@ -922,7 +1292,7 @@ async function clickProviderNav(page, tab) {
   assert(!(await registrationHasArabic()), 'English company registration still contains Arabic interface labels.');
   assert(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth + 1), 'English provider registration overflows horizontally.');
   await page.locator('#modalRoot [data-action="closeModal"]').click();
-  await page.locator('[data-action="toggleLang"]').first().click();
+  await chooseLanguage(page, 'ar');
   await capture(page, '00f-provider-login', { fullPage: false });
   await page.locator('#loginPhone').fill('91234567');
   await page.locator('#loginOtp').fill('1234');
@@ -966,7 +1336,7 @@ async function clickProviderNav(page, tab) {
   assert(providerTopFits, 'Provider top bar overflows the mobile viewport.');
   assert(await page.locator('.provider-top-actions > *').evaluateAll(items => items.every(item => { const box = item.getBoundingClientRect(); return box.left >= -1 && box.right <= window.innerWidth + 1; })), 'A provider header control leaves the mobile viewport.');
   await capture(page, '02-provider-dashboard');
-  await page.locator('.provider-top-actions [data-action="toggleLang"]').click();
+  await chooseLanguage(page, 'en', '.provider-top-actions [data-action="toggleLang"]');
   await page.waitForTimeout(150);
   assert(await page.locator('html').getAttribute('dir') === 'ltr', 'Provider English mode did not switch to LTR.');
   assert(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth + 1), 'Provider English layout overflows horizontally.');
@@ -981,16 +1351,17 @@ async function clickProviderNav(page, tab) {
     assert(providerNavLabels.length === 5, 'Provider phone navigation must contain exactly five destinations.');
     assert(providerNavLabels.every(label => label.trim()), 'A provider phone navigation destination has no accessible label.');
   }
-  await page.locator('.provider-status-toggle').click();
-  await page.locator('.provider-status-toggle').click();
-  await page.locator('.provider-status-toggle').click();
+  for (let statusStep = 0; statusStep < 3; statusStep += 1) {
+    await page.locator('.provider-status-toggle').click();
+    await page.waitForTimeout(160);
+  }
   await page.locator('.provider-top-actions [data-action="openNotifications"]').click();
   await page.locator('[data-action="notificationCenterTab"][data-value="updates"]').click();
   assert(await page.locator('.notification-center-sheet').getByText(/Your card is visible to customers|Your card was temporarily paused/i).count(), 'Stored provider status notifications were not translated into English.');
   assert(await page.locator('.notification-center-sheet').getByText(/بطاقتك متاحة للعملاء|تم إيقاف بطاقتك مؤقتاً/i).count() === 0, 'Arabic system notification copy leaked into English mode.');
   await page.locator('[data-action="closeModal"]').click();
   await capture(page, '02a-provider-english');
-  await page.locator('.provider-top-actions [data-action="toggleLang"]').click();
+  await chooseLanguage(page, 'ar', '.provider-top-actions [data-action="toggleLang"]');
   await page.waitForTimeout(100);
   assert(await page.locator('html').getAttribute('dir') === 'rtl', 'Provider Arabic mode was not restored to RTL.');
   await clickFirstAction(page, 'openQuoteLibrary');
@@ -1040,7 +1411,12 @@ async function clickProviderNav(page, tab) {
   const customerModeAuth = await page.evaluate(() => JSON.parse(sessionStorage.getItem('KHADAMATI_AUTH_V3') || '{}'));
   assert(customerModeAuth.activeRole === 'user' && customerModeAuth.userToken === 'ui-user-token', 'Returning from provider mode did not restore the customer session.');
   await clickUserNav(page, 'myAccount');
-  assert(await page.locator('.requests-disclosure [data-action="compareRequestOffers"]').count(), 'Offer comparison action is missing from the current request summary.');
+  const offerComparisonCount = await page.locator('.requests-disclosure [data-action="compareRequestOffers"]').count();
+  const offerComparisonState = offerComparisonCount ? null : await page.evaluate(() => {
+    const state = JSON.parse(sessionStorage.getItem('KHADAMATI_PRIVATE_STATE_V1') || '{}');
+    return (state.customerRequests || []).map(request => ({ id: request.id, userId: request.userId, status: request.status, offersOpen: request.offersOpen, acceptedProviderId: request.acceptedProviderId, offers: (request.offers || []).map(offer => ({ id: offer.id, providerId: offer.providerId, status: offer.status })) }));
+  });
+  assert(offerComparisonCount, `Offer comparison action is missing from the current request summary: ${JSON.stringify(offerComparisonState)}`);
   await page.waitForTimeout(600);
   if (await page.locator('#modalRoot .modal-backdrop.show').count()) {
     assert(await page.locator('#modalRoot .notification-disclosure').count(), 'Unexpected modal blocked offer comparison.');
@@ -1279,8 +1655,23 @@ async function clickProviderNav(page, tab) {
   await page.locator('.chat-sheet [data-action="closeModalSoft"]').click();
   assert(await page.locator('.provider-workspace .conversation-page-list').count(), 'Closing a chat did not return to the provider conversation page.');
   await clickProviderNav(page, 'tasks');
+  await page.waitForTimeout(120);
+  const tasksNavigationState = await page.evaluate(() => ({
+    activeTab: document.querySelector('.provider-bottom-nav [aria-current="page"]')?.getAttribute('data-tab') || '',
+    activeJobsContainer: document.querySelectorAll('.provider-active-jobs').length,
+    modalClass: document.querySelector('#modalRoot .modal')?.className || '',
+    workspaceText: document.querySelector('.provider-workspace')?.textContent?.slice(0,180) || '',
+  }));
+  assert(tasksNavigationState.activeJobsContainer, `Provider tasks navigation did not render the jobs workspace: ${JSON.stringify(tasksNavigationState)}; browser errors: ${errors.join(' | ')}`);
   await dismissProviderSectionGuide(page, '06a-provider-tasks-guide');
-  assert(await page.locator('.provider-active-jobs .provider-task-card').count(), 'Accepted request is missing from provider active jobs.');
+  const providerActiveJobCount = await page.locator('.provider-active-jobs .provider-task-card').count();
+  const providerActiveJobState = providerActiveJobCount ? null : await page.evaluate(() => {
+    const state = JSON.parse(sessionStorage.getItem('KHADAMATI_PRIVATE_STATE_V1') || '{}');
+    let live = null;
+    try { live = eval('({view:S.view,providerTab:S.providerTab,currentProviderId:S.currentProviderId,providerIds:(S.providers||[]).map(p=>p.id),requests:(S.customerRequests||[]).map(r=>({id:r.id,status:r.status,acceptedProviderId:r.acceptedProviderId}))})'); } catch (_) {}
+    return { stored: { currentProviderId: state.currentProviderId, requests: (state.customerRequests || []).map(request => ({ id: request.id, status: request.status, acceptedProviderId: request.acceptedProviderId })) }, live, activeJobsContainer: document.querySelectorAll('.provider-active-jobs').length, workspaceText: document.querySelector('.provider-workspace')?.textContent?.slice(0,300) || '' };
+  });
+  assert(providerActiveJobCount, `Accepted request is missing from provider active jobs: ${JSON.stringify(providerActiveJobState)}`);
   assert(await page.locator('.provider-active-jobs [data-action="providerAcceptRequest"]').count() === 0, 'Provider can still submit an offer after being selected.');
   const completionActionCount = await page.locator('.provider-active-jobs [data-action="openCompletionEvidence"]').count();
   assert(completionActionCount === 1, `Provider active job must expose exactly one completion action (found ${completionActionCount}).`);
@@ -1302,6 +1693,12 @@ async function clickProviderNav(page, tab) {
   await clickProviderNav(page, 'profile');
   await dismissProviderSectionGuide(page, '06b-provider-account-guide');
   assert(await page.locator('.provider-space-title h1').filter({ hasText: /مساحتك|Your space/i }).count(), 'Provider account did not open the structured Your space page.');
+  const providerSpaceGroups = page.locator('.provider-space-group');
+  assert(await providerSpaceGroups.count() === 5, 'Your space must contain five focused collapsible sections.');
+  assert(await providerSpaceGroups.first().getAttribute('open') !== null, 'Provider account section must open by default.');
+  assert(await providerSpaceGroups.nth(1).getAttribute('open') === null, 'Provider business section must start collapsed to reduce visual clutter.');
+  await providerSpaceGroups.nth(1).locator(':scope > summary').click();
+  assert(await providerSpaceGroups.nth(1).getAttribute('open') !== null, 'Provider business section does not expand.');
   await page.locator('[data-action="openProviderProfileEditor"]').click();
   await page.waitForSelector('.provider-profile-edit-sheet');
   assert(await page.locator('#ppEmail').count(), 'Provider profile editor is missing email.');
@@ -1320,6 +1717,11 @@ async function clickProviderNav(page, tab) {
   await page.locator('#ppNationality').fill('عُماني');
   await page.locator('#ppCommercialNo').fill('UI-LIC-100');
   await page.locator('#ppDocs').setInputFiles(path.join(__dirname, '..', 'app-icon-192.png'));
+  malformedApiResponses.add('/api/provider/profile');
+  await page.locator('[data-action="saveProviderProfile"]').click();
+  await page.waitForTimeout(120);
+  assert(await page.locator('.provider-profile-edit-sheet').count(), 'An incomplete provider-profile 2xx response closed the editor as a confirmed save.');
+  malformedApiResponses.delete('/api/provider/profile');
   await page.locator('[data-action="saveProviderProfile"]').click();
   await page.waitForSelector('.provider-profile-edit-sheet', { state: 'detached' });
   assert(await page.locator('.provider-space').count(), 'Saving an individual provider profile did not return to Your space.');
@@ -1385,7 +1787,7 @@ async function clickProviderNav(page, tab) {
   await page.waitForSelector('[data-action="enterGuest"]');
   await page.locator('[data-action="enterGuest"]').click();
   if (await page.locator('.role-onboarding').count()) {
-    assert(/assets\/onboarding\/core\/guest-browse\.webp/.test(await page.locator('.role-onboarding .onboarding-visual img').getAttribute('src')), 'Guest onboarding did not open its dedicated artwork.');
+    assert(/assets\/ads\/campaigns\/nearby-services\.webp/.test(await page.locator('.role-onboarding .onboarding-visual img').getAttribute('src')), 'Guest onboarding did not open its dedicated Khadamati service artwork.');
     await page.locator('[data-action="skipOnboarding"]').click();
   }
   assert(await page.locator('.app-top [data-action="openNotifications"] .notification-badge').count() === 0, 'Guest must not inherit the previous user notification badge.');
@@ -1494,7 +1896,7 @@ async function clickProviderNav(page, tab) {
   await page.locator('[data-action="closeModal"]').click();
   await clickAdminTab(page, 'reports');
   assert(await page.locator('.report-command-bar').count(), 'The production reports command bar is missing.');
-  assert(await page.locator('.report-summary-grid .report-summary-card').count() === 4, 'Report decision summaries are incomplete.');
+  assert(await page.locator('.report-summary-grid .report-summary-card').count() === 6, 'Report decision summaries must include matching and first-offer metrics.');
   assert(await page.locator('[data-action="exportReportsCsv"]').count(), 'CSV export is missing from reports.');
   assert(await page.locator('[data-action="exportReportsWord"]').count(), 'Word export is missing from reports.');
   assert(await page.locator('[data-action="printReports"]').count(), 'Print/PDF export is missing from reports.');
@@ -1518,7 +1920,7 @@ async function clickProviderNav(page, tab) {
   assert(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth + 1), 'Platform administration overflows the mobile viewport.');
   await capture(page, '03b-admin-platform');
 
-  await page.locator('.topbar [data-action="toggleLang"]').click();
+  await chooseLanguage(page, 'en', '.topbar [data-action="toggleLang"]');
   assert(await page.locator('html').getAttribute('dir') === 'ltr', 'English mode did not switch the document to LTR.');
   assert(await page.locator('.brand').filter({ hasText: /Administration/i }).count(), 'English administration title is missing.');
   assert(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth), 'English layout overflows horizontally.');

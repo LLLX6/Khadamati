@@ -8,6 +8,8 @@ import math
 import os
 import platform
 from pathlib import Path
+
+from runtime_test_env import add_windows_crypto_shim
 import socket
 import subprocess
 import sys
@@ -94,6 +96,7 @@ def main() -> int:
             "KHADAMATI_SEED_SAMPLE_DATA": "false",
             }
         )
+        add_windows_crypto_shim(env, temp)
         process = subprocess.Popen(
             [sys.executable, "server.py"],
             cwd=ROOT,

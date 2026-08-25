@@ -3,27 +3,39 @@ services:
     name: khadamati-app-api
     repo: https://github.com/LLLX6/Khadamati
     runtime: python
-    plan: free
-    branch: main
-    autoDeployTrigger: commit
+    # Render persistent disks require a paid instance. Applying this Blueprint
+    # must remain an explicit owner-approved action; commits do not auto-deploy.
+    plan: starter
+    branch: release/production-readiness
+    autoDeployTrigger: off
     renderSubdomainPolicy: enabled
     buildCommand: pip install -r requirements.txt
     startCommand: python server.py
-    healthCheckPath: /healthz
+    healthCheckPath: /readyz
     envVars:
       - key: HOST
         value: 0.0.0.0
       - key: KHADAMATI_ENV
         value: production
       - key: KHADAMATI_RELEASE
-        value: v1.0.0
+        value: v1.3.1
       - key: KHADAMATI_SEED_SAMPLE_DATA
         value: false
       - key: KHADAMATI_PUBLIC_URL
         value: https://lllx6.github.io/Khadamati/
       - key: KHADAMATI_ALLOWED_ORIGINS
         value: https://lllx6.github.io
+      - key: KHADAMATI_DB_PATH
+        value: /var/data/khadamati/database/khadamati.sqlite3
+      - key: KHADAMATI_UPLOAD_DIR
+        value: /var/data/khadamati/uploads
+      - key: KHADAMATI_BACKUP_DIR
+        value: /var/data/khadamati/backups
       - key: KHADAMATI_ADMIN_CODE
+        sync: false
+      - key: KHADAMATI_REQUIRE_ADMIN_2FA
+        value: true
+      - key: KHADAMATI_ADMIN_2FA_KEY
         sync: false
       - key: KHADAMATI_ADMIN_EMAIL
         value: om.khadamati@gmail.com
@@ -31,6 +43,12 @@ services:
         sync: false
       - key: KHADAMATI_MEDIA_SIGNING_KEY
         sync: false
+      - key: VAPID_PRIVATE_KEY
+        sync: false
+      - key: VAPID_PUBLIC_KEY
+        sync: false
+      - key: VAPID_SUBJECT
+        value: mailto:om.khadamati@gmail.com
       - key: KHADAMATI_LOGIN_MAX_ATTEMPTS
         value: 5
       - key: KHADAMATI_LOGIN_LOCK_MINUTES
@@ -55,3 +73,7 @@ services:
         value: 1
       - key: KHADAMATI_SMTP_USE_SSL
         value: 0
+    disk:
+      name: khadamati-persistent-data
+      mountPath: /var/data/khadamati
+      sizeGB: 1

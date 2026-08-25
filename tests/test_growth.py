@@ -13,7 +13,7 @@ class _AllowedEntitlements:
     def __init__(self, *_args, **_kwargs):
         pass
 
-    def can_receive(self, _provider_id):
+    def can_receive(self, _provider_id, *, enforce_subscription=True):
         return True, "ok", {"planId": "foundation_12m"}
 
 
@@ -56,8 +56,8 @@ class KnownProviderInvitationTests(unittest.TestCase):
 
     @patch("khadamati_growth.EntitlementService", _AllowedEntitlements)
     @patch(
-        "khadamati_growth.RankingService.exact_service_match",
-        return_value=True,
+        "khadamati_growth.RequestMarketplace.provider_match_reason",
+        return_value="",
     )
     def test_existing_provider_is_attached_only_to_the_selected_request(self, _match):
         self.con.execute(

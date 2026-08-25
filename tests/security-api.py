@@ -14,6 +14,8 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
+from runtime_test_env import add_windows_crypto_shim
+
 
 ROOT = Path(__file__).resolve().parents[1]
 ADMIN_CODE = "Audit-Admin-4829"
@@ -91,6 +93,7 @@ def register_provider(base: str, admin_token: str, suffix: str):
                 "priceFrom": 8,
                 "note": "خدمة كهرباء منزلية دقيقة وموثوقة",
                 "hours": "الأحد: 8:00 ص - 8:00 م",
+                "availability": {"days": ["0", "1", "2", "3", "4", "5", "6"], "start": "00:00", "end": "23:59", "dailyCapacity": 2},
                 "documentsData": [TEST_PNG, TEST_PNG],
             },
         ),
@@ -132,6 +135,7 @@ def run():
                 "KHADAMATI_LOGIN_LOCK_MINUTES": "15",
             }
         )
+        add_windows_crypto_shim(env, temp)
         process = subprocess.Popen(
             [sys.executable, "server.py"], cwd=ROOT, env=env,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
@@ -347,7 +351,7 @@ def run():
                 assert error.code == 413, f"oversized body returned HTTP {error.code}"
 
             sw = (ROOT / "service-worker.js").read_text(encoding="utf-8")
-            assert "khadamati-app-shell-v1.1.0-booking-v2-r1" in sw
+            assert "khadamati-app-shell-v1.3.1-r1" in sw
             assert "./assets/styles/khadamati-v1.css" in sw
             assert "khadamati-v1.css" in sw
             page_source = (ROOT / "index.html").read_text(encoding="utf-8")
