@@ -155,8 +155,8 @@ def environment_flag(name, default=False):
 SERVER_VERSION = (
     os.environ.get("KHADAMATI_SERVER_VERSION")
     or os.environ.get("KHADAMATI_RELEASE")
-    or "1.3.0"
-).strip().removeprefix("v") or "1.3.0"
+    or "1.3.1"
+).strip().removeprefix("v") or "1.3.1"
 # Keep the historic release field as an alias while exposing one version
 # contract to health, readiness, bootstrap, and structured logs.
 APP_RELEASE = SERVER_VERSION
@@ -1284,6 +1284,50 @@ SEED_PROVIDERS = [
     },
 ]
 
+LAUNCH_SAMPLE_PROVIDER_CONFIRMATION = "RESTORE_LAUNCH_SAMPLE_PROVIDERS"
+LAUNCH_SAMPLE_PROVIDER_IMAGES = {
+    "p1": "assets/providers/omani-electrician.webp",
+    "p2": "assets/providers/omani-cleaning-team.webp",
+    "p3": "assets/providers/omani-ac-technician.webp",
+    "p4": "assets/providers/omani-moving-team.webp",
+    "p5": "assets/providers/omani-tech-technician.webp",
+    "p6": "assets/providers/omani-events-team.webp",
+    "p7": "assets/providers/omani-construction-team.webp",
+    "p8": "assets/providers/omani-car-technician.webp",
+    "p9": "assets/providers/omani-private-tutor.webp",
+    "p10": "assets/providers/omani-home-care.webp",
+    "p11": "assets/providers/omani-tailor.webp",
+    "p12": "assets/providers/omani-tech-company.webp",
+}
+LAUNCH_SAMPLE_PROVIDER_STATS = {
+    "p1": {"views": 162, "whatsapp": 74, "calls": 31},
+    "p2": {"views": 236, "whatsapp": 91, "calls": 43},
+    "p3": {"views": 83, "whatsapp": 28, "calls": 18},
+    "p4": {"views": 109, "whatsapp": 45, "calls": 20},
+    "p5": {"views": 74, "whatsapp": 26, "calls": 9},
+    "p6": {"views": 56, "whatsapp": 19, "calls": 7},
+    "p7": {"views": 144, "whatsapp": 53, "calls": 21},
+    "p8": {"views": 188, "whatsapp": 67, "calls": 28},
+    "p9": {"views": 92, "whatsapp": 31, "calls": 11},
+    "p10": {"views": 121, "whatsapp": 39, "calls": 16},
+    "p11": {"views": 49, "whatsapp": 14, "calls": 6},
+    "p12": {"views": 169, "whatsapp": 62, "calls": 24},
+}
+LAUNCH_SAMPLE_PROVIDER_EXTRA_SERVICES = {
+    "p1": [
+        {
+            "catId": "homecare", "serviceId": "appliances", "priceFrom": 7,
+            "active": True, "areas": ["السيب"],
+        }
+    ],
+    "p2": [
+        {
+            "catId": "cleaning", "serviceId": "sofa", "priceFrom": 8,
+            "active": True, "areas": ["مسقط"],
+        }
+    ],
+}
+
 
 SQL_IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 SQL_COLUMN_DEFINITION_RE = re.compile(
@@ -1322,6 +1366,209 @@ def demo_content_counts(con):
                 (f"{DEMO_ID_PREFIX}%",),
             ).fetchone()["n"]
         ),
+    }
+
+
+def launch_sample_provider_counts(con):
+    """Return the explicit launch-catalog state without enabling startup seeds."""
+    row = con.execute(
+        """SELECT COUNT(*) total,
+        SUM(CASE WHEN active=1 AND verified=1 AND status='available'
+          AND listing_enabled=1 AND request_enabled=1
+          AND lifecycle_state='active' THEN 1 ELSE 0 END) requestable
+        FROM providers WHERE launch_sample=1"""
+    ).fetchone()
+    return {
+        "total": int(row["total"] or 0),
+        "requestable": int(row["requestable"] or 0),
+    }
+
+
+def restore_launch_sample_providers(con, session=None):
+    """Restore the fixed 12-provider launch catalog after an explicit admin action.
+
+    This is deliberately separate from ``SAMPLE_DATA_ENABLED``: production never
+    receives fixtures at startup.  The trusted catalog is idempotent, visibly
+    labelled as sample data, and remains removable through the normal provider
+    lifecycle and anonymized-delete controls.
+    """
+    now = datetime.now(UTC)
+    start_date = now.date().isoformat()
+    end_date = (now + timedelta(days=365)).date().isoformat()
+    now_iso = now.isoformat()
+    created = 0
+    restored = 0
+    updated = 0
+    verification_service = ProviderVerificationService(con, now=now)
+
+    for seed in SEED_PROVIDERS:
+        provider_id = seed["id"]
+        existing = con.execute(
+            "SELECT lifecycle_state,status FROM providers WHERE id=?", (provider_id,)
+        ).fetchone()
+        if not existing:
+            created += 1
+        elif provider_lifecycle_state(existing) == "deleted":
+            restored += 1
+        else:
+            updated += 1
+
+        provider_type = seed.get("provider_type", "individual")
+        plan_id = PlanCatalog.compatible_id(
+            seed.get("package_id", ""), provider_type
+        )
+        coverage = list(dict.fromkeys(seed.get("areas", [])))
+        services = [dict(item) for item in seed.get("services", [])]
+        services.extend(
+            dict(item)
+            for item in LAUNCH_SAMPLE_PROVIDER_EXTRA_SERVICES.get(provider_id, [])
+        )
+        normalized_services = []
+        for item in services:
+            service = dict(item)
+            service_areas = []
+            for area in service.get("areas", []) or []:
+                if area == seed.get("gov"):
+                    service_areas.extend(coverage)
+                else:
+                    service_areas.append(area)
+            service["areas"] = list(dict.fromkeys(service_areas or coverage))
+            service["active"] = True
+            normalized_services.append(service)
+
+        parameters = {
+            "id": provider_id,
+            "name": seed["name"],
+            "phone": normalize_phone(seed["phone"]),
+            "gov": seed.get("gov", ""),
+            "wilayah": seed.get("wilayah", ""),
+            "governorates": jdump([seed.get("gov")] if seed.get("gov") else []),
+            "areas": jdump(coverage),
+            "bio": seed.get("bio", ""),
+            "hours": seed.get("hours", ""),
+            "featured": int(bool(seed.get("featured"))),
+            "package_id": plan_id,
+            "rating": float(seed.get("rating", 0) or 0),
+            "reviews": int(seed.get("reviews", 0) or 0),
+            "admin_note": "بيانات تجريبية للإطلاق؛ يمكن حذفها من إدارة المزودين.",
+            "card_image": LAUNCH_SAMPLE_PROVIDER_IMAGES.get(provider_id, ""),
+            "services": jdump(normalized_services),
+            "quality_score": max(60, min(98, round(float(seed.get("rating", 0) or 0) * 20))),
+            "response_score": 80,
+            "subscription_until": end_date,
+            "subscription_start": start_date,
+            "provider_type": provider_type,
+            "company_name": seed.get("company_name", ""),
+            "stats": jdump(
+                LAUNCH_SAMPLE_PROVIDER_STATS.get(
+                    provider_id, {"views": 0, "whatsapp": 0, "calls": 0}
+                )
+            ),
+            "primary_service_id": (
+                normalized_services[0].get("serviceId", "")
+                if normalized_services else ""
+            ),
+        }
+        con.execute(
+            """INSERT INTO providers(
+            id,name,phone,gov,wilayah,governorates,areas,bio,hours,status,
+            active,verified,featured,package_id,rating,reviews,admin_note,
+            image_path,card_image,pin_hash,services,work_images,documents,
+            quality_score,response_score,subscription_until,subscription_start,
+            provider_type,company_name,stats,listing_enabled,request_enabled,
+            subscription_state,primary_service_id,map_visible,deleted_at,
+            delete_reason,hidden_history,lifecycle_state,lifecycle_snapshot,
+            status_reason,suspended_at,archived_at,launch_sample)
+            VALUES(
+            :id,:name,:phone,:gov,:wilayah,:governorates,:areas,:bio,:hours,'available',
+            1,1,:featured,:package_id,:rating,:reviews,:admin_note,
+            '',:card_image,'',:services,'[]','[]',
+            :quality_score,:response_score,:subscription_until,:subscription_start,
+            :provider_type,:company_name,:stats,1,1,
+            'active',:primary_service_id,1,'',
+            '','[]','active','{}',
+            '','','',1)
+            ON CONFLICT(id) DO UPDATE SET
+            name=excluded.name,phone=excluded.phone,gov=excluded.gov,
+            wilayah=excluded.wilayah,governorates=excluded.governorates,
+            areas=excluded.areas,bio=excluded.bio,hours=excluded.hours,
+            status='available',active=1,verified=1,featured=excluded.featured,
+            package_id=excluded.package_id,rating=excluded.rating,
+            reviews=excluded.reviews,admin_note=excluded.admin_note,
+            image_path='',card_image=excluded.card_image,pin_hash='',
+            services=excluded.services,work_images='[]',documents='[]',
+            quality_score=excluded.quality_score,
+            response_score=excluded.response_score,
+            subscription_until=excluded.subscription_until,
+            subscription_start=excluded.subscription_start,
+            provider_type=excluded.provider_type,
+            company_name=excluded.company_name,stats=excluded.stats,
+            listing_enabled=1,request_enabled=1,subscription_state='active',
+            primary_service_id=excluded.primary_service_id,map_visible=1,
+            deleted_at='',delete_reason='',hidden_history='[]',
+            lifecycle_state='active',lifecycle_version=lifecycle_version+1,
+            lifecycle_snapshot='{}',status_reason='',suspended_at='',archived_at='',
+            launch_sample=1,updated_at=CURRENT_TIMESTAMP""",
+            parameters,
+        )
+
+        subscription_id = f"launch_sample_subscription_{provider_id}"
+        con.execute(
+            """INSERT INTO subscriptions(
+            id,provider_id,package_id,amount,status,start_date,end_date,note,
+            currency,grace_days,activated_at,grace_until,metadata,created_at,updated_at)
+            VALUES(?,?,?,0,'active',?,?,?,'OMR',14,?,?,?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)
+            ON CONFLICT(id) DO UPDATE SET
+            provider_id=excluded.provider_id,package_id=excluded.package_id,
+            amount=0,status='active',start_date=excluded.start_date,
+            end_date=excluded.end_date,note=excluded.note,currency='OMR',
+            grace_days=14,activated_at=excluded.activated_at,
+            grace_until=excluded.grace_until,metadata=excluded.metadata,
+            cancelled_at='',refunded_at='',payment_id='',
+            created_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP""",
+            (
+                subscription_id,
+                provider_id,
+                plan_id,
+                start_date,
+                end_date,
+                "اشتراك تجريبي بلا دفع لبيانات الإطلاق.",
+                now_iso,
+                (now + timedelta(days=379)).date().isoformat(),
+                jdump({"launchSample": True, "noPayment": True}),
+            ),
+        )
+
+        provider_row = con.execute(
+            "SELECT * FROM providers WHERE id=?", (provider_id,)
+        ).fetchone()
+        verification_service.ensure_case(provider_row)
+        con.execute(
+            """UPDATE provider_verification_cases SET status='verified',
+            level=?,identity_status='verified',entity_status=?,
+            activity_status='verified',expires_at='',managed=0,
+            reviewed_at=?,updated_at=CURRENT_TIMESTAMP WHERE provider_id=?""",
+            (
+                "business" if provider_type == "company" else "professional",
+                "verified" if provider_type == "company" else "not_applicable",
+                now_iso,
+                provider_id,
+            ),
+        )
+
+    counts = launch_sample_provider_counts(con)
+    log_audit(
+        con,
+        session,
+        "provider.launch_samples.restored",
+        "launch-sample-providers",
+        jdump({"created": created, "restored": restored, "updated": updated, **counts}),
+    )
+    return {
+        "created": created,
+        "restored": restored,
+        "updated": updated,
+        **counts,
     }
 
 
@@ -1611,6 +1858,7 @@ def init_db():
               latitude REAL, longitude REAL, location_updated_at TEXT DEFAULT '',
               map_visible INTEGER NOT NULL DEFAULT 1, primary_service_id TEXT DEFAULT '',
               before_after TEXT DEFAULT '[]', intro_video_url TEXT DEFAULT '',
+              launch_sample INTEGER NOT NULL DEFAULT 0,
               stats TEXT NOT NULL DEFAULT '{"views":0,"whatsapp":0,"calls":0}', created_at TEXT DEFAULT CURRENT_TIMESTAMP
             );
             CREATE TABLE IF NOT EXISTS provider_requests(
@@ -1923,6 +2171,7 @@ def init_db():
         ensure_column(con, "providers", "status_reason", "TEXT DEFAULT ''")
         ensure_column(con, "providers", "suspended_at", "TEXT DEFAULT ''")
         ensure_column(con, "providers", "archived_at", "TEXT DEFAULT ''")
+        ensure_column(con, "providers", "launch_sample", "INTEGER NOT NULL DEFAULT 0")
         con.execute(
             """UPDATE providers SET lifecycle_state=CASE
             WHEN status='deleted' OR COALESCE(deleted_at,'')!='' THEN 'deleted'
@@ -2406,6 +2655,7 @@ def row_provider(r, private=False, sign_private=False):
     d["listingEnabled"] = bool(d.pop("listing_enabled", True))
     d["requestEnabled"] = bool(d.pop("request_enabled", True))
     d["mapVisible"] = bool(d.pop("map_visible", True))
+    d["launchSample"] = bool(d.pop("launch_sample", False))
     d["primaryServiceId"] = d.pop("primary_service_id", "")
     d["subscriptionState"] = d.pop("subscription_state", "active") or "active"
     d["availability"] = jload(d.pop("availability", "{}"), {})
@@ -12976,6 +13226,7 @@ class Handler(SimpleHTTPRequestHandler):
             "/api/admin/providers": "manage_providers",
             "/api/admin/provider-status": "manage_providers",
             "/api/admin/provider-delete": "manage_providers",
+            "/api/admin/demo-providers": "manage_providers",
             "/api/admin/app-user": "manage_admins",
             "/api/admin/request-decision": "review_requests",
             "/api/admin/customer-request-action": "review_requests",
@@ -13012,6 +13263,20 @@ class Handler(SimpleHTTPRequestHandler):
         }:
             return self.commercial_record_post(path, data, session)
         with db() as con:
+            if path == "/api/admin/demo-providers":
+                action = safe_text(data.get("action", ""), 24)
+                confirmation = safe_text(data.get("confirm", ""), 80)
+                if action != "restore" or confirmation != LAUNCH_SAMPLE_PROVIDER_CONFIRMATION:
+                    return self.send_json({"error": "demo_provider_confirmation_required"}, 400)
+                summary = restore_launch_sample_providers(con, session)
+                providers = [
+                    row_provider(row, private=True)
+                    for row in con.execute(
+                        """SELECT * FROM providers
+                        ORDER BY featured DESC,quality_score DESC,rating DESC"""
+                    )
+                ]
+                return self.send_json({"ok": True, **summary, "providers": providers})
             if path == "/api/admin/verification":
                 provider_id = safe_text(data.get("providerId"), 120)
                 action = safe_text(data.get("action"), 40) or "get"

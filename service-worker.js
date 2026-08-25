@@ -1,5 +1,5 @@
 const CACHE_PREFIX = 'khadamati-app-shell-v';
-const CACHE_NAME = 'khadamati-app-shell-v1.3.0-r1';
+const CACHE_NAME = 'khadamati-app-shell-v1.3.1-r1';
 const INDEX_CACHE_KEY = './index.html';
 const LANGUAGE_CACHE_KEY = './.khadamati-language';
 const PRIVATE_PATH = /\/(?:api|media|uploads)(?:\/|$)/i;

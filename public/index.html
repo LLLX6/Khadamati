@@ -19,7 +19,7 @@
 <link rel="stylesheet" href="vendor/leaflet.css" />
 <script src="vendor/leaflet.js"></script>
 <title>خدماتي | Khadamati App</title>
-<link rel="stylesheet" href="assets/styles/khadamati-v1.css?v=1.3.0-r1" />
+<link rel="stylesheet" href="assets/styles/khadamati-v1.css?v=1.3.1-r1" />
 </head>
 <body>
 <div id="app" class="app-shell"><div class="startup-skeleton" aria-label="جاري تحميل خدماتي"><div class="skeleton-bar"></div><div class="skeleton-search"></div><div class="skeleton-banner"></div><div class="skeleton-grid"><i></i><i></i><i></i><i></i><i></i><i></i></div></div></div>
@@ -28,17 +28,17 @@
 <div id="actionPromptRoot" class="action-prompt-root" aria-live="polite"></div>
 <div id="loadingRoot" class="task-loading-root" aria-live="polite"></div>
 <div class="toast-wrap" id="toastRoot"></div>
-<script src="assets/scripts/khadamati-i18n-data.js?v=1.3.0-r1"></script>
-<script src="assets/scripts/khadamati-i18n.js?v=1.3.0-r1"></script>
-<script src="assets/scripts/khadamati-visuals.js?v=1.3.0-r1"></script>
-<script src="assets/scripts/khadamati-ui-state.js?v=1.3.0-r1"></script>
+<script src="assets/scripts/khadamati-i18n-data.js?v=1.3.1-r1"></script>
+<script src="assets/scripts/khadamati-i18n.js?v=1.3.1-r1"></script>
+<script src="assets/scripts/khadamati-visuals.js?v=1.3.1-r1"></script>
+<script src="assets/scripts/khadamati-ui-state.js?v=1.3.1-r1"></script>
 <script>
 (() => {
 'use strict';
 const STORAGE_KEY = 'KHADAMATI_MARKET_OS_V21';
 const PRIVATE_STATE_KEY = 'KHADAMATI_PRIVATE_STATE_V1';
 const APP_SCHEMA_VERSION = 71;
-const APP_VERSION = '1.3.0';
+const APP_VERSION = '1.3.1';
 const APP_BUILD = 'r1';
 const LEGACY_STORAGE_KEYS = ['KHADAMATI_MARKET_OS_V20','FORAN_MARKET_OS_V14'];
 const ONBOARDING_STORAGE_KEY = 'KHADAMATI_ONBOARDING_V4';
@@ -870,6 +870,7 @@ const SAMPLE_PROVIDER_IMAGES={
 };
 const LOCAL_DEMO_PROVIDER_MODE=location.protocol==='file:'||/^(localhost|127\.0\.0\.1)$/i.test(location.hostname);
 const LEGACY_DEMO_PROVIDER_IDS=new Set(Array.from({length:12},(_,index)=>`p${index+1}`));
+const isLaunchSampleProvider=provider=>!!(provider?.launchSample||provider?.launch_sample);
 function sampleProviderImage(id,name){if(SAMPLE_PROVIDER_IMAGES[id])return SAMPLE_PROVIDER_IMAGES[id];const [c1,c2,symbol]=SAMPLE_PROVIDER_ART[id]||['#164e63','#2dd4bf','خ'],initial=String(name||'خ').trim().slice(0,1),svg=`<svg xmlns="http://www.w3.org/2000/svg" width="720" height="720" viewBox="0 0 720 720"><defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1"><stop stop-color="${c1}"/><stop offset="1" stop-color="${c2}"/></linearGradient></defs><rect width="720" height="720" rx="54" fill="url(#g)"/><circle cx="570" cy="125" r="170" fill="#fff" opacity=".1"/><circle cx="135" cy="620" r="210" fill="#07131f" opacity=".12"/><rect x="110" y="112" width="500" height="496" rx="68" fill="#fff" opacity=".12" stroke="#fff" stroke-opacity=".34" stroke-width="4"/><text x="360" y="350" text-anchor="middle" font-family="Arial,Tahoma,sans-serif" font-size="150" font-weight="900" fill="#fff">${symbol}</text><text x="360" y="520" text-anchor="middle" font-family="Tahoma,Arial,sans-serif" font-size="110" font-weight="900" fill="#fff">${initial}</text></svg>`;return `data:image/svg+xml;charset=UTF-8,${encodeURIComponent(svg)}`;}
 const seedProviders = () => [
  {id:'p1',name:'سالم البلوشي',phone:'91234567',gov:'مسقط',wilayah:'السيب',areas:['السيب','بوشر'],bio:'تنفيذ أعمال الكهرباء المنزلية والصيانة الطارئة بدقة وتنظيم.',hours:'8:00 ص - 9:00 م',status:'available',active:true,verified:true,featured:true,packageId:'plus',subscriptionEnd:'2026-08-30',avatar:'س',rating:4.8,reviews:38,adminNote:'',stats:{views:162,whatsapp:74,calls:31},services:[{id:'ps1',catId:'homecare',serviceId:'electrician',priceFrom:5,active:true,areas:['السيب','بوشر']},{id:'ps2',catId:'homecare',serviceId:'appliances',priceFrom:7,active:true,areas:['السيب']} ]},
@@ -1132,7 +1133,7 @@ function migrateSubscriptionStorageV1(){
 }
 function mergeSeedProviders(existing=[]){
  const current=(existing||[]).map(p=>({...p,services:[...(p.services||[])],stats:{...(p.stats||{})}}));
- if(!LOCAL_DEMO_PROVIDER_MODE)return current.filter(provider=>!provider.sample&&!provider.demo&&!LEGACY_DEMO_PROVIDER_IDS.has(String(provider.id||'')));
+ if(!LOCAL_DEMO_PROVIDER_MODE)return current.filter(provider=>isLaunchSampleProvider(provider)||(!provider.sample&&!provider.demo&&!LEGACY_DEMO_PROVIDER_IDS.has(String(provider.id||''))));
  const byId=new Map(current.map(p=>[p.id,p]));
  seedProviders().forEach(seed=>{
   const old=byId.get(seed.id);
@@ -3972,6 +3973,7 @@ function providerContactActions(p){
  if(p.status==='unavailable')return `<button class="pill-btn" data-action="unavailableNotice">${L('المزود غير متاح حالياً','Provider is currently unavailable')}</button>`;
  if(!isRegisteredUser())return `<button class="pill-btn primary" data-action="openUserLogin">${L('سجّل الدخول للطلب','Sign in to request')}</button>`;
  const r=userAcceptedRequestForProvider(p.id),c=requestContactConsent(r),external=r?`${c.whatsapp?`<button class="pill-btn accent" data-action="requestWhatsapp" data-id="${r.id}">${tr('whatsapp')}</button>`:''}${c.call?`<button class="pill-btn" data-action="requestCall" data-id="${r.id}">${tr('call')}</button>`:''}`:'';
+ if(isLaunchSampleProvider(p))return r?`<button class="pill-btn primary" data-action="openRequestChat" data-id="${r.id}">${icon('chat')} ${L('المحادثة','Chat')}</button>`:`<button class="pill-btn primary provider-request-short" data-action="bookingForm" data-id="${p.id}">${icon('chat')} ${L('طلب','Request')}</button>`;
  return `${r?`<button class="pill-btn primary" data-action="openRequestChat" data-id="${r.id}">${icon('chat')} ${L('المحادثة','Chat')}</button><button class="pill-btn contact-control" data-action="manageRequestContact" data-id="${r.id}">${icon('shield')} ${L('خيارات التواصل','Contact choices')}</button>${external}`:`<button class="pill-btn primary provider-request-short" data-action="bookingForm" data-id="${p.id}">${icon('chat')} ${L('طلب','Request')}</button>`}`;
 }
 function contactConsentSheet(requestId){
@@ -4368,6 +4370,7 @@ function verificationCheckLabel(status='pending'){
  return ({pending:L('بانتظار المراجعة','Pending review'),verified:L('تم التحقق','Verified'),rejected:L('غير مقبول','Not accepted'),not_applicable:L('لا ينطبق','Not applicable')})[status]||verificationStatusLabel(status);
 }
 function providerVerification(p){
+ if(isLaunchSampleProvider(p))return {status:'sample',identityStatus:'not_applicable',entityStatus:'not_applicable',activityStatus:'not_applicable',providerKind:providerType(p),badge:{ar:'تجريبي',en:'Demo',hi:'प्रायोगिक',bn:'ডেমো',ur:'تجرباتی',tone:'pending'}};
  if(p?.verification?.status)return p.verification;
  const kind=providerType(p),verified=!!p?.verified;
  return {status:verified?'verified':'unverified',identityStatus:verified?'verified':'pending',entityStatus:kind==='company'?(verified?'verified':'pending'):'not_applicable',activityStatus:verified?'verified':'pending',providerKind:kind,badge:verified?{ar:kind==='company'?'تم التحقق من المنشأة والنشاط':'تم التحقق من الهوية والنشاط',en:kind==='company'?'Business and activity verified':'Identity and activity verified',tone:'success'}:{ar:'لم يكتمل التحقق',en:'Verification incomplete',tone:'neutral'}};
@@ -5372,14 +5375,14 @@ async function applyAdminProviderLifecycle(providerId,action,reason=''){
  save();closeModal();render();toast(action==='restore'?L('تمت استعادة المزود.','Provider restored.'):action==='archive'?L('نُقل المزود إلى الأرشيف.','Provider moved to archive.'):L('تم إيقاف المزود وإشعاره.','Provider suspended and notified.'));
 }
 function adminProviders(){
- const f=S.adminProviderFilter||{};let items=[...S.providers],q=normalizeSearchText(f.q||'');
+ const f=S.adminProviderFilter||{},sampleCount=S.providers.filter(p=>isLaunchSampleProvider(p)&&providerLifecycleState(p)!=='deleted').length;let items=[...S.providers].filter(p=>providerLifecycleState(p)!=='deleted'),q=normalizeSearchText(f.q||'');
  if(q)items=items.filter(p=>normalizeSearchText([p.name,p.companyName,p.phone,p.gov,p.wilayah,p.bio,p.commercialNo].join(' ')).includes(q));
  if(f.type)items=items.filter(p=>providerType(p)===f.type);
  if(f.status)items=items.filter(p=>['suspended','archived'].includes(f.status)?providerLifecycleState(p)===f.status:p.status===f.status);
  if(f.gov)items=items.filter(p=>p.gov===f.gov);if(f.featured==='yes')items=items.filter(p=>p.featured);if(f.package)items=items.filter(p=>p.packageId===f.package);if(f.service)items=items.filter(p=>(p.services||[]).some(s=>`${s.catId}|${s.serviceId}`===f.service));if(f.sub)items=items.filter(p=>subscriptionState(p).status===f.sub||(f.sub==='ending'&&subscriptionState(p).days<=30&&subscriptionState(p).status!=='expired'));
- return `<div class="section-head"><div><h2>${tr('manageProviders')}</h2><p>${items.length} ${L('مزودًا ضمن النتائج','providers in results')}</p></div></div><div class="admin-filter-wide"><input class="input" id="adminProviderQ" value="${esc(f.q||'')}" placeholder="${L('الاسم أو الهاتف أو رقم الترخيص','Name, phone, or licence number')}"><select class="select" id="adminProviderType"><option value="">${L('النوع','Type')}</option><option value="individual" ${f.type==='individual'?'selected':''}>${L('مزود فردي','Individual provider')}</option><option value="company" ${f.type==='company'?'selected':''}>${L('شركة','Company')}</option></select><select class="select" id="adminProviderStatus"><option value="">${L('الحالة','Status')}</option><option value="available" ${f.status==='available'?'selected':''}>${tr('available')}</option><option value="busy" ${f.status==='busy'?'selected':''}>${tr('busy')}</option><option value="unavailable" ${f.status==='unavailable'?'selected':''}>${tr('unavailable')}</option><option value="suspended" ${f.status==='suspended'?'selected':''}>${L('موقوف إدارياً','Suspended')}</option><option value="archived" ${f.status==='archived'?'selected':''}>${L('في الأرشيف','Archived')}</option></select><select class="select" id="adminProviderSub"><option value="">${L('الاشتراك','Subscription')}</option><option value="active" ${f.sub==='active'?'selected':''}>${L('نشط','Active')}</option><option value="ending" ${f.sub==='ending'?'selected':''}>${L('قريب الانتهاء','Ending soon')}</option><option value="expired" ${f.sub==='expired'?'selected':''}>${L('منتهي','Expired')}</option><option value="free" ${f.sub==='free'?'selected':''}>${L('فترة تأسيس','Foundation')}</option></select><select class="select" id="adminProviderPackage"><option value="">${L('الباقة','Plan')}</option>${S.packages.map(pkg=>`<option value="${pkg.id}" ${f.package===pkg.id?'selected':''}>${esc(loc(pkg))}</option>`).join('')}</select><select class="select" id="adminProviderService"><option value="">${L('الخدمة','Service')}</option>${allServicesOptions('',f.service||'')}</select><select class="select" id="adminProviderFeatured"><option value="">${L('التمييز','Promotion')}</option><option value="yes" ${f.featured==='yes'?'selected':''}>${L('مزود مميز','Featured provider')}</option></select><select class="select" id="adminProviderGov"><option value="">${tr('all')}</option>${govOptions(f.gov||'')}</select><button class="pill-btn primary" data-action="adminProviderFilter">${tr('search')}</button></div>${adminProviderRows(items)}`;
+ return `<section class="admin-demo-controls"><span>${icon('sparkle')}</span><div><b>${L('بيانات عرض معزولة','Isolated demo content')}</b><small>${L(`${sampleCount} عناصر اختبار قابلة للمسح دون لمس الحسابات الحقيقية.`,`${sampleCount} removable test items without touching real accounts.`)}</small></div><div class="row-actions"><button class="ghost-btn tiny" data-action="restoreLaunchSampleProviders">${L('إعادة التجهيز','Prepare')}</button></div></section><div class="section-head"><div><h2>${tr('manageProviders')}</h2><p>${items.length} ${L('مزودًا ضمن النتائج','providers in results')}</p></div></div><div class="admin-filter-wide"><input class="input" id="adminProviderQ" value="${esc(f.q||'')}" placeholder="${L('الاسم أو الهاتف أو رقم الترخيص','Name, phone, or licence number')}"><select class="select" id="adminProviderType"><option value="">${L('النوع','Type')}</option><option value="individual" ${f.type==='individual'?'selected':''}>${L('مزود فردي','Individual provider')}</option><option value="company" ${f.type==='company'?'selected':''}>${L('شركة','Company')}</option></select><select class="select" id="adminProviderStatus"><option value="">${L('الحالة','Status')}</option><option value="available" ${f.status==='available'?'selected':''}>${tr('available')}</option><option value="busy" ${f.status==='busy'?'selected':''}>${tr('busy')}</option><option value="unavailable" ${f.status==='unavailable'?'selected':''}>${tr('unavailable')}</option><option value="suspended" ${f.status==='suspended'?'selected':''}>${L('موقوف إدارياً','Suspended')}</option><option value="archived" ${f.status==='archived'?'selected':''}>${L('في الأرشيف','Archived')}</option></select><select class="select" id="adminProviderSub"><option value="">${L('الاشتراك','Subscription')}</option><option value="active" ${f.sub==='active'?'selected':''}>${L('نشط','Active')}</option><option value="ending" ${f.sub==='ending'?'selected':''}>${L('قريب الانتهاء','Ending soon')}</option><option value="expired" ${f.sub==='expired'?'selected':''}>${L('منتهي','Expired')}</option><option value="free" ${f.sub==='free'?'selected':''}>${L('فترة تأسيس','Foundation')}</option></select><select class="select" id="adminProviderPackage"><option value="">${L('الباقة','Plan')}</option>${S.packages.map(pkg=>`<option value="${pkg.id}" ${f.package===pkg.id?'selected':''}>${esc(loc(pkg))}</option>`).join('')}</select><select class="select" id="adminProviderService"><option value="">${L('الخدمة','Service')}</option>${allServicesOptions('',f.service||'')}</select><select class="select" id="adminProviderFeatured"><option value="">${L('التمييز','Promotion')}</option><option value="yes" ${f.featured==='yes'?'selected':''}>${L('مزود مميز','Featured provider')}</option></select><select class="select" id="adminProviderGov"><option value="">${tr('all')}</option>${govOptions(f.gov||'')}</select><button class="pill-btn primary" data-action="adminProviderFilter">${tr('search')}</button></div>${adminProviderRows(items)}`;
 }
-function adminCompanies(){const companies=S.providers.filter(p=>providerType(p)==='company');return `<div class="section-head"><div><h2>${L('الشركات','Companies')}</h2><p>${L('إدارة الشركات وفرقها وصلاحيات باقاتها.','Manage companies, teams, and plan permissions.')}</p></div></div>${adminProviderRows(companies)}`;}
+function adminCompanies(){const companies=S.providers.filter(p=>providerType(p)==='company'&&providerLifecycleState(p)!=='deleted');return `<div class="section-head"><div><h2>${L('الشركات','Companies')}</h2><p>${L('إدارة الشركات وفرقها وصلاحيات باقاتها.','Manage companies, teams, and plan permissions.')}</p></div></div>${adminProviderRows(companies)}`;}
 function providerRequestValidation(p){
  const issues=[],description=String(p?.bio||p?.note||'').trim(),words=wordCount(description);
  if(!(p?.commercialNo||p?.licenseNo))issues.push(L('رقم السجل أو الرخصة','Registration or licence number'));
@@ -6385,6 +6388,13 @@ async function onClick(e){ const el=e.target.closest('[data-action]'); if(!el)re
  if(a==='confirmAdminProviderDelete'){
   const reason=val('adminProviderDeleteReason').trim(),adminCode=val('adminProviderDeleteCode');if(reason.length<3){markInvalid('adminProviderDeleteReason',L('اكتب سبب الحذف.','Enter the deletion reason.'));return;}if(!adminCode){markInvalid('adminProviderDeleteCode',L('أدخل رمز الإدارة.','Enter the admin code.'));return;}
   const result=await api('/api/admin/provider-delete',{id,reason,adminCode,permanent:true},AUTH.adminToken,{skipQueue:true});if(result?.deleted!==true)throw new Error('invalid_server_response');await refreshAdminProviderState();closeModal();render();toast(L('تم حذف بيانات هوية المزود مع حفظ السجل.','Provider identity data was removed while preserving history.'));return;
+ }
+ if(a==='restoreLaunchSampleProviders'){
+  if(!AUTH.adminToken){showError(new Error('auth_required'));return;}
+  if(!confirm(`${L('إعادة التجهيز','Prepare')}؟`))return;
+  const result=await api('/api/admin/demo-providers',{action:'restore',confirm:'RESTORE_LAUNCH_SAMPLE_PROVIDERS'},AUTH.adminToken,{skipQueue:true});
+  if(result?.ok!==true||!Array.isArray(result.providers)||Number(result.requestable)!==12)throw new Error('invalid_server_response');
+  mergeRemote({providers:result.providers});save();render();operationStateToast('confirmed',{message:L('تم تجهيز بيانات العرض.','Demo content prepared.')});return;
  }
  if(a==='openActionPrompt'){const notification=(S.notifications||[]).find(item=>item.id===id);if(notification)await openNotificationTarget(notification,{fromPrompt:true});return;}
  if(a==='snoozeActionPrompt'){const notification=(S.notifications||[]).find(item=>item.id===id);if(!notification)return;try{const result=await syncNotificationUiAction(notification,'snooze',{snoozeMinutes:20});if(result?.notification)S.notifications=mergeNotificationRecords([{...result.notification,_serverVerified:true}]);const current=(S.notifications||[]).find(item=>item.id===notification.id)||notification;current.snoozedUntil=result?.notification?.snoozedUntil||new Date(Date.now()+20*60000).toISOString();hideActionPromptForSession(current);save();trackEvent('action_prompt_snoozed',{notificationId:notification.id,actionKind:inferredNotificationActionKind(notification)});renderActionPrompt();}catch(error){showError(error);}return;}

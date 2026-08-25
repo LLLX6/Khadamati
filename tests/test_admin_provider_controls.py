@@ -211,6 +211,81 @@ class AdminProviderControlTests(unittest.TestCase):
         self.assertEqual("[]", deleted["services"])
         self.assertTrue(deleted["phone"].startswith("deleted-"))
 
+    def test_launch_sample_catalog_is_explicit_idempotent_and_requestable(self):
+        self.assertEqual(
+            {"total": 0, "requestable": 0},
+            server.launch_sample_provider_counts(self.con),
+        )
+        first = server.restore_launch_sample_providers(self.con, self.session)
+        self.assertEqual(12, first["created"])
+        self.assertEqual(12, first["total"])
+        self.assertEqual(12, first["requestable"])
+
+        rows = self.con.execute(
+            """SELECT id,status,active,verified,listing_enabled,request_enabled,
+            lifecycle_state,launch_sample,card_image FROM providers
+            WHERE launch_sample=1 ORDER BY id"""
+        ).fetchall()
+        self.assertEqual(12, len(rows))
+        for row in rows:
+            self.assertEqual("available", row["status"])
+            self.assertEqual(1, row["active"])
+            self.assertEqual(1, row["verified"])
+            self.assertEqual(1, row["listing_enabled"])
+            self.assertEqual(1, row["request_enabled"])
+            self.assertEqual("active", row["lifecycle_state"])
+            self.assertEqual(1, row["launch_sample"])
+            self.assertTrue(row["card_image"].startswith("assets/providers/"))
+
+        service_total = sum(
+            len(json.loads(row["services"]))
+            for row in self.con.execute(
+                "SELECT services FROM providers WHERE launch_sample=1"
+            ).fetchall()
+        )
+        self.assertEqual(28, service_total)
+
+        for provider in self.con.execute(
+            "SELECT * FROM providers WHERE launch_sample=1"
+        ).fetchall():
+            self.assertTrue(
+                server.provider_eligibility(
+                    self.con, provider, receive_requests=True
+                )[0],
+                provider["id"],
+            )
+            self.assertTrue(
+                server.EntitlementService(self.con).for_provider(provider["id"])["allowed"],
+                provider["id"],
+            )
+
+        p1 = self.con.execute("SELECT * FROM providers WHERE id='p1'").fetchone()
+        self.assertEqual(2, len(json.loads(p1["services"])))
+
+        second = server.restore_launch_sample_providers(self.con, self.session)
+        self.assertEqual(0, second["created"])
+        self.assertEqual(12, second["updated"])
+        self.assertEqual(12, second["total"])
+
+        server.provider_lifecycle_transition(
+            self.con, self.session, "p1", "suspend", reason="اختبار الحذف"
+        )
+        server.provider_lifecycle_transition(
+            self.con, self.session, "p1", "archive", reason="اختبار الحذف"
+        )
+        server.anonymize_provider_account(self.con, "p1", reason="اختبار الحذف")
+        self.assertEqual(11, server.launch_sample_provider_counts(self.con)["requestable"])
+        deleted = self.con.execute("SELECT * FROM providers WHERE id='p1'").fetchone()
+        self.assertFalse(server.provider_eligibility(self.con, deleted, receive_requests=True)[0])
+        self.assertEqual(1, deleted["launch_sample"])
+        self.assertGreaterEqual(
+            self.con.execute(
+                """SELECT COUNT(*) n FROM audit_logs
+                WHERE action='provider.launch_samples.restored'"""
+            ).fetchone()["n"],
+            2,
+        )
+
     def test_admin_dispatch_notifies_but_never_accepts_for_customer(self):
         provider_id = self.provider()
         request_id = self.request()

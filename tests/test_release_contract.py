@@ -85,20 +85,20 @@ class ReleaseContractTests(unittest.TestCase):
                 render_version,
                 worker_version,
             },
-            {"1.3.0"},
+            {"1.3.1"},
         )
         self.assertEqual(index_build, "r1")
-        self.assertIn("khadamati-app-shell-v1.3.0-r1", text("service-worker.js"))
+        self.assertIn("khadamati-app-shell-v1.3.1-r1", text("service-worker.js"))
         self.assertIn("'./assets/scripts/khadamati-i18n-data.js'", text("service-worker.js"))
         self.assertIn("'./assets/scripts/khadamati-i18n.js'", text("service-worker.js"))
         self.assertIn("'./assets/scripts/khadamati-ui-state.js'", text("service-worker.js"))
         index_source = text("index.html")
         for asset in (
-            "assets/styles/khadamati-v1.css?v=1.3.0-r1",
-            "assets/scripts/khadamati-i18n-data.js?v=1.3.0-r1",
-            "assets/scripts/khadamati-i18n.js?v=1.3.0-r1",
-            "assets/scripts/khadamati-visuals.js?v=1.3.0-r1",
-            "assets/scripts/khadamati-ui-state.js?v=1.3.0-r1",
+            "assets/styles/khadamati-v1.css?v=1.3.1-r1",
+            "assets/scripts/khadamati-i18n-data.js?v=1.3.1-r1",
+            "assets/scripts/khadamati-i18n.js?v=1.3.1-r1",
+            "assets/scripts/khadamati-visuals.js?v=1.3.1-r1",
+            "assets/scripts/khadamati-ui-state.js?v=1.3.1-r1",
         ):
             with self.subTest(asset=asset):
                 self.assertIn(asset, index_source)

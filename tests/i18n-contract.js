@@ -40,7 +40,7 @@ for (const language of ['ar', 'en', 'hi', 'bn', 'ur']) {
   const manifest = JSON.parse(fs.readFileSync(path.join(root, name), 'utf8'));
   assert(manifest.lang === language, `${name} has the wrong language.`);
   assert(manifest.dir === (['ar', 'ur'].includes(language) ? 'rtl' : 'ltr'), `${name} has the wrong direction.`);
-  assert(manifest.version === '1.3.0', `${name} has the wrong release version.`);
+  assert(manifest.version === '1.3.1', `${name} has the wrong release version.`);
 }
 
 const indexSource = fs.readFileSync(path.join(root, 'index.html'), 'utf8');
