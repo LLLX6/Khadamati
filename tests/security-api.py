@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from http.client import HTTPConnection
 import json
 import os
 import socket
@@ -337,18 +338,21 @@ def run():
             )
             expect(http(base, "/api/provider/me", token=token_a), {401}, "inactive provider session")
 
-            oversized = b'{"value":"' + (b"a" * 1_100_000) + b'"}'
-            request = urllib.request.Request(
-                f"{base}/api/admin/login",
-                data=oversized,
-                headers={"Content-Type": "application/json", "Origin": "http://127.0.0.1:8080"},
-                method="POST",
-            )
+            # The server rejects an oversized Content-Length before reading the
+            # body. Sending the entire payload can race its 413 response and
+            # produce BrokenPipeError in the client; verify the early rejection.
+            connection = HTTPConnection("127.0.0.1", port, timeout=20)
             try:
-                urllib.request.urlopen(request, timeout=20)
-                raise AssertionError("oversized JSON body was accepted")
-            except urllib.error.HTTPError as error:
-                assert error.code == 413, f"oversized body returned HTTP {error.code}"
+                connection.putrequest("POST", "/api/admin/login")
+                connection.putheader("Content-Type", "application/json")
+                connection.putheader("Origin", "http://127.0.0.1:8080")
+                connection.putheader("Content-Length", "1100012")
+                connection.endheaders()
+                response = connection.getresponse()
+                assert response.status == 413, f"oversized body returned HTTP {response.status}"
+                assert json.loads(response.read())["error"] == "request_too_large"
+            finally:
+                connection.close()
 
             sw = (ROOT / "service-worker.js").read_text(encoding="utf-8")
             assert "khadamati-app-shell-v1.3.1-r1" in sw

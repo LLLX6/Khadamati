@@ -3855,7 +3855,12 @@ def deliver_push(target_kind, target_id, payload):
         subscription_info = jload(subscription["subscription_json"], {})
         try:
             validate_push_endpoint(subscription_info.get("endpoint", ""))
-        except DomainError:
+        except DomainError as err:
+            if err.code == "push_endpoint_unresolvable":
+                # A temporary DNS failure must not permanently unsubscribe the
+                # device. Leave the binding active and let the outbox retry.
+                transient_failure = True
+                continue
             with db() as con:
                 con.execute(
                     """UPDATE push_subscription_bindings SET active=0,
