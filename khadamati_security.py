@@ -13,6 +13,7 @@ import hmac
 import json
 import secrets
 import struct
+import unicodedata
 from typing import Any
 from urllib.parse import quote
 
@@ -113,6 +114,12 @@ class AdminTwoFactorService:
         candidate = "".join(ch for ch in str(code or "") if ch.isdigit())
         if len(candidate) != self.DIGITS:
             return False
+        try:
+            # Arabic and other decimal keyboards must compare as ASCII, which
+            # compare_digest requires for strings. Reject superscripts, etc.
+            candidate = "".join(str(unicodedata.decimal(ch)) for ch in candidate)
+        except ValueError:
+            return False
         return any(
             hmac.compare_digest(
                 candidate,
@@ -203,11 +210,18 @@ class AdminTwoFactorService:
         if recovery_hash not in hashes:
             return False
         hashes.remove(recovery_hash)
-        self.con.execute(
-            "UPDATE admin_users SET recovery_codes=? WHERE id=?",
-            (json.dumps(hashes), admin_row["id"]),
+        updated = self.con.execute(
+            """UPDATE admin_users SET recovery_codes=?
+            WHERE id=? AND active=1 AND two_factor_enabled=1
+            AND recovery_codes=? AND two_factor_secret=?""",
+            (
+                json.dumps(hashes), admin_row["id"], admin_row["recovery_codes"],
+                admin_row["two_factor_secret"],
+            ),
         )
-        return True
+        # A parallel login or reset may have changed this snapshot. Never
+        # restore consumed codes or authenticate a second use of the same code.
+        return updated.rowcount == 1
 
     @staticmethod
     def public_status(admin_row) -> dict[str, Any]:

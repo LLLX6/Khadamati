@@ -21,7 +21,11 @@ except ModuleNotFoundError:
 
 def safe_archive_name(name: str) -> bool:
     path = PurePosixPath(name)
-    return bool(name) and not path.is_absolute() and ".." not in path.parts
+    return (
+        bool(name) and not path.is_absolute() and ".." not in path.parts
+        and "\\" not in name and ":" not in name
+        and path.as_posix() == name.rstrip("/")
+    )
 
 
 def sha256_bytes(value: bytes) -> str:
@@ -48,14 +52,34 @@ def restore_backup(
         names = archive.namelist()
         if any(not safe_archive_name(name) for name in names):
             raise ValueError("unsafe_archive_path")
+        if len(names) != len(set(names)):
+            raise ValueError("duplicate_archive_entry")
         if "manifest.json" not in names or "database.sqlite3" not in names:
             raise ValueError("backup_required_entry_missing")
         manifest = json.loads(archive.read("manifest.json").decode("utf-8"))
+        if not isinstance(manifest, dict):
+            raise ValueError("backup_manifest_invalid")
         if manifest.get("format") != FORMAT:
             raise ValueError("unsupported_backup_format")
         entries = manifest.get("entries")
         if not isinstance(entries, dict):
             raise ValueError("backup_manifest_invalid")
+        archived_files = {info.filename for info in archive.infolist() if not info.is_dir()}
+        if archived_files != set(entries) | {"manifest.json"}:
+            raise ValueError("backup_entries_mismatch")
+        for name, expected in entries.items():
+            if (
+                not safe_archive_name(name)
+                or not (name == "database.sqlite3" or name.startswith("uploads/"))
+                or not isinstance(expected, dict)
+                or type(expected.get("bytes")) is not int
+                or expected["bytes"] < 0
+                or not isinstance(expected.get("sha256"), str)
+                or len(expected["sha256"]) != 64
+            ):
+                raise ValueError("backup_manifest_invalid")
+            if archive.getinfo(name).file_size != expected["bytes"]:
+                raise ValueError("backup_entry_size_mismatch")
 
         with tempfile.TemporaryDirectory(
             prefix="khadamati-restore-", dir=database_target.parent

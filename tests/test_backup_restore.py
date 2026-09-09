@@ -1,8 +1,10 @@
+import json
 import sqlite3
 import subprocess
 import sys
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
 
 from scripts.backup_sqlite import create_backup
@@ -65,6 +67,45 @@ class BackupRestoreTests(unittest.TestCase):
             with self.assertRaises(FileExistsError):
                 restore_backup(archive, existing)
             self.assertEqual(b"do-not-overwrite", existing.read_bytes())
+
+    def test_restore_rejects_incomplete_or_inconsistent_archives(self):
+        with tempfile.TemporaryDirectory(prefix="khadamati-backup-integrity-") as temp:
+            root = Path(temp)
+            database = root / "source.sqlite3"
+            with sqlite3.connect(database) as con:
+                con.execute("CREATE TABLE sample(id INTEGER)")
+            uploads = root / "source-uploads"
+            uploads.mkdir()
+            (uploads / "evidence.txt").write_bytes(b"important test attachment")
+            archive = root / "good.zip"
+            create_backup(database, archive, uploads)
+            with zipfile.ZipFile(archive) as original:
+                contents = {name: original.read(name) for name in original.namelist()}
+
+            for scenario in ("missing_upload", "unlisted_upload", "wrong_size", "duplicate_entry"):
+                with self.subTest(scenario=scenario):
+                    altered = dict(contents)
+                    manifest = json.loads(altered["manifest.json"])
+                    if scenario == "missing_upload":
+                        del altered["uploads/evidence.txt"]
+                    elif scenario == "unlisted_upload":
+                        del manifest["entries"]["uploads/evidence.txt"]
+                    elif scenario == "wrong_size":
+                        manifest["entries"]["uploads/evidence.txt"]["bytes"] += 1
+                    altered["manifest.json"] = json.dumps(manifest).encode("utf-8")
+                    broken = root / f"{scenario}.zip"
+                    with zipfile.ZipFile(broken, "w") as target:
+                        for name, data in altered.items():
+                            target.writestr(name, data)
+                        if scenario == "duplicate_entry":
+                            with self.assertWarns(UserWarning):
+                                target.writestr("uploads/evidence.txt", altered["uploads/evidence.txt"])
+                    restored = root / f"{scenario}.sqlite3"
+                    restored_uploads = root / f"{scenario}-uploads"
+                    with self.assertRaises(ValueError):
+                        restore_backup(broken, restored, restored_uploads)
+                    self.assertFalse(restored.exists())
+                    self.assertFalse(restored_uploads.exists())
 
     def test_restore_script_supports_direct_invocation(self):
         result = subprocess.run(
