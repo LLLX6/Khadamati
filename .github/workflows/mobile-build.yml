@@ -1,0 +1,98 @@
+name: Native mobile build
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mobile-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  web-contract:
+    name: Native bridge and bundled UI
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            mobile/package-lock.json
+      - run: npm ci
+      - run: npm ci --prefix mobile
+      - run: npm audit --prefix mobile --audit-level=high
+      - run: npm run build --prefix mobile
+      - run: npm test --prefix mobile
+      - run: npx playwright install --with-deps chromium
+      - name: Verify native UI integration with isolated API responses
+        run: node tests/native-ui.js
+
+  android:
+    name: Android APK and unsigned AAB
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: mobile/package-lock.json
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - uses: gradle/actions/setup-gradle@v4
+      - run: npm ci --prefix mobile
+      - run: npm run sync --prefix mobile
+      - name: Build internal APK and unsigned release bundle
+        working-directory: mobile/android
+        run: ./gradlew --no-daemon assembleDebug bundleRelease lintDebug
+      - uses: actions/upload-artifact@v4
+        with:
+          name: khadamati-android-internal-${{ github.sha }}
+          if-no-files-found: error
+          retention-days: 14
+          path: |
+            mobile/android/app/build/outputs/apk/debug/*.apk
+            mobile/android/app/build/outputs/bundle/release/*.aab
+            mobile/android/app/build/reports/lint-results-debug.html
+
+  ios:
+    name: iOS simulator build
+    runs-on: macos-26
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: mobile/package-lock.json
+      - run: npm ci --prefix mobile
+      - run: npm run sync --prefix mobile
+      - run: xcodebuild -version
+      - name: Build iOS without distribution credentials
+        working-directory: mobile
+        run: >-
+          xcodebuild -project ios/App/App.xcodeproj -scheme App
+          -configuration Debug -sdk iphonesimulator
+          -destination 'generic/platform=iOS Simulator'
+          -derivedDataPath ios/DerivedData
+          CODE_SIGNING_ALLOWED=NO build
+      - name: Package simulator app
+        working-directory: mobile
+        run: ditto -c -k --sequesterRsrc --keepParent ios/DerivedData/Build/Products/Debug-iphonesimulator/App.app ios/khadamati-ios-simulator.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: khadamati-ios-simulator-${{ github.sha }}
+          path: mobile/ios/khadamati-ios-simulator.zip
+          if-no-files-found: error
+          retention-days: 14
