@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { approvedApiBase, createGeolocationAdapter, externalHttpsUrl, safeFilename } from '../src/native-helpers.mjs';
+import { approvedApiBase, createGeolocationAdapter, externalHttpsUrl, safeFilename, shareDirectoryId } from '../src/native-helpers.mjs';
 
 test('mobile configuration rejects credentials, cleartext, query strings, and local-only APIs', () => {
   assert.equal(approvedApiBase('https://khadamati-app-api.onrender.com/'), 'https://khadamati-app-api.onrender.com');
@@ -52,4 +52,10 @@ test('location permission failures remain failures and never create fake coordin
 test('Android approximate location permission is sufficient', async () => {
   const adapter = createGeolocationAdapter({ async checkPermissions() { return { location: 'prompt', coarseLocation: 'granted' }; } });
   assert.equal(await adapter.permissionState(), 'granted');
+});
+
+test('file sharing supports WebViews without crypto.randomUUID', () => {
+  const oldCrypto = { getRandomValues(bytes) { return bytes.fill(7); } };
+  const id = shareDirectoryId(oldCrypto, 1789012800000);
+  assert.match(id, /^1789012800000-[a-f0-9]{32}$/);
 });

@@ -23,6 +23,12 @@ export function safeFilename(value) {
     .replace(/[\\/\u0000-\u001f\u007f]/g, '_').replace(/^\.+/, '_').slice(0, 160) || 'khadamati-file';
 }
 
+export function shareDirectoryId(cryptoApi = globalThis.crypto, timestamp = Date.now()) {
+  // getRandomValues also works in supported WebViews predating randomUUID.
+  const bytes = cryptoApi.getRandomValues(new Uint8Array(16));
+  return `${timestamp}-${Array.from(bytes, value => value.toString(16).padStart(2, '0')).join('')}`;
+}
+
 function locationError(error) {
   const codes = { OS_PLUG_GLOC_0003: 1, OS_PLUG_GLOC_0007: 2, OS_PLUG_GLOC_0010: 3 };
   return { code: codes[error?.code] || error?.code || 2, message: error?.message || 'position_unavailable' };

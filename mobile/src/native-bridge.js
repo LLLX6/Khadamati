@@ -4,7 +4,7 @@ import { Browser } from '@capacitor/browser';
 import { Filesystem, Directory } from '@capacitor/filesystem';
 import { Geolocation } from '@capacitor/geolocation';
 import { Share } from '@capacitor/share';
-import { createGeolocationAdapter, externalHttpsUrl, safeFilename } from './native-helpers.mjs';
+import { createGeolocationAdapter, externalHttpsUrl, safeFilename, shareDirectoryId } from './native-helpers.mjs';
 
 if (Capacitor.isNativePlatform()) {
   const apiBase = __KHADAMATI_MOBILE_API__;
@@ -40,7 +40,7 @@ if (Capacitor.isNativePlatform()) {
       throw new Error('share_file_too_large');
     }
     sharing = true;
-    const shareDirectory = `${cacheDirectory}/${Date.now()}-${crypto.randomUUID()}`;
+    const shareDirectory = `${cacheDirectory}/${shareDirectoryId()}`;
     try {
       await initialCleanup;
       const paths = [];
