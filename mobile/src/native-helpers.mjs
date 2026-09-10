@@ -11,7 +11,7 @@ export function approvedApiBase(value) {
 
 export function externalHttpsUrl(value, origin) {
   try {
-    const url = new URL(value, origin);
+    const url = new URL(value, origin === 'null' ? undefined : origin);
     return url.protocol === 'https:' && !url.username && !url.password && url.origin !== origin ? url.href : null;
   } catch {
     return null;

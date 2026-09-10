@@ -11,6 +11,7 @@ test('mobile configuration rejects credentials, cleartext, query strings, and lo
 
 test('external browser accepts HTTPS destinations and keeps local files out of it', () => {
   assert.equal(externalHttpsUrl('https://wa.me/96890000000', 'capacitor://localhost'), 'https://wa.me/96890000000');
+  assert.equal(externalHttpsUrl('https://wa.me/96890000000', 'null'), 'https://wa.me/96890000000');
   for (const url of ['javascript:alert(1)', 'file:///private/key', 'http://example.com', 'https://user:secret@example.com', 'https://localhost/profile', '/assets/file.pdf']) {
     assert.equal(externalHttpsUrl(url, 'https://localhost'), null);
   }
