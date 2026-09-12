@@ -275,7 +275,7 @@ function readStoredAuth(){
 }
 const LEGACY_LOCAL_AUTH=safeJson(localStorage.getItem(AUTH_KEY),{});
 let AUTH = readStoredAuth();
-let ADMIN_LOGIN_FIRST_FACTOR='';
+let ADMIN_LOGIN_FIRST_FACTOR=null;
 let ADMIN_RECOVERY_CODES=[];
 let PROVIDER_INVITATION_TOKEN='';
 if(!AUTH.activeRole)AUTH.activeRole=AUTH.adminToken?'admin':AUTH.providerToken?'provider':AUTH.userToken?'user':'';
@@ -5713,7 +5713,7 @@ function removeRegistrationSubserviceRow(button){
 }
 function openAdminLogin(options={}){
  const mode=options.mode||'email';
- if(mode==='email'||mode==='password')ADMIN_LOGIN_FIRST_FACTOR='';
+ if(mode==='email'||mode==='password')ADMIN_LOGIN_FIRST_FACTOR=null;
  const title=mode==='emailVerify'?L('رمز البريد','Email code'):mode==='verify'?L('التحقق بخطوتين','Two-step verification'):mode==='setup'?L('حماية حساب الإدارة','Protect the admin account'):tr('adminLogin');
  let body='';
  if(mode==='email'){
@@ -5730,6 +5730,7 @@ function openAdminLogin(options={}){
  openModal(`<div class="modal"><div class="modal-head"><div class="modal-title">${title}</div><button class="close-btn" data-action="closeModal">×</button></div><div class="modal-body admin-auth-sheet">${body}</div></div>`);
 }
 async function activateAdminSession(res){
+ if(!res?.token)throw new Error('admin_2fa_required');
  applySessionResponse('admin',res,true);
  mergeRemote(await api('/api/admin/session',null,AUTH.adminToken));
  S.admin=true;S.view='admin';save();render();
@@ -5738,6 +5739,13 @@ function showAdminRecoveryCodes(codes=[]){
  ADMIN_RECOVERY_CODES=(codes||[]).map(String).filter(Boolean);
  const rows=ADMIN_RECOVERY_CODES.map(code=>`<code>${esc(code)}</code>`).join('');
  openModal(`<div class="modal"><div class="modal-head"><div class="modal-title">${L('رموز الاسترداد','Recovery codes')}</div></div><div class="modal-body admin-auth-sheet"><div class="trust-callout warning"><b>${L('احفظ هذه الرموز الآن','Save these codes now')}</b><span>${L('تظهر مرة واحدة فقط. كل رمز يعمل مرة واحدة عند فقدان تطبيق المصادقة.','They are shown once. Each code works once if you lose access to the authenticator app.')}</span></div><div class="admin-recovery-codes" dir="ltr">${rows}</div><button class="pill-btn" data-action="copyAdminRecoveryCodes">${icon('copy')} ${L('نسخ الرموز','Copy codes')}</button><button class="pill-btn primary" data-action="finishAdminTwoFactorSetup">${L('حفظتها، افتح الإدارة','I saved them, open admin')}</button></div></div>`);
+}
+async function continueAdminLogin(firstFactor,twoFactorCode=''){
+ const res=await api('/api/admin/login',{...firstFactor,twoFactorCode,deviceId:DEVICE_ID});
+ if(res.twoFactorRequired){ADMIN_LOGIN_FIRST_FACTOR=firstFactor;openAdminLogin({mode:'verify'});return;}
+ ADMIN_LOGIN_FIRST_FACTOR=null;
+ if(res.twoFactorSetupRequired){openAdminLogin({mode:'setup',challengeId:res.challengeId,secret:res.secret,uri:res.uri});return;}
+ await activateAdminSession(res);closeModal();render();
 }
 async function handleAdminAuthenticationAction(action){
  if(!['requestAdminEmailCode','adminEmailLogin','useAdminPassword','restartAdminLogin','copyAdminTwoFactorSecret','copyAdminRecoveryCodes','finishAdminTwoFactorSetup','confirmAdminTwoFactorSetup','adminLogin'].includes(action))return false;
@@ -5758,12 +5766,11 @@ async function handleAdminAuthenticationAction(action){
   const emailCode=val('adminEmailCode');
   if(!/^\d{6}$/.test(emailCode)){markInvalid('adminEmailCode',L('أدخل الرمز المكون من 6 أرقام.','Enter the 6-digit code.'));return true;}
   try{
-   const res=await api('/api/admin/login',{emailChallengeId:val('adminEmailChallengeId'),emailCode,deviceId:DEVICE_ID});
-   await activateAdminSession(res);closeModal();render();
+   await continueAdminLogin({emailChallengeId:val('adminEmailChallengeId'),emailCode});
   }catch(err){showError(err);}
   return true;
  }
- if(action==='restartAdminLogin'){ADMIN_LOGIN_FIRST_FACTOR='';openAdminLogin();return true;}
+ if(action==='restartAdminLogin'){ADMIN_LOGIN_FIRST_FACTOR=null;openAdminLogin();return true;}
  if(action==='copyAdminTwoFactorSecret'){
   const secret=document.getElementById('adminTwoFactorSecret')?.textContent||'';
   try{await navigator.clipboard.writeText(secret);toast(L('تم نسخ مفتاح الإعداد.','Setup key copied.'));}catch(_){toast(L('تعذر النسخ تلقائيًا. اضغط مطولًا على المفتاح لنسخه.','Automatic copy failed. Press and hold the key to copy it.'));}
@@ -5773,21 +5780,18 @@ async function handleAdminAuthenticationAction(action){
   try{await navigator.clipboard.writeText(ADMIN_RECOVERY_CODES.join('\n'));toast(L('تم نسخ رموز الاسترداد.','Recovery codes copied.'));}catch(_){toast(L('تعذر النسخ تلقائيًا.','Automatic copy failed.'));}
   return true;
  }
- if(action==='finishAdminTwoFactorSetup'){ADMIN_LOGIN_FIRST_FACTOR='';ADMIN_RECOVERY_CODES=[];closeModal();render();return true;}
+ if(action==='finishAdminTwoFactorSetup'){ADMIN_LOGIN_FIRST_FACTOR=null;ADMIN_RECOVERY_CODES=[];closeModal();render();return true;}
  if(action==='confirmAdminTwoFactorSetup'){
   try{
    const res=await api('/api/admin/2fa/setup',{challengeId:val('adminTwoFactorChallenge'),code:val('adminTwoFactorCode'),deviceId:DEVICE_ID});
-   await activateAdminSession(res);ADMIN_LOGIN_FIRST_FACTOR='';showAdminRecoveryCodes(res.recoveryCodes||[]);
+   await activateAdminSession(res);ADMIN_LOGIN_FIRST_FACTOR=null;showAdminRecoveryCodes(res.recoveryCodes||[]);
   }catch(err){showError(err);}
   return true;
  }
  try{
-  const firstFactor=val('adminCode')||ADMIN_LOGIN_FIRST_FACTOR;
+  const adminCode=val('adminCode'),firstFactor=adminCode?{code:adminCode}:ADMIN_LOGIN_FIRST_FACTOR;
   if(!firstFactor){markInvalid('adminCode',L('أدخل رمز الإدارة.','Enter the admin code.'));return true;}
-  const res=await api('/api/admin/login',{code:firstFactor,twoFactorCode:val('adminTwoFactorCode'),deviceId:DEVICE_ID});
-  if(res.twoFactorRequired){ADMIN_LOGIN_FIRST_FACTOR=firstFactor;openAdminLogin({mode:'verify'});return true;}
-  if(res.twoFactorSetupRequired){ADMIN_LOGIN_FIRST_FACTOR='';openAdminLogin({mode:'setup',challengeId:res.challengeId,secret:res.secret,uri:res.uri});return true;}
-  ADMIN_LOGIN_FIRST_FACTOR='';await activateAdminSession(res);closeModal();render();
+  await continueAdminLogin(firstFactor,val('adminTwoFactorCode'));
  }catch(err){toast(String(err?.message||err)==='request_failed'?L('يتطلب دخول الإدارة اتصالًا بالخادم.','Admin sign-in requires a server connection.'):niceError(err));}
  return true;
 }
@@ -5832,7 +5836,7 @@ function openModal(html,options={}){
  localizeStaticDom();
  queueMicrotask(renderActionPrompt);
 }
-function closeModal(options={}){const resumePending=options?.resumePending!==false;if(document.getElementById('userRegistrationFlow'))persistUserRegistrationDraft();ADMIN_LOGIN_FIRST_FACTOR='';stopRequestChatPolling();if(CHAT_RECORDER?.state==='recording')stopChatRecording();if(CHAT_AUDIO_PREVIEW_URL)URL.revokeObjectURL(CHAT_AUDIO_PREVIEW_URL);CHAT_AUDIO_PREVIEW_URL='';CHAT_AUDIO_DATA='';CHAT_IMAGE_DATA='';CHAT_IMAGE_PROMISE=null;CHAT_IMAGE_CAPTION='';stopMapLocationWatch();destroyLeafletMaps();MODAL_STACK.length=0;document.getElementById('modalRoot').innerHTML='';document.body.classList.remove('onboarding-open','modal-chat-open');unlockModalPage();setTimeout(()=>{renderActionPrompt();if(resumePending)resumePendingNotificationTarget();},30);}
+function closeModal(options={}){const resumePending=options?.resumePending!==false;if(document.getElementById('userRegistrationFlow'))persistUserRegistrationDraft();ADMIN_LOGIN_FIRST_FACTOR=null;stopRequestChatPolling();if(CHAT_RECORDER?.state==='recording')stopChatRecording();if(CHAT_AUDIO_PREVIEW_URL)URL.revokeObjectURL(CHAT_AUDIO_PREVIEW_URL);CHAT_AUDIO_PREVIEW_URL='';CHAT_AUDIO_DATA='';CHAT_IMAGE_DATA='';CHAT_IMAGE_PROMISE=null;CHAT_IMAGE_CAPTION='';stopMapLocationWatch();destroyLeafletMaps();MODAL_STACK.length=0;document.getElementById('modalRoot').innerHTML='';document.body.classList.remove('onboarding-open','modal-chat-open');unlockModalPage();setTimeout(()=>{renderActionPrompt();if(resumePending)resumePendingNotificationTarget();},30);}
 function closeModalLayer(){
  const root=document.getElementById('modalRoot'),imagePreview=root?.querySelector('.chat-image-preview-sheet');
  if(imagePreview&&!imagePreview.classList.contains('is-confirmed'))clearChatImageAttachment();
