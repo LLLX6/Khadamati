@@ -84,6 +84,7 @@ const ACCOUNT_SYNC = {inFlight:null,controller:null,context:'',sequence:0,lastCo
 const NOTIFICATION_READ_IN_FLIGHT = new Map();
 const MAP_INSTANCES = new Map();
 let MAP_WATCH_ID = null;
+let NATIVE_APP_ACTIVE = true;
 const REVERSE_LOCATION_CACHE = new Map();
 let REVERSE_LOCATION_CONTROLLER = null;
 let REVERSE_LOCATION_TIMER = null;
@@ -274,7 +275,7 @@ function readStoredAuth(){
 }
 const LEGACY_LOCAL_AUTH=safeJson(localStorage.getItem(AUTH_KEY),{});
 let AUTH = readStoredAuth();
-let ADMIN_LOGIN_FIRST_FACTOR='';
+let ADMIN_LOGIN_FIRST_FACTOR=null;
 let ADMIN_RECOVERY_CODES=[];
 let PROVIDER_INVITATION_TOKEN='';
 if(!AUTH.activeRole)AUTH.activeRole=AUTH.adminToken?'admin':AUTH.providerToken?'provider':AUTH.userToken?'user':'';
@@ -367,6 +368,7 @@ async function initializePersistentSessions(){
 }
 const DEFAULT_REMOTE_API='https://khadamati-app-api.onrender.com';
 function apiBase(){
+ if(window.KhadamatiNative)return window.KhadamatiNative.apiBase;
  const configured=String(localStorage.getItem('KHADAMATI_API_BASE')||window.KHADAMATI_API_BASE||'').replace(/\/+$/,'');
  if(['https://khadamati.onrender.com','https://faoran.onrender.com','https://khadamati-app.onrender.com'].includes(configured)){
   localStorage.setItem('KHADAMATI_API_BASE',DEFAULT_REMOTE_API);
@@ -948,7 +950,7 @@ version:APP_SCHEMA_VERSION,lang:'ar',theme:'light',view:'entry',lastView:'home',
  finance:[],expenses:[],sponsors:[],coupons:[]
 });
 function serverApiAvailable(){
-  return /^https?:$/.test(location.protocol) && (!!apiBase() || !/(^|\.)github\.io$/i.test(location.hostname));
+  return !!window.KhadamatiNative || (/^https?:$/.test(location.protocol) && (!!apiBase() || !/(^|\.)github\.io$/i.test(location.hostname)));
 }
 const PRIVATE_STATE_FIELDS=['users','providerRequests','complaints','interactionBlocks','subscriptions','payments','leads','auditLogs','customerRequests','marketplaceRequests','serviceAssets','notifications','providerTeam','providerBranches','supportNotes','activityEvents','financeEntries','finance','expenses','sponsors','sponsorships','coupons','guestVisits','offlineQueue','loginFailures','communityListings','communityFavorites','communityReports'];
 function scrubPrivateSessionState(state){
@@ -1288,6 +1290,7 @@ function rememberPushBinding(kind,subjectId,ready,reason=''){
  try{save();}catch(_){}return ready===true;
 }
 async function ensurePushBinding(kind=activeAuthKind(),subjectId=authSubjectForKind(kind)){
+ if(window.KhadamatiNative)return false;
  const token=tokenForKind(kind);if(!token||!subjectId||!('Notification' in window)||Notification.permission!=='granted'||!window.isSecureContext)return false;
  try{
   const reg=await currentServiceWorkerRegistration(true),keyResponse=await api('/api/push/public-key',null,'',{silentLoading:true,skipQueue:true}),publicKey=String(keyResponse?.publicKey||'');
@@ -1308,6 +1311,7 @@ async function disablePushBinding(kind,token=tokenForKind(kind),subjectId=authSu
   try{const reg=await currentServiceWorkerRegistration(false),subscription=await reg?.pushManager?.getSubscription();if(!subscription){rememberPushBinding(kind,subjectId,false,'disabled');return true;}const result=await api('/api/push/subscribe',{action:'unsubscribe',role:kind,subjectId,endpoint:subscription.endpoint},token,{silentLoading:true,skipQueue:true});if(result?.ok!==true)return false;rememberPushBinding(kind,subjectId,false,'disabled');return true;}catch(err){console.warn('Push binding removal pending',err);return false;}
 }
 async function requestDeviceNotifications({silent=false}={}){
+ if(window.KhadamatiNative)return false;
  if(!('Notification' in window))return false;
  const kind=activeAuthKind(),subjectId=authSubjectForKind(kind);if(!tokenForKind(kind)||!subjectId){if(!silent)toast(L('سجّل الدخول أولاً لربط الإشعارات بهذا الحساب.','Sign in first to link notifications to this account.'));return false;}
  const permission=Notification.permission==='default'?await Notification.requestPermission():Notification.permission;
@@ -1319,6 +1323,7 @@ async function requestDeviceNotifications({silent=false}={}){
  if(!silent)toast(L('لم يتم السماح بإشعارات الهاتف.','Phone notifications were not allowed.'));return false;
 }
 async function requestDeviceNotificationsOnce(){
+ if(window.KhadamatiNative)return false;
  if(!('Notification' in window)||!window.isSecureContext)return false;
  const kind=activeAuthKind(),subjectId=authSubjectForKind(kind);if(!tokenForKind(kind)||!subjectId)return false;
  const key='khadamati_notification_prompted_v1',prompted=localStorage.getItem(key);
@@ -2359,12 +2364,13 @@ function parseLocationText(text){
  const parts=String(text||'').match(/-?\d+(?:\.\d+)?/g)||[];return parts.length>=2?normalizeCoordinates({lat:parts[0],lng:parts[1]}):null;
 }
 function locationErrorMessage(error){const code=error?.code||error?.message;return code===1||code==='permission_denied'?L('تم رفض إذن الموقع. يمكنك تفعيله من إعدادات المتصفح.','Location permission was denied. You can enable it in browser settings.'):code===2||code==='position_unavailable'?L('تعذر الحصول على موقع دقيق. تأكد من تشغيل خدمة الموقع.','An accurate location is unavailable. Check that location services are on.'):code===3||code==='timeout'?L('استغرق تحديد الموقع وقتاً طويلاً. حاول في مكان مفتوح.','Location lookup timed out. Try again in an open area.'):L('تعذر تحديد الموقع الآن. حاول مرة أخرى.','Location could not be determined. Try again.');}
-async function geolocationPermissionState(){try{return (await navigator.permissions?.query({name:'geolocation'}))?.state||'prompt';}catch(_){return 'prompt';}}
+function deviceGeolocation(){return window.KhadamatiNative?.geolocation||navigator.geolocation;}
+async function geolocationPermissionState(){if(window.KhadamatiNative)return window.KhadamatiNative.geolocation.permissionState();try{return (await navigator.permissions?.query({name:'geolocation'}))?.state||'prompt';}catch(_){return 'prompt';}}
 function positionPoint(position){return {lat:Number(position.coords.latitude),lng:Number(position.coords.longitude),accuracy:Math.round(position.coords.accuracy||0),updatedAt:nowISO()};}
 function getLiveLocation(options={}){
  return new Promise((resolve,reject)=>{
-  if(!navigator.geolocation)return reject(new Error('unsupported'));
-  navigator.geolocation.getCurrentPosition(pos=>resolve(positionPoint(pos)),reject,{enableHighAccuracy:options.highAccuracy!==false,timeout:Number(options.timeout||18000),maximumAge:Number(options.maximumAge??15000)});
+  if(!deviceGeolocation())return reject(new Error('unsupported'));
+  deviceGeolocation().getCurrentPosition(pos=>resolve(positionPoint(pos)),reject,{enableHighAccuracy:options.highAccuracy!==false,timeout:Number(options.timeout||18000),maximumAge:Number(options.maximumAge??15000)});
  });
 }
 function applyLocationToFields(prefix,point){
@@ -2909,8 +2915,8 @@ async function openNotificationTarget(notification,{fromPrompt=false,skipServerF
  if(request){openUserRequest(request.id);return true;}S.view=['home','services','tasks','community','myAccount'].includes(legacyRoute)?legacyRoute:'tasks';save();render();return true;
 }
 function notificationPreferencesSheet(){
- const supported='Notification' in window,secure=window.isSecureContext,permission=supported?Notification.permission:'unsupported',enabled=supported&&permission==='granted'&&devicePushBindingReady();
- const body=!supported?L('هذا المتصفح لا يدعم إشعارات الهاتف.','This browser does not support phone notifications.'):!secure?L('تحتاج إشعارات الهاتف إلى اتصال آمن HTTPS.','Phone notifications require a secure HTTPS connection.'):permission==='denied'?L('تم حظر الإشعارات من المتصفح. اسمح بها من إعدادات الموقع في الهاتف ثم عد إلى هنا.','Notifications are blocked by the browser. Allow them in the site settings, then return here.'):enabled?L('إشعارات هاتفك مفعلة ومربوطة بهذا الحساب.','Phone notifications are enabled and linked to this account.'):permission==='granted'?L('إذن المتصفح موجود، لكن ربط الخادم بهذا الحساب لم يتأكد بعد.','Browser permission exists, but server binding for this account is not confirmed yet.'):L('فعّلها لتصلك تحديثات الطلبات والمحادثات المهمة.','Enable them to receive important request and chat updates.');
+ const supported=!window.KhadamatiNative&&'Notification' in window,secure=window.isSecureContext,permission=supported?Notification.permission:'unsupported',enabled=supported&&permission==='granted'&&devicePushBindingReady();
+ const body=window.KhadamatiNative?window.KhadamatiNative.notificationHint(S.lang):!supported?L('هذا المتصفح لا يدعم إشعارات الهاتف.','This browser does not support phone notifications.'):!secure?L('تحتاج إشعارات الهاتف إلى اتصال آمن HTTPS.','Phone notifications require a secure HTTPS connection.'):permission==='denied'?L('تم حظر الإشعارات من المتصفح. اسمح بها من إعدادات الموقع في الهاتف ثم عد إلى هنا.','Notifications are blocked by the browser. Allow them in the site settings, then return here.'):enabled?L('إشعارات هاتفك مفعلة ومربوطة بهذا الحساب.','Phone notifications are enabled and linked to this account.'):permission==='granted'?L('إذن المتصفح موجود، لكن ربط الخادم بهذا الحساب لم يتأكد بعد.','Browser permission exists, but server binding for this account is not confirmed yet.'):L('فعّلها لتصلك تحديثات الطلبات والمحادثات المهمة.','Enable them to receive important request and chat updates.');
  openModal(`<div class="modal sheet"><div class="modal-head"><div class="modal-title">${icon('bell')} ${L('إشعارات الهاتف','Phone notifications')}</div><button class="close-btn" data-action="closeModal">×</button></div><div class="modal-body"><div class="assistant-guidance">${icon(enabled?'shield':'bell')}<div><b>${enabled?L('مفعلة','Enabled'):L('إعداد الإشعارات','Notification setup')}</b><p class="muted" style="margin:4px 0 0">${body}</p></div></div>${supported&&secure&&!enabled&&permission!=='denied'?`<button class="pill-btn primary" data-action="enableDeviceNotifications" style="width:100%;margin-top:14px">${icon('bell')} ${L('تفعيل إشعارات الهاتف','Enable phone notifications')}</button>`:''}</div></div>`);
 }
 function bookingV2FeatureEnabled(){return S.bookingV2Enabled===true||S.appConfig?.bookingV2Enabled===true||S.platform?.bookingV2Enabled===true;}
@@ -3246,10 +3252,11 @@ async function saveCurrentAccountLocation(point,area=null){
  save();return S.user;
 }
 async function startMapLocationWatch(){
- if(MAP_WATCH_ID!=null||!navigator.geolocation||await geolocationPermissionState()!=='granted')return;
- MAP_WATCH_ID=navigator.geolocation.watchPosition(position=>{const point=positionPoint(position),previous=currentMapLocation();if(S.view==='provider'){const provider=getProvider(S.currentProviderId);if(provider)provider.location=point;}else S.user.location=point;updateMapLocationMarker(point);const moved=previous?distanceKmBetween(previous,point):null;if(Date.now()-MAP_LOCATION_SYNC_AT>120000&&(moved==null||moved>.05)){MAP_LOCATION_SYNC_AT=Date.now();void saveCurrentAccountLocation(point).catch(()=>{});}},()=>{}, {enableHighAccuracy:false,timeout:20000,maximumAge:30000});
+ if(MAP_WATCH_ID!=null||!deviceGeolocation()||document.hidden||!NATIVE_APP_ACTIVE||await geolocationPermissionState()!=='granted')return;
+ if(MAP_WATCH_ID!=null||document.hidden||!NATIVE_APP_ACTIVE)return;
+ MAP_WATCH_ID=deviceGeolocation().watchPosition(position=>{const point=positionPoint(position),previous=currentMapLocation();if(S.view==='provider'){const provider=getProvider(S.currentProviderId);if(provider)provider.location=point;}else S.user.location=point;updateMapLocationMarker(point);const moved=previous?distanceKmBetween(previous,point):null;if(Date.now()-MAP_LOCATION_SYNC_AT>120000&&(moved==null||moved>.05)){MAP_LOCATION_SYNC_AT=Date.now();void saveCurrentAccountLocation(point).catch(()=>{});}},()=>{}, {enableHighAccuracy:false,timeout:20000,maximumAge:30000});
 }
-function stopMapLocationWatch(){if(MAP_WATCH_ID!=null&&navigator.geolocation){navigator.geolocation.clearWatch(MAP_WATCH_ID);MAP_WATCH_ID=null;}}
+function stopMapLocationWatch(){if(MAP_WATCH_ID!=null&&deviceGeolocation()){deviceGeolocation().clearWatch(MAP_WATCH_ID);MAP_WATCH_ID=null;}}
 function mapLegend(){return `<div class="map-provider-legend"><span><i></i>${L('مزود','Provider')}</span><span><i class="company-dot"></i>${L('شركة','Company')}</span><span><i class="user-dot"></i>${L('موقعك','Your location')}</span></div>`;}
 function liveMapHomeCard(){
  const point=normalizeCoordinates(S.user?.location);
@@ -5706,7 +5713,7 @@ function removeRegistrationSubserviceRow(button){
 }
 function openAdminLogin(options={}){
  const mode=options.mode||'email';
- if(mode==='email'||mode==='password')ADMIN_LOGIN_FIRST_FACTOR='';
+ if(mode==='email'||mode==='password')ADMIN_LOGIN_FIRST_FACTOR=null;
  const title=mode==='emailVerify'?L('رمز البريد','Email code'):mode==='verify'?L('التحقق بخطوتين','Two-step verification'):mode==='setup'?L('حماية حساب الإدارة','Protect the admin account'):tr('adminLogin');
  let body='';
  if(mode==='email'){
@@ -5723,6 +5730,7 @@ function openAdminLogin(options={}){
  openModal(`<div class="modal"><div class="modal-head"><div class="modal-title">${title}</div><button class="close-btn" data-action="closeModal">×</button></div><div class="modal-body admin-auth-sheet">${body}</div></div>`);
 }
 async function activateAdminSession(res){
+ if(!res?.token)throw new Error('admin_2fa_required');
  applySessionResponse('admin',res,true);
  mergeRemote(await api('/api/admin/session',null,AUTH.adminToken));
  S.admin=true;S.view='admin';save();render();
@@ -5731,6 +5739,13 @@ function showAdminRecoveryCodes(codes=[]){
  ADMIN_RECOVERY_CODES=(codes||[]).map(String).filter(Boolean);
  const rows=ADMIN_RECOVERY_CODES.map(code=>`<code>${esc(code)}</code>`).join('');
  openModal(`<div class="modal"><div class="modal-head"><div class="modal-title">${L('رموز الاسترداد','Recovery codes')}</div></div><div class="modal-body admin-auth-sheet"><div class="trust-callout warning"><b>${L('احفظ هذه الرموز الآن','Save these codes now')}</b><span>${L('تظهر مرة واحدة فقط. كل رمز يعمل مرة واحدة عند فقدان تطبيق المصادقة.','They are shown once. Each code works once if you lose access to the authenticator app.')}</span></div><div class="admin-recovery-codes" dir="ltr">${rows}</div><button class="pill-btn" data-action="copyAdminRecoveryCodes">${icon('copy')} ${L('نسخ الرموز','Copy codes')}</button><button class="pill-btn primary" data-action="finishAdminTwoFactorSetup">${L('حفظتها، افتح الإدارة','I saved them, open admin')}</button></div></div>`);
+}
+async function continueAdminLogin(firstFactor,twoFactorCode=''){
+ const res=await api('/api/admin/login',{...firstFactor,twoFactorCode,deviceId:DEVICE_ID});
+ if(res.twoFactorRequired){ADMIN_LOGIN_FIRST_FACTOR=firstFactor;openAdminLogin({mode:'verify'});return;}
+ ADMIN_LOGIN_FIRST_FACTOR=null;
+ if(res.twoFactorSetupRequired){openAdminLogin({mode:'setup',challengeId:res.challengeId,secret:res.secret,uri:res.uri});return;}
+ await activateAdminSession(res);closeModal();render();
 }
 async function handleAdminAuthenticationAction(action){
  if(!['requestAdminEmailCode','adminEmailLogin','useAdminPassword','restartAdminLogin','copyAdminTwoFactorSecret','copyAdminRecoveryCodes','finishAdminTwoFactorSetup','confirmAdminTwoFactorSetup','adminLogin'].includes(action))return false;
@@ -5751,12 +5766,11 @@ async function handleAdminAuthenticationAction(action){
   const emailCode=val('adminEmailCode');
   if(!/^\d{6}$/.test(emailCode)){markInvalid('adminEmailCode',L('أدخل الرمز المكون من 6 أرقام.','Enter the 6-digit code.'));return true;}
   try{
-   const res=await api('/api/admin/login',{emailChallengeId:val('adminEmailChallengeId'),emailCode,deviceId:DEVICE_ID});
-   await activateAdminSession(res);closeModal();render();
+   await continueAdminLogin({emailChallengeId:val('adminEmailChallengeId'),emailCode});
   }catch(err){showError(err);}
   return true;
  }
- if(action==='restartAdminLogin'){ADMIN_LOGIN_FIRST_FACTOR='';openAdminLogin();return true;}
+ if(action==='restartAdminLogin'){ADMIN_LOGIN_FIRST_FACTOR=null;openAdminLogin();return true;}
  if(action==='copyAdminTwoFactorSecret'){
   const secret=document.getElementById('adminTwoFactorSecret')?.textContent||'';
   try{await navigator.clipboard.writeText(secret);toast(L('تم نسخ مفتاح الإعداد.','Setup key copied.'));}catch(_){toast(L('تعذر النسخ تلقائيًا. اضغط مطولًا على المفتاح لنسخه.','Automatic copy failed. Press and hold the key to copy it.'));}
@@ -5766,21 +5780,18 @@ async function handleAdminAuthenticationAction(action){
   try{await navigator.clipboard.writeText(ADMIN_RECOVERY_CODES.join('\n'));toast(L('تم نسخ رموز الاسترداد.','Recovery codes copied.'));}catch(_){toast(L('تعذر النسخ تلقائيًا.','Automatic copy failed.'));}
   return true;
  }
- if(action==='finishAdminTwoFactorSetup'){ADMIN_LOGIN_FIRST_FACTOR='';ADMIN_RECOVERY_CODES=[];closeModal();render();return true;}
+ if(action==='finishAdminTwoFactorSetup'){ADMIN_LOGIN_FIRST_FACTOR=null;ADMIN_RECOVERY_CODES=[];closeModal();render();return true;}
  if(action==='confirmAdminTwoFactorSetup'){
   try{
    const res=await api('/api/admin/2fa/setup',{challengeId:val('adminTwoFactorChallenge'),code:val('adminTwoFactorCode'),deviceId:DEVICE_ID});
-   await activateAdminSession(res);ADMIN_LOGIN_FIRST_FACTOR='';showAdminRecoveryCodes(res.recoveryCodes||[]);
+   await activateAdminSession(res);ADMIN_LOGIN_FIRST_FACTOR=null;showAdminRecoveryCodes(res.recoveryCodes||[]);
   }catch(err){showError(err);}
   return true;
  }
  try{
-  const firstFactor=val('adminCode')||ADMIN_LOGIN_FIRST_FACTOR;
+  const adminCode=val('adminCode'),firstFactor=adminCode?{code:adminCode}:ADMIN_LOGIN_FIRST_FACTOR;
   if(!firstFactor){markInvalid('adminCode',L('أدخل رمز الإدارة.','Enter the admin code.'));return true;}
-  const res=await api('/api/admin/login',{code:firstFactor,twoFactorCode:val('adminTwoFactorCode'),deviceId:DEVICE_ID});
-  if(res.twoFactorRequired){ADMIN_LOGIN_FIRST_FACTOR=firstFactor;openAdminLogin({mode:'verify'});return true;}
-  if(res.twoFactorSetupRequired){ADMIN_LOGIN_FIRST_FACTOR='';openAdminLogin({mode:'setup',challengeId:res.challengeId,secret:res.secret,uri:res.uri});return true;}
-  ADMIN_LOGIN_FIRST_FACTOR='';await activateAdminSession(res);closeModal();render();
+  await continueAdminLogin(firstFactor,val('adminTwoFactorCode'));
  }catch(err){toast(String(err?.message||err)==='request_failed'?L('يتطلب دخول الإدارة اتصالًا بالخادم.','Admin sign-in requires a server connection.'):niceError(err));}
  return true;
 }
@@ -5825,7 +5836,7 @@ function openModal(html,options={}){
  localizeStaticDom();
  queueMicrotask(renderActionPrompt);
 }
-function closeModal(options={}){const resumePending=options?.resumePending!==false;if(document.getElementById('userRegistrationFlow'))persistUserRegistrationDraft();ADMIN_LOGIN_FIRST_FACTOR='';stopRequestChatPolling();if(CHAT_RECORDER?.state==='recording')stopChatRecording();if(CHAT_AUDIO_PREVIEW_URL)URL.revokeObjectURL(CHAT_AUDIO_PREVIEW_URL);CHAT_AUDIO_PREVIEW_URL='';CHAT_AUDIO_DATA='';CHAT_IMAGE_DATA='';CHAT_IMAGE_PROMISE=null;CHAT_IMAGE_CAPTION='';stopMapLocationWatch();destroyLeafletMaps();MODAL_STACK.length=0;document.getElementById('modalRoot').innerHTML='';document.body.classList.remove('onboarding-open','modal-chat-open');unlockModalPage();setTimeout(()=>{renderActionPrompt();if(resumePending)resumePendingNotificationTarget();},30);}
+function closeModal(options={}){const resumePending=options?.resumePending!==false;if(document.getElementById('userRegistrationFlow'))persistUserRegistrationDraft();ADMIN_LOGIN_FIRST_FACTOR=null;stopRequestChatPolling();if(CHAT_RECORDER?.state==='recording')stopChatRecording();if(CHAT_AUDIO_PREVIEW_URL)URL.revokeObjectURL(CHAT_AUDIO_PREVIEW_URL);CHAT_AUDIO_PREVIEW_URL='';CHAT_AUDIO_DATA='';CHAT_IMAGE_DATA='';CHAT_IMAGE_PROMISE=null;CHAT_IMAGE_CAPTION='';stopMapLocationWatch();destroyLeafletMaps();MODAL_STACK.length=0;document.getElementById('modalRoot').innerHTML='';document.body.classList.remove('onboarding-open','modal-chat-open');unlockModalPage();setTimeout(()=>{renderActionPrompt();if(resumePending)resumePendingNotificationTarget();},30);}
 function closeModalLayer(){
  const root=document.getElementById('modalRoot'),imagePreview=root?.querySelector('.chat-image-preview-sheet');
  if(imagePreview&&!imagePreview.classList.contains('is-confirmed'))clearChatImageAttachment();
@@ -6230,13 +6241,15 @@ function secretBrandTap(){
 }
 function searchFieldValue(id,fallback=''){const field=document.getElementById(id);return field?field.value:fallback;}
 function applySearch(){ const old=S.search||{};S.search={...old,q:searchFieldValue('fQuery',old.q||''),cat:old.cat||'',service:old.service||'',gov:searchFieldValue('fGov',old.gov||''),status:searchFieldValue('fStatus',old.status||''),minRating:Number(searchFieldValue('fMinRating',old.minRating||0)||0),maxPrice:Number(searchFieldValue('fMaxPrice',old.maxPrice||0)||0),sort:searchFieldValue('fSort',old.sort||'rating')||'rating'};addRecentSearch(S.search.q);const results=filterProviders(S.search);trackEvent('search',{query:S.search.q,cat:S.search.cat,gov:S.search.gov,results:results.length});if(S.search.q&&!results.length){const oldRow=(S.assistantSearches||[]).find(x=>x.key===normalizeSearchText(S.search.q));if(oldRow){oldRow.count=Number(oldRow.count||1)+1;oldRow.lastAt=nowISO();oldRow.found=false;}else S.assistantSearches.unshift({id:uid('as'),key:normalizeSearchText(S.search.q),query:S.search.q,count:1,createdAt:nowISO(),lastAt:nowISO(),serviceValue:'',serviceName:'',found:false});addNotification({type:'search',title:'بحث بلا نتائج',message:`لم يجد البحث نتيجة لعبارة: ${S.search.q}`,target:'admin',priority:'normal',actionText:'فتح البحث والمساعد',actionRoute:'assistant',dedupeKey:`no-search:${normalizeSearchText(S.search.q)}`});}save();render();}
-function download(name, content, type='text/plain'){ const a=document.createElement('a'); a.href=URL.createObjectURL(new Blob([content],{type})); a.download=name; a.click(); setTimeout(()=>URL.revokeObjectURL(a.href),1000); }
+function download(name, content, type='text/plain'){ if(window.KhadamatiNative)return window.KhadamatiNative.download(name,content,type).catch(err=>{if(err?.name!=='AbortError')showError(err);}); const a=document.createElement('a'); a.href=URL.createObjectURL(new Blob([content],{type})); a.download=name; a.click(); setTimeout(()=>URL.revokeObjectURL(a.href),1000); }
 async function downloadApiFile(path,filename){
  const res=await fetch(apiUrl(path),{headers:{Authorization:`Bearer ${AUTH.adminToken||''}`}});
  if(!res.ok)throw new Error((await res.json().catch(()=>({}))).error||'request_failed');
- const blob=await res.blob(),url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download=filename;a.click();setTimeout(()=>URL.revokeObjectURL(url),1200);
+ const blob=await res.blob();if(window.KhadamatiNative)return window.KhadamatiNative.download(filename,blob,blob.type);
+ const url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download=filename;a.click();setTimeout(()=>URL.revokeObjectURL(url),1200);
 }
 async function protectedDocument(src,downloadName=''){
+ if(window.KhadamatiNative){const source=/^\/(?:uploads|media)\//.test(String(src))?apiUrl(src):src;const response=await fetch(source,{headers:String(src).startsWith('data:')?{}:{Authorization:`Bearer ${AUTH.adminToken||''}`}});if(!response.ok)throw new Error('document_access_denied');const blob=await response.blob(),extension=({'application/pdf':'pdf','image/jpeg':'jpg','image/png':'png','image/webp':'webp'})[blob.type]||'bin';return window.KhadamatiNative.download(downloadName||`khadamati-document.${extension}`,blob,blob.type);}
  if(String(src).startsWith('data:')){const a=document.createElement('a');a.href=src;if(downloadName)a.download=downloadName;else a.target='_blank';a.click();return;}
  const source=/^\/(?:uploads|media)\//.test(String(src))?apiUrl(src):src;
  const res=await fetch(source,{headers:{Authorization:`Bearer ${AUTH.adminToken||''}`}});
@@ -7633,7 +7646,22 @@ document.addEventListener('change', e=>{
 window.addEventListener('resize',()=>positionTopSearchDropdown(document.querySelector('.global-search')),{passive:true});
 window.addEventListener('online',()=>{flushOfflineQueue().finally(()=>refreshActiveAccountData({reason:'online',force:true}));});
 document.addEventListener('visibilitychange',()=>{if(!document.hidden)refreshActiveAccountData({reason:'foreground',force:true});});
-if('serviceWorker' in navigator && /^https?:$/.test(location.protocol)){
+window.addEventListener('khadamati:native-state',event=>{
+ if(!window.KhadamatiNative)return;
+ NATIVE_APP_ACTIVE=event.detail?.isActive===true;
+ if(NATIVE_APP_ACTIVE){refreshActiveAccountData({reason:'foreground',force:true});if(document.querySelector('#modalRoot .live-map-full'))void startMapLocationWatch();}
+ else{stopMapLocationWatch();if(CHAT_RECORDER?.state==='recording')stopChatRecording();}
+});
+window.addEventListener('khadamati:native-back',event=>{
+ if(!window.KhadamatiNative)return;
+ if(IMAGE_EDITOR){event.preventDefault();closeImageEditor();return;}
+ if(MEDIA_VIEWER){event.preventDefault();closeMediaViewer();return;}
+ if(document.getElementById('drawerRoot')?.children.length){event.preventDefault();closeReportPreview();return;}
+ if(document.getElementById('modalRoot')?.children.length){event.preventDefault();const skip=document.querySelector('#modalRoot [data-action="skipOnboarding"]');if(skip)skip.click();else closeModalLayer();return;}
+ if(S.view==='provider'&&S.providerTab!=='home'){event.preventDefault();S.providerTab='home';save();render();return;}
+ if(!['entry','home','provider','admin'].includes(S.view)){event.preventDefault();S.view='home';save();render();window.scrollTo({top:0});}
+});
+if(!window.KhadamatiNative && 'serviceWorker' in navigator && /^https?:$/.test(location.protocol)){
  const refreshKey=`${APP_BUILD}:reloaded`;
  const freshRequested=new URLSearchParams(location.search).has('fresh');
  if(freshRequested&&window.caches) caches.keys().then(keys=>Promise.all(keys.filter(k=>k.startsWith('khadamati-')).map(k=>caches.delete(k)))).catch(()=>{});

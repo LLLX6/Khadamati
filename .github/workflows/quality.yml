@@ -68,6 +68,8 @@ jobs:
         run: npx playwright install --with-deps chromium
       - name: Check JavaScript syntax
         run: npm run check:js
+      - name: Admin authentication regression tests
+        run: npm run test:admin-auth
       - name: Five-language contract and mobile flow
         run: npm run test:i18n
       - name: Responsive UI smoke matrix

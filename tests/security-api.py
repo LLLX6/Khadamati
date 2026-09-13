@@ -6,6 +6,7 @@ from http.client import HTTPConnection
 import json
 import os
 import socket
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -292,7 +293,7 @@ def run():
                 http(
                     base,
                     "/api/user/profile",
-                    {"name": "مستخدم أمني", "location": {"lat": 23.6, "lng": 58.2}, "avatarData": TEST_PNG},
+                    {"name": "مستخدم أمني", "email": "delete-test@example.invalid", "age": 30, "nationality": "عُماني", "gender": "male", "gov": "مسقط", "wilayah": "السيب", "location": {"lat": 23.6, "lng": 58.2}, "avatarData": TEST_PNG},
                     user_token,
                 ),
                 {200},
@@ -305,6 +306,27 @@ def run():
                 {401},
                 "revoked user session",
             )
+
+            deletion_login = expect(
+                http(base, "/api/users/login", {"phone": "96896660001", "pin": "4268"}),
+                {200}, "login before account deletion",
+            )
+            deletion_token = deletion_login["token"]
+            expect(http(base, "/api/account/delete", {"pin": "9999"}, deletion_token), {403}, "delete with wrong PIN")
+            with sqlite3.connect(Path(temp) / "audit.sqlite3") as audit_db:
+                audit_db.row_factory = sqlite3.Row
+                active = audit_db.execute("SELECT * FROM app_users WHERE id=?", (user["user"]["id"],)).fetchone()
+                assert active["status"] == "active" and active["email"] == "delete-test@example.invalid"
+            expect(http(base, "/api/account/delete", {"pin": "4268"}, deletion_token), {200}, "confirmed account deletion")
+            with sqlite3.connect(Path(temp) / "audit.sqlite3") as audit_db:
+                audit_db.row_factory = sqlite3.Row
+                deleted = audit_db.execute("SELECT * FROM app_users WHERE id=?", (user["user"]["id"],)).fetchone()
+                assert deleted["status"] == "deleted" and deleted["phone"].startswith("deleted-")
+                for field in ("email", "nationality", "gov", "wilayah", "avatar", "pin_hash", "location_updated_at"):
+                    assert deleted[field] == "", f"Deleted account retained {field}"
+                assert deleted["age"] == 0 and deleted["gender"] == "not_specified"
+                assert deleted["latitude"] is None and deleted["longitude"] is None
+            expect(http(base, "/api/user/profile", {"name": "must not revive"}, deletion_token), {401}, "deleted account session revoked")
 
             lock_phone = "96896660002"
             expect(
@@ -374,6 +396,7 @@ def run():
                 "provider_owner_pin_protection": True,
                 "mime_signature_validation": True,
                 "session_revocation": True,
+                "account_deletion_profile_privacy": True,
                 "login_lockout": True,
                 "inactive_account_revocation": True,
                 "request_size_limit": True,
