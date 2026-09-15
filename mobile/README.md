@@ -12,7 +12,7 @@
 
 ```bash
 npm ci --prefix mobile
-npm run sync --prefix mobile
+KHADAMATI_MOBILE_API_BASE=https://khadamati-launch-check-20260911.onrender.com npm run sync --prefix mobile
 npm test --prefix mobile
 ```
 
