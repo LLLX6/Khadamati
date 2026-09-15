@@ -7,6 +7,11 @@ on:
 permissions:
   contents: read
 
+# This workflow produces internal test artifacts, including the unsigned AAB.
+# Keep them on the same isolated API as the public phone trial.
+env:
+  KHADAMATI_MOBILE_API_BASE: https://khadamati-launch-check-20260911.onrender.com
+
 concurrency:
   group: mobile-${{ github.ref }}
   cancel-in-progress: true
@@ -55,9 +60,28 @@ jobs:
       - name: Build internal APK and unsigned release bundle
         working-directory: mobile/android
         run: ./gradlew --no-daemon assembleDebug bundleRelease lintDebug
+      - name: Verify the API packaged in both Android artifacts
+        run: |
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+          from zipfile import ZipFile
+
+          expected = os.environ['KHADAMATI_MOBILE_API_BASE'].encode()
+          artifacts = [
+              ('mobile/android/app/build/outputs/apk/debug/app-debug.apk', 'assets/public/native-bridge.js'),
+              ('mobile/android/app/build/outputs/bundle/release/app-release.aab', 'base/assets/public/native-bridge.js'),
+          ]
+          for artifact, member in artifacts:
+              with ZipFile(artifact) as archive:
+                  bridge = archive.read(member)
+              assert expected in bridge, f'{artifact}: staging API missing from packaged bridge'
+              assert b'https://khadamati-app-api.onrender.com' not in bridge, f'{artifact}: production API packaged'
+              print(f'{Path(artifact).name}: staging API verified')
+          PY
       - uses: actions/upload-artifact@v4
         with:
-          name: khadamati-android-internal-${{ github.sha }}
+          name: khadamati-android-staging-${{ github.sha }}
           if-no-files-found: error
           retention-days: 14
           path: |
@@ -87,12 +111,23 @@ jobs:
           -destination 'generic/platform=iOS Simulator'
           -derivedDataPath ios/DerivedData
           CODE_SIGNING_ALLOWED=NO build
+      - name: Verify the API packaged in the iOS simulator app
+        run: |
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+
+          bridge = Path('mobile/ios/DerivedData/Build/Products/Debug-iphonesimulator/App.app/public/native-bridge.js').read_bytes()
+          assert os.environ['KHADAMATI_MOBILE_API_BASE'].encode() in bridge, 'staging API missing from packaged bridge'
+          assert b'https://khadamati-app-api.onrender.com' not in bridge, 'production API packaged'
+          print('iOS simulator app: staging API verified')
+          PY
       - name: Package simulator app
         working-directory: mobile
         run: ditto -c -k --sequesterRsrc --keepParent ios/DerivedData/Build/Products/Debug-iphonesimulator/App.app ios/khadamati-ios-simulator.zip
       - uses: actions/upload-artifact@v4
         with:
-          name: khadamati-ios-simulator-${{ github.sha }}
+          name: khadamati-ios-simulator-staging-${{ github.sha }}
           path: mobile/ios/khadamati-ios-simulator.zip
           if-no-files-found: error
           retention-days: 14
