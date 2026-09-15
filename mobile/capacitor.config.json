@@ -1,0 +1,23 @@
+{
+  "appId": "om.khadamati.app",
+  "appName": "خدماتي",
+  "webDir": "www",
+  "backgroundColor": "#071a2b",
+  "server": {
+    "hostname": "localhost",
+    "androidScheme": "https",
+    "iosScheme": "capacitor",
+    "cleartext": false
+  },
+  "ios": {
+    "contentInset": "automatic",
+    "preferredContentMode": "mobile"
+  },
+  "android": {
+    "allowMixedContent": false,
+    "webContentsDebuggingEnabled": false
+  },
+  "plugins": {
+    "CapacitorHttp": { "enabled": true }
+  }
+}

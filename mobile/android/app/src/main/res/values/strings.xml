@@ -1,0 +1,7 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">خدماتي</string>
+    <string name="title_activity_main">خدماتي</string>
+    <string name="package_name">om.khadamati.app</string>
+    <string name="custom_url_scheme">om.khadamati.app</string>
+</resources>

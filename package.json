@@ -8,6 +8,7 @@
     "sync:public": "node scripts/sync-public.mjs",
     "check:mirrors": "node scripts/sync-public.mjs --check",
     "test:i18n": "node tests/i18n-contract.js && node tests/i18n-ui.js",
+    "test:admin-auth": "node --test tests/admin-auth.test.js",
     "test:ui": "node tests/smoke-ui.js",
     "test:performance": "node tests/performance-ui.js"
   },

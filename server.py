@@ -12450,6 +12450,7 @@ class Handler(SimpleHTTPRequestHandler):
                 anonymous_phone = f"deleted-{hashlib.sha256(account_id.encode('utf-8')).hexdigest()[:16]}"
                 con.execute(
                     """UPDATE app_users SET status='deleted',name='حساب محذوف',phone=?,pin_hash='',
+                    email='',age=0,nationality='',gender='not_specified',gov='',wilayah='',
                     avatar='',latitude=NULL,longitude=NULL,location_updated_at='',updated_at=CURRENT_TIMESTAMP
                     WHERE id=?""",
                     (anonymous_phone, account_id),

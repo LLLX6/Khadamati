@@ -551,7 +551,14 @@ async function clickProviderNav(page, tab) {
       return json({ ok: true, templates: payload.templates || [] });
     }
     if (url.pathname === '/api/provider/support') return json({ ok: true, notificationId: 'ui-provider-support' });
-    if (url.pathname === '/api/admin/login') return json({ token: 'ui-admin-token', user: { id: 'ui-admin', name: 'إدارة خدماتي', role: 'super_admin' } });
+    if (url.pathname === '/api/admin/email-code/request') return json({ challengeId: 'ui-email-challenge', maskedEmail: 'a***@example.test' });
+    if (url.pathname === '/api/admin/login') {
+      const payload = route.request().postDataJSON();
+      assert(payload.code === 'UI-Test-4829' || (payload.emailChallengeId === 'ui-email-challenge' && payload.emailCode === '592814'), 'The admin first factor was lost between screens.');
+      if (!payload.twoFactorCode) return json({ twoFactorRequired: true });
+      assert(payload.twoFactorCode === '222222', 'The authenticator value was not submitted.');
+      return json({ token: 'ui-admin-token', user: { id: 'ui-admin', name: 'إدارة خدماتي', role: 'super_admin' } });
+    }
     if (url.pathname === '/api/platform') {
       const auth = route.request().headers().authorization || '';
       const platform = auth.includes('provider') ? mockProviderPlatform : mockUserPlatform;
@@ -1802,6 +1809,17 @@ async function clickProviderNav(page, tab) {
   }
   await page.waitForSelector('#adminCode');
   await page.locator('#adminCode').fill('UI-Test-4829');
+  await page.locator('[data-action="adminLogin"]').click();
+  await page.waitForSelector('#adminTwoFactorCode');
+  assert(await page.locator('.admin-shell').count() === 0, 'Admin access opened before password second-factor verification.');
+  await page.locator('[data-action="restartAdminLogin"]').click();
+  await page.locator('[data-action="requestAdminEmailCode"]').click();
+  await page.waitForSelector('#adminEmailCode');
+  await page.locator('#adminEmailCode').fill('592814');
+  await page.locator('[data-action="adminEmailLogin"]').click();
+  await page.waitForSelector('#adminTwoFactorCode');
+  assert(await page.locator('.admin-shell').count() === 0, 'Email sign-in bypassed second-factor verification.');
+  await page.locator('#adminTwoFactorCode').fill('222222');
   await page.locator('[data-action="adminLogin"]').click();
   await page.waitForSelector('.admin-shell');
   await page.locator('.admin-topbar [data-action="openAdminNotifications"]').click();
